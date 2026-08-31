@@ -1,0 +1,542 @@
+import Foundation
+
+/// BPTT 計算用の中間キャッシュ
+public final class ForwardCache: @unchecked Sendable {
+    public let seqLen: Int
+    public let timeSteps: Int
+    public let hiddenDim: Int
+    public let outputDim: Int
+
+    public var vStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim]
+    public var sStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim]
+    public var spikeAvg: [[Float]]   // [seqLen][hiddenDim]
+    public var logits: [[Float]]     // [seqLen][outputDim]
+    public var probs: [[Float]]      // [seqLen][outputDim]
+
+    public init(seqLen: Int, timeSteps: Int, hiddenDim: Int, outputDim: Int) {
+        self.seqLen = seqLen
+        self.timeSteps = timeSteps
+        self.hiddenDim = hiddenDim
+        self.outputDim = outputDim
+
+        self.vStates = [[[Float]]](
+            repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
+            count: seqLen
+        )
+        self.sStates = [[[Float]]](
+            repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
+            count: seqLen
+        )
+        self.spikeAvg = [[Float]](
+            repeating: [Float](repeating: 0.0, count: hiddenDim),
+            count: seqLen
+        )
+        self.logits = [[Float]](
+            repeating: [Float](repeating: 0.0, count: outputDim),
+            count: seqLen
+        )
+        self.probs = [[Float]](
+            repeating: [Float](repeating: 0.0, count: outputDim),
+            count: seqLen
+        )
+    }
+}
+
+/// スレッドセーフな独立勾配バッファ構造体 (並列学習用)
+public struct NetworkGradients: @unchecked Sendable {
+    public var gradWIn: [Float]
+    public var gradWRec: [Float]
+    public var gradWOut: [Float]
+    public var gradBOut: [Float]
+
+    public init(inputDim: Int, maxHiddenDim: Int, outputDim: Int) {
+        self.gradWIn = [Float](repeating: 0.0, count: maxHiddenDim * inputDim)
+        self.gradWRec = [Float](repeating: 0.0, count: maxHiddenDim * maxHiddenDim)
+        self.gradWOut = [Float](repeating: 0.0, count: outputDim * maxHiddenDim)
+        self.gradBOut = [Float](repeating: 0.0, count: outputDim)
+    }
+
+    public mutating func zeroGrad() {
+        var i = 0
+        while i < gradWIn.count { gradWIn[i] = 0.0; i += 1 }
+        i = 0
+        while i < gradWRec.count { gradWRec[i] = 0.0; i += 1 }
+        i = 0
+        while i < gradWOut.count { gradWOut[i] = 0.0; i += 1 }
+        i = 0
+        while i < gradBOut.count { gradBOut[i] = 0.0; i += 1 }
+    }
+
+    public mutating func accumulate(from other: NetworkGradients) {
+        var i = 0
+        while i < gradWIn.count { gradWIn[i] += other.gradWIn[i]; i += 1 }
+        i = 0
+        while i < gradWRec.count { gradWRec[i] += other.gradWRec[i]; i += 1 }
+        i = 0
+        while i < gradWOut.count { gradWOut[i] += other.gradWOut[i]; i += 1 }
+        i = 0
+        while i < gradBOut.count { gradBOut[i] += other.gradBOut[i]; i += 1 }
+    }
+}
+
+/// BPTT 学習トレーナー
+public final class BPTTTrainer: @unchecked Sendable {
+    public let network: MatryoshkaNetwork
+    public let optimizer: AdamOptimizer
+
+    public init(network: MatryoshkaNetwork, optimizer: AdamOptimizer) {
+        self.network = network
+        self.optimizer = optimizer
+    }
+
+    /// 新規勾配バッファの割り当て
+    public func makeGradients() -> NetworkGradients {
+        return NetworkGradients(
+            inputDim: network.inputDim,
+            maxHiddenDim: network.maxHiddenDim,
+            outputDim: network.outputDim
+        )
+    }
+
+    /// 単一スライスのシーケンス順伝播と損失計算
+    public func forwardSequence(
+        featuresSeq: [[Float]],
+        targets: [Int],
+        slice: MatryoshkaSlice
+    ) -> (cache: ForwardCache, loss: Float) {
+        let seqLen = featuresSeq.count
+        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let tSteps = network.timeSteps
+        let outDim = network.outputDim
+
+        let cache = ForwardCache(seqLen: seqLen, timeSteps: tSteps, hiddenDim: hSize, outputDim: outDim)
+        if seqLen <= 0 {
+            return (cache, 0.0)
+        }
+
+        var vPrev = [Float](repeating: 0.0, count: hSize)
+        var sPrev = [Float](repeating: 0.0, count: hSize)
+
+        var totalLoss: Float = 0.0
+        var numTargets: Float = 0.0
+
+        var k = 0
+        while k < seqLen {
+            let feat = featuresSeq[k]
+            var spikeSum = [Float](repeating: 0.0, count: hSize)
+
+            var t = 0
+            while t < tSteps {
+                var vNew = [Float](repeating: 0.0, count: hSize)
+                var sNew = [Float](repeating: 0.0, count: hSize)
+
+                var i = 0
+                while i < hSize {
+                    // 入力電流: bH + WIn * feat
+                    let wInOffset = i * network.inputDim
+                    var current: Float = network.pBH.data[i]
+                    var d = 0
+                    while d < network.inputDim {
+                        current += network.pWIn.data[wInOffset + d] * feat[d]
+                        d += 1
+                    }
+
+                    // 再帰電流: WRec * sPrev
+                    let wRecOffset = i * network.maxHiddenDim
+                    var j = 0
+                    while j < hSize {
+                        current += network.pWRec.data[wRecOffset + j] * sPrev[j]
+                        j += 1
+                    }
+
+                    // LIF 膜電位更新
+                    let vDecayed = network.lifConfig.beta * vPrev[i] * (1.0 - sPrev[i])
+                    let vUpdated = vDecayed + current
+                    vNew[i] = vUpdated
+
+                    // スパイク発火
+                    if network.lifConfig.vTh <= vUpdated {
+                        sNew[i] = 1.0
+                    }
+                    if vUpdated < network.lifConfig.vTh {
+                        sNew[i] = 0.0
+                    }
+
+                    spikeSum[i] += sNew[i]
+                    cache.vStates[k][t][i] = vNew[i]
+                    cache.sStates[k][t][i] = sNew[i]
+                    i += 1
+                }
+
+                vPrev = vNew
+                sPrev = sNew
+                t += 1
+            }
+
+            // スパイク平均
+            let invT = 1.0 / Float(tSteps)
+            var i = 0
+            while i < hSize {
+                let sAvg = spikeSum[i] * invT
+                cache.spikeAvg[k][i] = sAvg
+                i += 1
+            }
+
+            // 出力ロジット: sliceNorm * WOut * sAvg + BOut
+            let sliceNorm = sqrt(Float(network.maxHiddenDim) / Float(hSize))
+            var maxLogit: Float = -Float.greatestFiniteMagnitude
+            var c = 0
+            while c < outDim {
+                let wOutOffset = c * network.maxHiddenDim
+                var sumW: Float = 0.0
+                var j = 0
+                while j < hSize {
+                    sumW += network.pWOut.data[wOutOffset + j] * cache.spikeAvg[k][j]
+                    j += 1
+                }
+                let logit = network.pBOut.data[c] + (sumW * sliceNorm)
+                cache.logits[k][c] = logit
+                if maxLogit < logit {
+                    maxLogit = logit
+                }
+                c += 1
+            }
+
+            // Softmax & Cross-Entropy 損失
+            var sumExp: Float = 0.0
+            c = 0
+            while c < outDim {
+                let expV = exp(cache.logits[k][c] - maxLogit)
+                cache.probs[k][c] = expV
+                sumExp += expV
+                c += 1
+            }
+            let invSum = 1.0 / sumExp
+            c = 0
+            while c < outDim {
+                cache.probs[k][c] *= invSum
+                c += 1
+            }
+
+            if k < targets.count {
+                let tgt = targets[k]
+                if 0 <= tgt {
+                    if tgt < outDim {
+                        let weight: Float
+                        if tgt == TextVocabulary.padId {
+                            weight = 0.3
+                        } else {
+                            weight = 1.0
+                        }
+                        var p = cache.probs[k][tgt]
+                        if p < 1e-15 {
+                            p = 1e-15
+                        }
+                        totalLoss += -log(p) * weight
+                        numTargets += weight
+                    }
+                }
+            }
+
+            k += 1
+        }
+
+        var avgLoss: Float = 0.0
+        if 0.0 < numTargets {
+            avgLoss = totalLoss / numTargets
+        }
+        return (cache, avgLoss)
+    }
+
+    /// 単一スライスの時間逆伝播（メインネットワークの grad 配列に直接蓄積）
+    public func backwardSequence(
+        featuresSeq: [[Float]],
+        targets: [Int],
+        cache: ForwardCache,
+        slice: MatryoshkaSlice,
+        lossWeight: Float = 1.0
+    ) {
+        var grads = makeGradients()
+        backwardSequence(
+            featuresSeq: featuresSeq,
+            targets: targets,
+            cache: cache,
+            slice: slice,
+            lossWeight: lossWeight,
+            grads: &grads
+        )
+        var i = 0
+        while i < network.pWIn.grad.count {
+            network.pWIn.grad[i] += grads.gradWIn[i]
+            i += 1
+        }
+        i = 0
+        while i < network.pWRec.grad.count {
+            network.pWRec.grad[i] += grads.gradWRec[i]
+            i += 1
+        }
+        i = 0
+        while i < network.pWOut.grad.count {
+            network.pWOut.grad[i] += grads.gradWOut[i]
+            i += 1
+        }
+        i = 0
+        while i < network.pBOut.grad.count {
+            network.pBOut.grad[i] += grads.gradBOut[i]
+            i += 1
+        }
+    }
+
+    /// 単一スライスの時間逆伝播（指定された勾配バッファに蓄積）
+    public func backwardSequence(
+        featuresSeq: [[Float]],
+        targets: [Int],
+        cache: ForwardCache,
+        slice: MatryoshkaSlice,
+        lossWeight: Float = 1.0,
+        grads: inout NetworkGradients
+    ) {
+        let seqLen = cache.seqLen
+        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let tSteps = cache.timeSteps
+        let outDim = cache.outputDim
+
+        var numTargets: Float = 0.0
+        var k = 0
+        while k < seqLen {
+            if k < targets.count {
+                let tgt = targets[k]
+                if 0 <= tgt {
+                    if tgt < outDim {
+                        if tgt == TextVocabulary.padId {
+                            numTargets += 0.3
+                        } else {
+                            numTargets += 1.0
+                        }
+                    }
+                }
+            }
+            k += 1
+        }
+        if numTargets <= 0.0 {
+            return
+        }
+
+        let lossScale = (1.0 / numTargets) * lossWeight
+        var dVNextStep = [Float](repeating: 0.0, count: hSize)
+        var dSNextStep = [Float](repeating: 0.0, count: hSize)
+        let invT = 1.0 / Float(tSteps)
+
+        k = seqLen - 1
+        while 0 <= k {
+            let feat = featuresSeq[k]
+            let spikeAvg = cache.spikeAvg[k]
+            let probs = cache.probs[k]
+
+            var dLogits = [Float](repeating: 0.0, count: outDim)
+            if k < targets.count {
+                let tgt = targets[k]
+                if 0 <= tgt {
+                    if tgt < outDim {
+                        let weight: Float
+                        if tgt == TextVocabulary.padId {
+                            weight = 0.3
+                        } else {
+                            weight = 1.0
+                        }
+                        var c = 0
+                        while c < outDim {
+                            var grad = probs[c]
+                            if c == tgt {
+                                grad -= 1.0
+                            }
+                            dLogits[c] = grad * weight * lossScale
+                            c += 1
+                        }
+                    }
+                }
+            }
+
+            let sliceNorm = sqrt(Float(network.maxHiddenDim) / Float(hSize))
+            var dSpikeAvg = [Float](repeating: 0.0, count: hSize)
+            var c = 0
+            while c < outDim {
+                let dL = dLogits[c]
+                grads.gradBOut[c] += dL
+                let wOffset = c * network.maxHiddenDim
+                var i = 0
+                while i < hSize {
+                    grads.gradWOut[wOffset + i] += dL * spikeAvg[i] * sliceNorm
+                    dSpikeAvg[i] += network.pWOut.data[wOffset + i] * dL * sliceNorm
+                    i += 1
+                }
+                c += 1
+            }
+
+            var dVTime = dVNextStep
+            var dSTime = dSNextStep
+
+            var t = tSteps - 1
+            while 0 <= t {
+                let vCurr = cache.vStates[k][t]
+                let vPrevT: [Float]
+                let sPrevT: [Float]
+
+                if t == 0 {
+                    if 0 < k {
+                        vPrevT = cache.vStates[k - 1][tSteps - 1]
+                        sPrevT = cache.sStates[k - 1][tSteps - 1]
+                    } else {
+                        vPrevT = [Float](repeating: 0.0, count: hSize)
+                        sPrevT = [Float](repeating: 0.0, count: hSize)
+                    }
+                } else {
+                    vPrevT = cache.vStates[k][t - 1]
+                    sPrevT = cache.sStates[k][t - 1]
+                }
+
+                var dVList = [Float](repeating: 0.0, count: hSize)
+                var i = 0
+                while i < hSize {
+                    let dS_total = (dSpikeAvg[i] * invT) + dSTime[i]
+                    let surrogateGrad = SurrogateGradient.derivative(
+                        v: vCurr[i],
+                        vTh: network.lifConfig.vTh,
+                        alpha: network.lifConfig.alpha
+                    )
+                    let dV_i = dVTime[i] + (dS_total * surrogateGrad)
+                    dVList[i] = dV_i
+
+                    let dInput_i = dV_i
+
+                    // 入力重み勾配
+                    let inOffset = i * network.inputDim
+                    var d = 0
+                    while d < network.inputDim {
+                        grads.gradWIn[inOffset + d] += dInput_i * feat[d]
+                        d += 1
+                    }
+
+                    // 再帰重み勾配
+                    let recOffset = i * network.maxHiddenDim
+                    var j = 0
+                    while j < hSize {
+                        grads.gradWRec[recOffset + j] += dInput_i * sPrevT[j]
+                        j += 1
+                    }
+                    i += 1
+                }
+
+                var newDVTime = [Float](repeating: 0.0, count: hSize)
+                var newDSTime = [Float](repeating: 0.0, count: hSize)
+
+                var j = 0
+                while j < hSize {
+                    let decayFactor = network.lifConfig.beta * (1.0 - sPrevT[j])
+                    newDVTime[j] = dVList[j] * decayFactor
+
+                    var dS_j = -network.lifConfig.beta * vPrevT[j] * dVList[j]
+                    var iRec = 0
+                    while iRec < hSize {
+                        dS_j += network.pWRec.data[iRec * network.maxHiddenDim + j] * dVList[iRec]
+                        iRec += 1
+                    }
+                    newDSTime[j] = dS_j
+                    j += 1
+                }
+
+                dVTime = newDVTime
+                dSTime = newDSTime
+                t -= 1
+            }
+
+            dVNextStep = dVTime
+            dSNextStep = dSTime
+            k -= 1
+        }
+    }
+
+    /// 1 サンプルの多重スライス勾配計算 (並列ワーカー用)
+    public func computeSampleGradients(
+        featuresSeq: [[Float]],
+        targets: [Int],
+        grads: inout NetworkGradients
+    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
+        var lossBase: Float = 0.0
+        var lossMiddle: Float = 0.0
+        var lossHigh: Float = 0.0
+        var totalLoss: Float = 0.0
+
+        var activeSlices: [MatryoshkaSlice] = []
+        for slice in MatryoshkaSlice.allCases {
+            if slice == .base || slice.rawValue <= network.maxHiddenDim {
+                activeSlices.append(slice)
+            }
+        }
+
+        for slice in activeSlices {
+            let cache = forwardSequence(featuresSeq: featuresSeq, targets: targets, slice: slice)
+            switch slice {
+            case .base:
+                lossBase = cache.loss
+            case .middle:
+                lossMiddle = cache.loss
+            case .high:
+                lossHigh = cache.loss
+            }
+            totalLoss += cache.loss
+            let lossWeight: Float = 1.0
+            backwardSequence(
+                featuresSeq: featuresSeq,
+                targets: targets,
+                cache: cache.cache,
+                slice: slice,
+                lossWeight: lossWeight,
+                grads: &grads
+            )
+        }
+
+        return (totalLoss, lossBase, lossMiddle, lossHigh)
+    }
+
+    /// 合算された勾配をメインネットワークに適用して最適化ステップを実行
+    public func applyGradientsAndStep(grads: NetworkGradients, sampleCount: Int) {
+        optimizer.zeroGrad()
+        let scale = 1.0 / Float(max(1, sampleCount))
+
+        var i = 0
+        while i < network.pWIn.grad.count {
+            network.pWIn.grad[i] = grads.gradWIn[i] * scale
+            i += 1
+        }
+        i = 0
+        while i < network.pWRec.grad.count {
+            network.pWRec.grad[i] = grads.gradWRec[i] * scale
+            i += 1
+        }
+        i = 0
+        while i < network.pWOut.grad.count {
+            network.pWOut.grad[i] = grads.gradWOut[i] * scale * 2.0
+            i += 1
+        }
+        i = 0
+        while i < network.pBOut.grad.count {
+            // 出力層バイアスの特定文字張り付きを抑え、重み主導の分類を促進
+            network.pBOut.grad[i] = grads.gradBOut[i] * scale * 0.05
+            i += 1
+        }
+
+        optimizer.step()
+    }
+
+    /// Matryoshka 多重スライス同時学習ステップ (単一サンプル直列用)
+    public func trainStep(
+        featuresSeq: [[Float]],
+        targets: [Int]
+    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
+        var grads = makeGradients()
+        let result = computeSampleGradients(featuresSeq: featuresSeq, targets: targets, grads: &grads)
+        applyGradientsAndStep(grads: grads, sampleCount: 1)
+        return result
+    }
+}
