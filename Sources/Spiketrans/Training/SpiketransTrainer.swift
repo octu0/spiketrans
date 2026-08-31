@@ -253,11 +253,13 @@ extension SpiketransTrainer {
     ) -> String {
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: pcmData, sampleRate: 16000)
         let featuresSeq = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k)
+        let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
         return transcribeAcousticDirect(
             featuresSeq: featuresSeq,
             slice: slice,
             minDurationFrames: minDurationFrames,
-            minConfidence: minConfidence
+            minConfidence: minConfidence,
+            boundaries: boundaries
         )
     }
 
@@ -266,7 +268,8 @@ extension SpiketransTrainer {
         featuresSeq: [[Float]],
         slice: MatryoshkaSlice = .base,
         minDurationFrames: Int = 3,
-        minConfidence: Float = 0.45
+        minConfidence: Float = 0.45,
+        boundaries: [Int]? = nil
     ) -> String {
         if featuresSeq.isEmpty {
             return ""
@@ -284,17 +287,17 @@ extension SpiketransTrainer {
             inputDim: acousticTrainer.network.inputDim
         )
 
+        let frameProbs = acDecoder.decodeSequence(
+            featuresSeq: featuresSeq,
+            workspace: acWorkspace,
+            boundaries: boundaries
+        )
         var rawTokens: [Int] = []
         rawTokens.reserveCapacity(featuresSeq.count)
 
         var f = 0
         while f < featuresSeq.count {
-            let feat = featuresSeq[f]
-            let frame = acDecoder.decodeFrame(
-                features: feat,
-                workspace: acWorkspace,
-                frameIndex: f
-            )
+            let frame = frameProbs[f]
             // 1. 低信頼度フレームは pad として扱う
             if frame.topProbability < minConfidence {
                 rawTokens.append(TextVocabulary.padId)

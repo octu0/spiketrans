@@ -23,6 +23,16 @@ public final class AcousticWorkspace: @unchecked Sendable {
     }
 
     @inline(__always)
+    public func resetHiddenState() {
+        var i = 0
+        while i < vPrev.count {
+            vPrev[i] = 0.0
+            sPrev[i] = 0.0
+            i += 1
+        }
+    }
+
+    @inline(__always)
     public func reset() {
         var i = 0
         while i < vPrev.count {
@@ -151,7 +161,8 @@ public final class AcousticDecoder: @unchecked Sendable {
     /// 特徴量シーケンスのデコード
     public func decodeSequence(
         featuresSeq: [[Float]],
-        workspace: AcousticWorkspace
+        workspace: AcousticWorkspace,
+        boundaries: [Int]? = nil
     ) -> [AcousticFrameProbabilities] {
         var results = [AcousticFrameProbabilities]()
         results.reserveCapacity(featuresSeq.count)

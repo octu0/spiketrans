@@ -20,16 +20,25 @@ let package = Package(
             targets: ["benchmark"]
         )
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.21.0")
+    ],
     targets: [
         .target(
             name: "Spiketrans",
-            dependencies: [],
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXOptimizers", package: "mlx-swift")
+            ],
             path: "Sources/Spiketrans"
         ),
         .executableTarget(
             name: "train",
-            dependencies: ["Spiketrans"],
+            dependencies: [
+                "Spiketrans",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
             path: "script/train",
             exclude: ["run.sh"]
         ),
@@ -41,7 +50,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SpiketransTests",
-            dependencies: ["Spiketrans"],
+            dependencies: [
+                "Spiketrans",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
             path: "Tests/SpiketransTests"
         )
     ]

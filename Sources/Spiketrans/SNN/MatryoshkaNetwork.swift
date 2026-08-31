@@ -258,6 +258,44 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         }
     }
 
+    /// 全体重みのエクスポート
+    public func exportWeights() -> MatryoshkaWeightsData {
+        return MatryoshkaWeightsData(
+            inputDim: inputDim,
+            maxHiddenDim: maxHiddenDim,
+            outputDim: outputDim,
+            timeSteps: timeSteps,
+            beta: lifConfig.beta,
+            vTh: lifConfig.vTh,
+            vReset: lifConfig.vReset,
+            alpha: lifConfig.alpha,
+            wIn: pWIn.data,
+            wRec: pWRec.data,
+            bH: pBH.data,
+            wOut: pWOut.data,
+            bOut: pBOut.data
+        )
+    }
+
+    /// 全体重みのインポート
+    public func importWeights(from weightsData: MatryoshkaWeightsData) {
+        if weightsData.wIn.count == pWIn.data.count {
+            pWIn.data = weightsData.wIn
+        }
+        if weightsData.wRec.count == pWRec.data.count {
+            pWRec.data = weightsData.wRec
+        }
+        if weightsData.bH.count == pBH.data.count {
+            pBH.data = weightsData.bH
+        }
+        if weightsData.wOut.count == pWOut.data.count {
+            pWOut.data = weightsData.wOut
+        }
+        if weightsData.bOut.count == pBOut.data.count {
+            pBOut.data = weightsData.bOut
+        }
+    }
+
     /// 指定スライスでの推論（Hot Path ゼロアロケーション）
     public func forwardSlice(
         features: [Float],
