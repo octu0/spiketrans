@@ -111,6 +111,7 @@ for slice in MatryoshkaSlice.allCases {
     let hSize = slice.rawValue
     var v = [Float](repeating: 0.0, count: hSize)
     var s = [Float](repeating: 0.0, count: hSize)
+    var a = [Float](repeating: 0.0, count: hSize)
     var sum = [Float](repeating: 0.0, count: hSize)
     var logits = [Float](repeating: 0.0, count: 64)
     var probs = [Float](repeating: 0.0, count: 64)
@@ -125,6 +126,7 @@ for slice in MatryoshkaSlice.allCases {
             slice: slice,
             vPrev: &v,
             sPrev: &s,
+            aPrev: &a,
             spikeSum: &sum,
             logits: &logits,
             probabilities: &probs

@@ -4,6 +4,7 @@ import Foundation
 public final class AcousticWorkspace: @unchecked Sendable {
     public var vPrev: [Float]
     public var sPrev: [Float]
+    public var aPrev: [Float]
     public var spikeSum: [Float]
     public var logits: [Float]
     public var probabilities: [Float]
@@ -12,6 +13,7 @@ public final class AcousticWorkspace: @unchecked Sendable {
     public init(maxHiddenDim: Int = 4096, outputDim: Int = 523, inputDim: Int = 64) {
         self.vPrev = [Float](repeating: 0.0, count: maxHiddenDim)
         self.sPrev = [Float](repeating: 0.0, count: maxHiddenDim)
+        self.aPrev = [Float](repeating: 0.0, count: maxHiddenDim)
         self.spikeSum = [Float](repeating: 0.0, count: maxHiddenDim)
         self.logits = [Float](repeating: 0.0, count: outputDim)
         self.probabilities = [Float](repeating: 0.0, count: outputDim)
@@ -28,6 +30,7 @@ public final class AcousticWorkspace: @unchecked Sendable {
         while i < vPrev.count {
             vPrev[i] = 0.0
             sPrev[i] = 0.0
+            aPrev[i] = 0.0
             i += 1
         }
     }
@@ -38,6 +41,7 @@ public final class AcousticWorkspace: @unchecked Sendable {
         while i < vPrev.count {
             vPrev[i] = 0.0
             sPrev[i] = 0.0
+            aPrev[i] = 0.0
             spikeSum[i] = 0.0
             i += 1
         }
@@ -130,6 +134,7 @@ public final class AcousticDecoder: @unchecked Sendable {
                 slice: slice,
                 vPrev: &workspace.vPrev,
                 sPrev: &workspace.sPrev,
+                aPrev: &workspace.aPrev,
                 spikeSum: &workspace.spikeSum,
                 logits: &workspace.logits,
                 probabilities: &workspace.probabilities

@@ -163,7 +163,7 @@ kanaKanjiDict.buildFromCorpus(rawTexts: textLines)
 print("コーパス総行数: \(textLines.count) 件")
 print("第1段 音響 SNN (かな・音素) 語彙数: \(phoneticVocabulary.size) 文字")
 print("第2段 言語 SNN (漢字かな混じり) 語彙数: \(textVocabulary.size) 文字")
-print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.entriesByReading.count) 語")
+print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語")
 
 // 3. WAV ファイルを読み込んでデータセット構築
 let sampleLimit = maxTrainSamples ?? rawPairs.count

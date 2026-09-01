@@ -36,12 +36,15 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let beta = network.lifConfig.beta
         let vTh = network.lifConfig.vTh
         let alpha = network.lifConfig.alpha
+        let rho = network.lifConfig.rho
+        let gamma = network.lifConfig.gamma
 
         // [B, T, hMax] = [B, T, inputDim] @ [inputDim, hMax] + bH
         let currentSeq = matmul(features, network.wIn) + network.bH
 
         var v = MLXArray.zeros([batchSize, hMax])
         var s = MLXArray.zeros([batchSize, hMax])
+        var a = MLXArray.zeros([batchSize, hMax])
 
         var sAvgList: [MLXArray] = []
         sAvgList.reserveCapacity(seqLen)
@@ -54,6 +57,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             // フレーム間の勾配切り離し (フレーム内 4-step BPTT による完全な数値安定性)
             v = stopGradient(v)
             s = stopGradient(s)
+            a = stopGradient(a)
 
             var step = 0
             while step < tSteps {
@@ -61,10 +65,14 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 let vDecayed = (v * beta) * (1.0 - s)
                 v = clip(vDecayed + current_t + rec, min: -20.0, max: 20.0)
 
+                // 適応型発火閾値 (ALIF: 生物の神経順応)
+                a = (a * rho) + (s * gamma)
+                let dynVTh = vTh + a
+
                 // Fast Sigmoid Surrogate Gradient
-                let vRel = (v - vTh) * alpha
+                let vRel = (v - dynVTh) * alpha
                 let sSurrogate = 0.5 * (vRel / (1.0 + abs(vRel)) + 1.0)
-                let sHard = (v .>= vTh).asType(.float32)
+                let sHard = (v .>= dynVTh).asType(.float32)
                 s = stopGradient(sHard - sSurrogate) + sSurrogate
 
                 sSum = sSum + s

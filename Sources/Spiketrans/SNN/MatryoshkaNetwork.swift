@@ -296,12 +296,13 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         }
     }
 
-    /// 指定スライスでの推論（Event-driven 疎スパイク高速化 & ゼロアロケーション）
+    /// 指定スライスでの推論（ALIF 適応型発火閾値 & Event-driven 疎スパイク高速化）
     public func forwardSlice(
         features: [Float],
         slice: MatryoshkaSlice,
         vPrev: inout [Float],
         sPrev: inout [Float],
+        aPrev: inout [Float],
         spikeSum: inout [Float],
         logits: inout [Float],
         probabilities: inout [Float]
@@ -335,10 +336,11 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
 
         var vNext = [Float](repeating: 0.0, count: hSize)
         var sNext = [Float](repeating: 0.0, count: hSize)
+        var aNext = [Float](repeating: 0.0, count: hSize)
         var activeSpikes: [Int] = []
         activeSpikes.reserveCapacity(hSize)
 
-        // 3. 時間ステップループ (Event-driven 疎スパイク加算)
+        // 3. 時間ステップループ (ALIF 適応型閾値 & Event-driven 疎スパイク加算)
         var t = 0
         while t < timeSteps {
             // 3.1 直前ステップで発火したニューロンのインデックスのみを収集
@@ -365,15 +367,17 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
                     a += 1
                 }
 
-                // LIF ステップ
-                let stepRes = LIFNeuronEngine.stepScalar(
+                // ALIF 適応型ステップ
+                let stepRes = LIFNeuronEngine.stepScalarAdaptive(
                     config: lifConfig,
                     vPrev: vPrev[n],
                     sPrev: sPrev[n],
+                    aPrev: aPrev[n],
                     inputCurrent: current
                 )
                 vNext[n] = stepRes.vNext
                 sNext[n] = stepRes.sNext
+                aNext[n] = stepRes.aNext
                 spikeSum[n] += stepRes.sNext
                 n += 1
             }
@@ -383,6 +387,7 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             while n < hSize {
                 vPrev[n] = vNext[n]
                 sPrev[n] = sNext[n]
+                aPrev[n] = aNext[n]
                 n += 1
             }
 
@@ -443,5 +448,28 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             probabilities[c] *= invSum
             c += 1
         }
+    }
+
+    /// 既存テスト・クライアント用後方互換メソッド (aPrev を自動管理)
+    public func forwardSlice(
+        features: [Float],
+        slice: MatryoshkaSlice,
+        vPrev: inout [Float],
+        sPrev: inout [Float],
+        spikeSum: inout [Float],
+        logits: inout [Float],
+        probabilities: inout [Float]
+    ) {
+        var aPrev = [Float](repeating: 0.0, count: min(slice.rawValue, maxHiddenDim))
+        forwardSlice(
+            features: features,
+            slice: slice,
+            vPrev: &vPrev,
+            sPrev: &sPrev,
+            aPrev: &aPrev,
+            spikeSum: &spikeSum,
+            logits: &logits,
+            probabilities: &probabilities
+        )
     }
 }

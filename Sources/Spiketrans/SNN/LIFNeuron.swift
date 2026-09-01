@@ -3,20 +3,26 @@ import Foundation
 /// LIF (Leaky Integrate-and-Fire) ニューロン設定パラメータ
 public struct LIFConfig: Sendable, Equatable {
     public let beta: Float      // 膜電位減衰率 (0.0 < beta < 1.0)
-    public let vTh: Float       // 発火閾値 (通常 1.0)
+    public let vTh: Float       // 基本発火閾値 (通常 1.0)
     public let vReset: Float    // リセット電位 (通常 0.0)
     public let alpha: Float     // Surrogate Gradient 鋭さパラメータ (通常 2.0)
+    public let rho: Float       // 適応閾値減衰率 (通常 0.85)
+    public let gamma: Float     // 発火時閾値上昇幅 (0.0 で標準固定閾値, >0.0 で適応型 ALIF)
 
     public init(
         beta: Float = 0.8,
         vTh: Float = 1.0,
         vReset: Float = 0.0,
-        alpha: Float = 2.0
+        alpha: Float = 2.0,
+        rho: Float = 0.85,
+        gamma: Float = 0.0
     ) {
         self.beta = beta
         self.vTh = vTh
         self.vReset = vReset
         self.alpha = alpha
+        self.rho = rho
+        self.gamma = gamma
     }
 }
 
@@ -24,12 +30,14 @@ public struct LIFConfig: Sendable, Equatable {
 public final class LIFState: @unchecked Sendable {
     public var v: ContiguousArray<Float>
     public var s: ContiguousArray<Float>
+    public var a: ContiguousArray<Float>
     public let size: Int
 
     public init(size: Int) {
         self.size = size
         self.v = ContiguousArray<Float>(repeating: 0.0, count: size)
         self.s = ContiguousArray<Float>(repeating: 0.0, count: size)
+        self.a = ContiguousArray<Float>(repeating: 0.0, count: size)
     }
 
     @inline(__always)
@@ -38,6 +46,7 @@ public final class LIFState: @unchecked Sendable {
         while i < size {
             v[i] = 0.0
             s[i] = 0.0
+            a[i] = 0.0
             i += 1
         }
     }
@@ -59,7 +68,27 @@ public enum LIFNeuronEngine {
         if config.vTh <= vNext {
             sNext = 1.0
         }
-        return (vNext, sNext)
+        return (vNext: vNext, sNext: sNext)
+    }
+
+    /// 1 ニューロンの適応型発火閾値 (ALIF) スカラー更新ステップ
+    @inline(__always)
+    public static func stepScalarAdaptive(
+        config: LIFConfig,
+        vPrev: Float,
+        sPrev: Float,
+        aPrev: Float,
+        inputCurrent: Float
+    ) -> (vNext: Float, sNext: Float, aNext: Float) {
+        let vDecayed = config.beta * vPrev * (1.0 - sPrev)
+        let vNext = vDecayed + inputCurrent
+        let aNext = (config.rho * aPrev) + (config.gamma * sPrev)
+        let dynVTh = config.vTh + aNext
+        var sNext: Float = 0.0
+        if dynVTh <= vNext {
+            sNext = 1.0
+        }
+        return (vNext: vNext, sNext: sNext, aNext: aNext)
     }
 
     /// SIMD8 による 8 ニューロン一括更新ステップ

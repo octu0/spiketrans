@@ -6,6 +6,7 @@ public struct BeamHypothesis: Sendable {
     public let score: Float
     public let lmVState: [Float]
     public let lmSState: [Float]
+    public let lmAState: [Float]
     public let isFinished: Bool
 
     public init(
@@ -13,12 +14,14 @@ public struct BeamHypothesis: Sendable {
         score: Float,
         lmVState: [Float],
         lmSState: [Float],
+        lmAState: [Float] = [],
         isFinished: Bool
     ) {
         self.tokenIds = tokenIds
         self.score = score
         self.lmVState = lmVState
         self.lmSState = lmSState
+        self.lmAState = lmAState
         self.isFinished = isFinished
     }
 }
@@ -46,13 +49,12 @@ public struct LanguageDecoderConfig: Sendable {
     }
 }
 
-/// 第2段 自己回帰言語 SNN デコーダ (先行文字トークン文脈遷移 + 音響言語結合デコード)
+/// 第2段 自己回帰言語 SNN デコーダ
 public final class LanguageDecoder: @unchecked Sendable {
     public let lmNetwork: MatryoshkaNetwork
     public let vocabulary: TextVocabulary
     public let fallbackVocabulary: PhonemeVocabulary
     public let config: LanguageDecoderConfig
-    public let inputDim: Int
 
     public init(
         lmNetwork: MatryoshkaNetwork,
@@ -64,18 +66,17 @@ public final class LanguageDecoder: @unchecked Sendable {
         self.vocabulary = vocabulary
         self.fallbackVocabulary = fallbackVocabulary
         self.config = config
-        self.inputDim = lmNetwork.inputDim
     }
 
-    /// トークン ID から決定論的埋め込み特徴量ベクトル (inputDim 次元) を生成
-    @inline(__always)
-    public func buildTokenFeature(tokenId: Int) -> [Float] {
-        var feat = [Float](repeating: 0.0, count: inputDim)
-        var d = 0
-        while d < inputDim {
-            let angle = Float(tokenId * 17 + d * 11 + 3)
-            feat[d] = (sin(angle) * 0.5) + 0.5
-            d += 1
+    /// トークン ID からワンホット風埋め込み特徴量を生成
+    private func buildTokenFeature(tokenId: Int) -> [Float] {
+        var feat = [Float](repeating: 0.0, count: lmNetwork.inputDim)
+        if tokenId < lmNetwork.inputDim {
+            feat[tokenId] = 1.0
+        } else {
+            // ハッシュ分散埋め込み
+            let idx = abs(tokenId.hashValue) % lmNetwork.inputDim
+            feat[idx] = 1.0
         }
         return feat
     }
@@ -94,6 +95,7 @@ public final class LanguageDecoder: @unchecked Sendable {
         let outDim = lmNetwork.outputDim
         var vLM = [Float](repeating: 0.0, count: hSize)
         var sLM = [Float](repeating: 0.0, count: hSize)
+        var aLM = [Float](repeating: 0.0, count: hSize)
         var spikeSumLM = [Float](repeating: 0.0, count: hSize)
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
@@ -120,6 +122,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                 slice: slice,
                 vPrev: &vLM,
                 sPrev: &sLM,
+                aPrev: &aLM,
                 spikeSum: &spikeSumLM,
                 logits: &logitsLM,
                 probabilities: &probsLM
@@ -138,15 +141,7 @@ public final class LanguageDecoder: @unchecked Sendable {
 
                 switch tokId {
                 case TextVocabulary.padId:
-                    score = log(pAc) - config.blankPenalty
-                case TextVocabulary.unkId:
-                    score = log(pAc) - 1.0 // 未知トークンのペナルティ
-                case TextVocabulary.eosId:
-                    if acousticProbs.count - 5 <= fIdx {
-                        score = log(pAc) + (config.lmWeight * log(pLm))
-                    } else {
-                        score = -Float.greatestFiniteMagnitude // 系列の途中では eos を除外
-                    }
+                    score = log(pAc) + config.blankPenalty
                 default:
                     score = log(pAc) + (config.lmWeight * log(pLm)) + config.wordBonus
                 }
@@ -211,6 +206,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                 score: 0.0,
                 lmVState: [Float](repeating: 0.0, count: hSize),
                 lmSState: [Float](repeating: 0.0, count: hSize),
+                lmAState: [Float](repeating: 0.0, count: hSize),
                 isFinished: false
             )
         ]
@@ -240,6 +236,7 @@ public final class LanguageDecoder: @unchecked Sendable {
 
                 var vLM = hyp.lmVState
                 var sLM = hyp.lmSState
+                var aLM = hyp.lmAState.isEmpty ? [Float](repeating: 0.0, count: hSize) : hyp.lmAState
                 let tokenFeatures = buildTokenFeature(tokenId: prevTok)
 
                 lmNetwork.forwardSlice(
@@ -247,6 +244,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                     slice: slice,
                     vPrev: &vLM,
                     sPrev: &sLM,
+                    aPrev: &aLM,
                     spikeSum: &spikeSumLM,
                     logits: &logitsLM,
                     probabilities: &probsLM
@@ -261,42 +259,33 @@ public final class LanguageDecoder: @unchecked Sendable {
 
                     switch tokId {
                     case TextVocabulary.padId:
-                        let stepScore = log(pAc) - config.blankPenalty
+                        let newScore = hyp.score + log(pAc) + config.blankPenalty
                         candidates.append(BeamHypothesis(
                             tokenIds: hyp.tokenIds,
-                            score: hyp.score + stepScore,
+                            score: newScore,
                             lmVState: vLM,
                             lmSState: sLM,
-                            isFinished: false
-                        ))
-                    case TextVocabulary.unkId:
-                        let stepScore = log(pAc) - 1.0
-                        candidates.append(BeamHypothesis(
-                            tokenIds: hyp.tokenIds,
-                            score: hyp.score + stepScore,
-                            lmVState: vLM,
-                            lmSState: sLM,
+                            lmAState: aLM,
                             isFinished: false
                         ))
                     case TextVocabulary.eosId:
-                        let stepScore = log(pAc) + (config.lmWeight * log(pLm))
+                        let newScore = hyp.score + log(pAc) + (config.lmWeight * log(pLm))
                         candidates.append(BeamHypothesis(
                             tokenIds: hyp.tokenIds,
-                            score: hyp.score + stepScore,
+                            score: newScore,
                             lmVState: vLM,
                             lmSState: sLM,
+                            lmAState: aLM,
                             isFinished: true
                         ))
                     default:
-                        let stepScore = log(pAc) + (config.lmWeight * log(pLm)) + config.wordBonus
                         var newTokens = hyp.tokenIds
-                        var shouldAppend = false
-                        switch hyp.tokenIds.last {
-                        case .none:
-                            shouldAppend = true
-                        case .some(let prev):
-                            if prev != tokId {
-                                shouldAppend = true
+                        // 連続同一トークンの重複圧縮判定 (直前が同じトークンかつ直前が pad でない場合はマージ)
+                        var shouldAppend = true
+                        if newTokens.isEmpty != true {
+                            let lastTok = newTokens[newTokens.count - 1]
+                            if lastTok == tokId {
+                                shouldAppend = false
                             }
                         }
 
@@ -304,11 +293,13 @@ public final class LanguageDecoder: @unchecked Sendable {
                             newTokens.append(tokId)
                         }
 
+                        let newScore = hyp.score + log(pAc) + (config.lmWeight * log(pLm)) + config.wordBonus
                         candidates.append(BeamHypothesis(
                             tokenIds: newTokens,
-                            score: hyp.score + stepScore,
+                            score: newScore,
                             lmVState: vLM,
                             lmSState: sLM,
+                            lmAState: aLM,
                             isFinished: false
                         ))
                     }
@@ -319,29 +310,30 @@ public final class LanguageDecoder: @unchecked Sendable {
                 bIdx += 1
             }
 
-            // 枝刈り (スコア降順ソート: < を使用)
-            candidates.sort { (a, b) -> Bool in
-                b.score < a.score
+            // スコア順にソートして Top-K を残す
+            candidates.sort { hypB, hypA in
+                hypA.score < hypB.score
             }
 
-            var nextBeams: [BeamHypothesis] = []
-            var cIdx = 0
-            let limit = min(config.beamWidth, candidates.count)
-            while cIdx < limit {
-                nextBeams.append(candidates[cIdx])
-                cIdx += 1
-            }
-            beams = nextBeams
-
+            beams = Array(candidates.prefix(config.beamWidth))
             fIdx += 1
         }
 
-        let bestHyp = beams[0]
+        // 最良仮説を選択
+        var bestHyp = beams[0]
+        var b = 1
+        while b < beams.count {
+            if bestHyp.score < beams[b].score {
+                bestHyp = beams[b]
+            }
+            b += 1
+        }
+
         let text = vocabulary.idsToText(bestHyp.tokenIds)
         return (tokens: bestHyp.tokenIds, text: text, score: bestHyp.score)
     }
 
-    /// ひらがな・音素テキスト系列から自己回帰言語 SNN により漢字かな混じりテキストを生成
+    /// 音響 SNN の推定したかな文字列から直接漢字かな混じり文を自己回帰復元
     public func decodeKanaToKanji(
         kanaText: String,
         kanaVocabulary: TextVocabulary,
@@ -360,6 +352,7 @@ public final class LanguageDecoder: @unchecked Sendable {
         let outDim = lmNetwork.outputDim
         var vLM = [Float](repeating: 0.0, count: hSize)
         var sLM = [Float](repeating: 0.0, count: hSize)
+        var aLM = [Float](repeating: 0.0, count: hSize)
         var spikeSumLM = [Float](repeating: 0.0, count: hSize)
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
@@ -375,6 +368,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                 slice: slice,
                 vPrev: &vLM,
                 sPrev: &sLM,
+                aPrev: &aLM,
                 spikeSum: &spikeSumLM,
                 logits: &logitsLM,
                 probabilities: &probsLM
