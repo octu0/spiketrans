@@ -296,7 +296,7 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         }
     }
 
-    /// 指定スライスでの推論（Hot Path ゼロアロケーション）
+    /// 指定スライスでの推論（Event-driven 疎スパイク高速化 & ゼロアロケーション）
     public func forwardSlice(
         features: [Float],
         slice: MatryoshkaSlice,
@@ -310,7 +310,7 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             return
         }
         let hSize = min(slice.rawValue, maxHiddenDim)
-        
+
         // 1. 各ニューロンのスパイク積算リセット
         var i = 0
         while i < hSize {
@@ -318,31 +318,51 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             i += 1
         }
 
+        // 2. 入力電流の事前計算 (全タイムステップで不変のためループ外へ Hoist)
+        var inputCurrents = [Float](repeating: 0.0, count: hSize)
+        var n = 0
+        while n < hSize {
+            var curr = pBH.data[n]
+            let inOffset = n * inputDim
+            var d = 0
+            while d < inputDim {
+                curr += pWIn.data[inOffset + d] * features[d]
+                d += 1
+            }
+            inputCurrents[n] = curr
+            n += 1
+        }
+
         var vNext = [Float](repeating: 0.0, count: hSize)
         var sNext = [Float](repeating: 0.0, count: hSize)
+        var activeSpikes: [Int] = []
+        activeSpikes.reserveCapacity(hSize)
 
-        // 2. 時間ステップループ
+        // 3. 時間ステップループ (Event-driven 疎スパイク加算)
         var t = 0
         while t < timeSteps {
-            var n = 0
-            while n < hSize {
-                // 入力電流: bH + WIn * features
-                var current = pBH.data[n]
-                let inOffset = n * inputDim
-                var d = 0
-                while d < inputDim {
-                    current += pWIn.data[inOffset + d] * features[d]
-                    d += 1
+            // 3.1 直前ステップで発火したニューロンのインデックスのみを収集
+            activeSpikes.removeAll(keepingCapacity: true)
+            var j = 0
+            while j < hSize {
+                if sPrev[j] != 0.0 {
+                    activeSpikes.append(j)
                 }
+                j += 1
+            }
+            let activeCount = activeSpikes.count
 
-                // リカレント電流: WRec * sPrev (スパース加算)
+            n = 0
+            while n < hSize {
+                var current = inputCurrents[n]
                 let recOffset = n * maxHiddenDim
-                var j = 0
-                while j < hSize {
-                    if sPrev[j] != 0.0 {
-                        current += pWRec.data[recOffset + j]
-                    }
-                    j += 1
+
+                // 発火ニューロンの重みのみを加算 (ゼロ乗算を完全スキップ)
+                var a = 0
+                while a < activeCount {
+                    let spikeIdx = activeSpikes[a]
+                    current += pWRec.data[recOffset + spikeIdx]
+                    a += 1
                 }
 
                 // LIF ステップ
@@ -369,19 +389,36 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             t += 1
         }
 
-        // 3. リードアウト層計算 (スライスサイズに応じたスケール正規化)
+        // 4. リードアウト層計算 (Event-driven 疎加算 & スケール正規化)
         let invT = 1.0 / Float(timeSteps)
         let sliceNorm = sqrt(Float(maxHiddenDim) / Float(hSize))
+
+        var activeReadoutIndices: [Int] = []
+        var activeRates: [Float] = []
+        activeReadoutIndices.reserveCapacity(hSize)
+        activeRates.reserveCapacity(hSize)
+
+        var k = 0
+        while k < hSize {
+            let sRate = spikeSum[k] * invT
+            if sRate != 0.0 {
+                activeReadoutIndices.append(k)
+                activeRates.append(sRate)
+            }
+            k += 1
+        }
+        let activeOutCount = activeReadoutIndices.count
+
         var maxLogit: Float = -Float.greatestFiniteMagnitude
         var c = 0
         while c < outputDim {
             var sumW: Float = 0.0
             let wOffset = c * maxHiddenDim
-            var k = 0
-            while k < hSize {
-                let spikeRate = spikeSum[k] * invT
-                sumW += pWOut.data[wOffset + k] * spikeRate
-                k += 1
+            var a = 0
+            while a < activeOutCount {
+                let idx = activeReadoutIndices[a]
+                sumW += pWOut.data[wOffset + idx] * activeRates[a]
+                a += 1
             }
             let logit = pBOut.data[c] + (sumW * sliceNorm)
             logits[c] = logit
@@ -391,7 +428,7 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             c += 1
         }
 
-        // 4. Softmax
+        // 5. Softmax
         var sumExp: Float = 0.0
         c = 0
         while c < outputDim {
