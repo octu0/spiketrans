@@ -108,7 +108,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let lossB = computeSliceLoss(logits: logitsBase)
         let lossM = computeSliceLoss(logits: logitsMid)
         let lossH = computeSliceLoss(logits: logitsHigh)
-        let totalLoss = lossB + lossM + lossH
+        let totalLoss = (lossB * 0.1) + (lossM * 0.2) + (lossH * 1.0)
 
         return (totalLoss, lossB, lossM, lossH)
     }

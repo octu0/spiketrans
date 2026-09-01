@@ -331,17 +331,17 @@ extension SpiketransTrainer {
             segments.append(Segment(token: currToken, count: currCount))
         }
 
-        // 3. 短い pad (<= 2フレーム) を挟んだ同一文字のマージ
+        // 3. 短い pad / 制御トークン (<= 2フレーム) を挟んだ同一文字のマージ
         var mergedSegments: [Segment] = []
         var sIdx = 0
         while sIdx < segments.count {
             let seg = segments[sIdx]
-            if seg.token == TextVocabulary.padId && seg.count <= 2 {
+            if seg.token < 4 && seg.count <= 2 {
                 // 前後が同じ文字か確認
                 if 0 < mergedSegments.count && (sIdx + 1) < segments.count {
                     let prevToken = mergedSegments[mergedSegments.count - 1].token
                     let nextSeg = segments[sIdx + 1]
-                    if prevToken != TextVocabulary.padId && prevToken == nextSeg.token {
+                    if 4 <= prevToken && prevToken == nextSeg.token {
                         // マージして同一文字の継続とする
                         mergedSegments[mergedSegments.count - 1].count += nextSeg.count
                         sIdx += 2
@@ -353,13 +353,13 @@ extension SpiketransTrainer {
             sIdx += 1
         }
 
-        // 4. 有効文字の抽出 (minDurationFrames 以上, 連続重複除外)
+        // 4. 有効文字の抽出 (4 <= token かつ minDurationFrames 以上, 連続重複除外)
         var collapsedTokens: [Int] = []
         var lastEmittedToken = TextVocabulary.padId
         var mIdx = 0
         while mIdx < mergedSegments.count {
             let mSeg = mergedSegments[mIdx]
-            if mSeg.token != TextVocabulary.padId && minDurationFrames <= mSeg.count {
+            if 4 <= mSeg.token && minDurationFrames <= mSeg.count {
                 if mSeg.token != lastEmittedToken {
                     collapsedTokens.append(mSeg.token)
                     lastEmittedToken = mSeg.token
@@ -369,5 +369,61 @@ extension SpiketransTrainer {
         }
 
         return textVocabulary.idsToText(collapsedTokens)
+    }
+
+    /// 音響 SNN の対数確率から CTC プレフィックスビーム探索文字起こしを実行
+    public func transcribeAcousticCTC(
+        featuresSeq: [[Float]],
+        slice: MatryoshkaSlice = .high,
+        beamWidth: Int = 16
+    ) -> String {
+        let fwd = acousticTrainer.bpttTrainer.forwardSequenceLogProbs(featuresSeq: featuresSeq, slice: slice)
+        let decoder = CTCBeamDecoder(vocabulary: textVocabulary, blankId: 0, beamWidth: beamWidth)
+        let result = decoder.decode(logProbs: fwd.logProbs)
+        return result.text
+    }
+
+    /// 2段階音声文字起こし (第1段 音響 SNN かな推定 -> 第2段 漢字かな混じり文復元)
+    public func transcribeTwoStage(
+        featuresSeq: [[Float]],
+        kanjiVocabulary: TextVocabulary,
+        dictionary: KanaKanjiDictionary? = nil,
+        slice: MatryoshkaSlice = .high,
+        minDurationFrames: Int = 3,
+        minConfidence: Float = 0.05,
+        boundaries: [Int]? = nil,
+        useCTC: Bool = false
+    ) -> (kana: String, kanji: String) {
+        let kanaText: String
+        if useCTC {
+            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, slice: slice, beamWidth: 16)
+        } else {
+            kanaText = transcribeAcousticDirect(
+                featuresSeq: featuresSeq,
+                slice: slice,
+                minDurationFrames: minDurationFrames,
+                minConfidence: minConfidence,
+                boundaries: boundaries
+            )
+        }
+
+        var kanjiText = ""
+        switch dictionary {
+        case .some(let dict):
+            let decoder = KanaKanjiDecoder(dictionary: dict)
+            kanjiText = decoder.decode(kanaText: kanaText)
+        case .none:
+            let decoder = LanguageDecoder(
+                lmNetwork: languageTrainer.network,
+                vocabulary: kanjiVocabulary
+            )
+            kanjiText = decoder.decodeKanaToKanji(
+                kanaText: kanaText,
+                kanaVocabulary: textVocabulary,
+                slice: slice
+            )
+        }
+
+        return (kana: kanaText, kanji: kanjiText)
     }
 }

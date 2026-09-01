@@ -160,4 +160,128 @@ public final class LanguageTrainer: @unchecked Sendable {
         }
         return results
     }
+
+    /// ひらがな・音素系列から漢字テキストへの変換自己回帰学習を 1 エポック実行
+    public func trainKanaToKanjiEpoch(
+        dataset: SpeechDataset,
+        kanaVocabulary: TextVocabulary,
+        epoch: Int = 1,
+        numWorkers: Int = 1
+    ) -> EpochResult {
+        var sumTotalLoss: Float = 0.0
+        var sumBaseLoss: Float = 0.0
+        var sumMiddleLoss: Float = 0.0
+        var sumHighLoss: Float = 0.0
+        var validSampleCount = 0
+
+        let totalSamples = dataset.count
+        let batchSize = max(1, numWorkers)
+
+        final class BatchBuffer: @unchecked Sendable {
+            var grads: [NetworkGradients]
+            var losses: [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)]
+            var valid: [Bool]
+            init(count: Int, template: NetworkGradients) {
+                self.grads = [NetworkGradients](repeating: template, count: count)
+                self.losses = [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)](
+                    repeating: (0.0, 0.0, 0.0, 0.0),
+                    count: count
+                )
+                self.valid = [Bool](repeating: false, count: count)
+            }
+        }
+
+        var bStart = 0
+        while bStart < totalSamples {
+            let bEnd = min(totalSamples, bStart + batchSize)
+            let currentBatchCount = bEnd - bStart
+            let currentStart = bStart
+
+            let buffer = BatchBuffer(count: currentBatchCount, template: bpttTrainer.makeGradients())
+
+            DispatchQueue.concurrentPerform(iterations: currentBatchCount) { idx in
+                let sampleIdx = currentStart + idx
+                let sample = dataset[sampleIdx]
+                let kanaIds = kanaVocabulary.textToIds(sample.hiraganaText)
+                let kanjiIds = sample.textIds
+
+                if 0 < kanaIds.count && 0 < kanjiIds.count {
+                    // 入力: かなトークン特徴量系列
+                    var featSeq: [[Float]] = []
+                    var targetSeq: [Int] = []
+
+                    let stepCount = max(kanaIds.count, kanjiIds.count)
+                    var s = 0
+                    while s < stepCount {
+                        var kId = TextVocabulary.padId
+                        if s < kanaIds.count {
+                            kId = kanaIds[s]
+                        }
+                        featSeq.append(self.buildTokenFeature(tokenId: kId))
+
+                        var tId = TextVocabulary.padId
+                        if s < kanjiIds.count {
+                            tId = kanjiIds[s]
+                        }
+                        targetSeq.append(tId)
+                        s += 1
+                    }
+
+                    var localGrads = self.bpttTrainer.makeGradients()
+                    let loss = self.bpttTrainer.computeSampleGradients(
+                        featuresSeq: featSeq,
+                        targets: targetSeq,
+                        grads: &localGrads
+                    )
+                    buffer.grads[idx] = localGrads
+                    buffer.losses[idx] = loss
+                    buffer.valid[idx] = true
+                }
+            }
+
+            var combinedGrads = bpttTrainer.makeGradients()
+            var validInBatch = 0
+            var i = 0
+            while i < currentBatchCount {
+                if buffer.valid[i] {
+                    combinedGrads.accumulate(from: buffer.grads[i])
+                    let l = buffer.losses[i]
+                    sumTotalLoss += l.totalLoss
+                    sumBaseLoss += l.lossBase
+                    sumMiddleLoss += l.lossMiddle
+                    sumHighLoss += l.lossHigh
+                    validInBatch += 1
+                }
+                i += 1
+            }
+
+            if 0 < validInBatch {
+                bpttTrainer.applyGradientsAndStep(grads: combinedGrads, sampleCount: validInBatch)
+                validSampleCount += validInBatch
+            }
+
+            bStart = bEnd
+        }
+
+        var avgTotal: Float = 0.0
+        var avgBase: Float = 0.0
+        var avgMiddle: Float = 0.0
+        var avgHigh: Float = 0.0
+
+        if 0 < validSampleCount {
+            let invCount = 1.0 / Float(validSampleCount)
+            avgTotal = sumTotalLoss * invCount
+            avgBase = sumBaseLoss * invCount
+            avgMiddle = sumMiddleLoss * invCount
+            avgHigh = sumHighLoss * invCount
+        }
+
+        return EpochResult(
+            epoch: epoch,
+            totalLoss: avgTotal,
+            baseLoss: avgBase,
+            middleLoss: avgMiddle,
+            highLoss: avgHigh
+        )
+    }
 }

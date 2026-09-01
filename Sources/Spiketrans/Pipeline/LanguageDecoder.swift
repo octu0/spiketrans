@@ -340,4 +340,65 @@ public final class LanguageDecoder: @unchecked Sendable {
         let text = vocabulary.idsToText(bestHyp.tokenIds)
         return (tokens: bestHyp.tokenIds, text: text, score: bestHyp.score)
     }
+
+    /// ひらがな・音素テキスト系列から自己回帰言語 SNN により漢字かな混じりテキストを生成
+    public func decodeKanaToKanji(
+        kanaText: String,
+        kanaVocabulary: TextVocabulary,
+        slice: MatryoshkaSlice = .high
+    ) -> String {
+        if kanaText.isEmpty {
+            return ""
+        }
+
+        let kanaIds = kanaVocabulary.textToIds(kanaText)
+        if kanaIds.isEmpty {
+            return ""
+        }
+
+        let hSize = min(slice.rawValue, lmNetwork.maxHiddenDim)
+        let outDim = lmNetwork.outputDim
+        var vLM = [Float](repeating: 0.0, count: hSize)
+        var sLM = [Float](repeating: 0.0, count: hSize)
+        var spikeSumLM = [Float](repeating: 0.0, count: hSize)
+        var logitsLM = [Float](repeating: 0.0, count: outDim)
+        var probsLM = [Float](repeating: 0.0, count: outDim)
+
+        var outputTokens: [Int] = []
+        var kIdx = 0
+        while kIdx < kanaIds.count {
+            let kId = kanaIds[kIdx]
+            let feat = buildTokenFeature(tokenId: kId)
+
+            lmNetwork.forwardSlice(
+                features: feat,
+                slice: slice,
+                vPrev: &vLM,
+                sPrev: &sLM,
+                spikeSum: &spikeSumLM,
+                logits: &logitsLM,
+                probabilities: &probsLM
+            )
+
+            // Top-1 漢字トークン（4 <= ID）の選択
+            var bestTokId = -1
+            var bestProb: Float = -1.0
+            var tId = 4
+            while tId < outDim {
+                let p = probsLM[tId]
+                if bestProb < p {
+                    bestProb = p
+                    bestTokId = tId
+                }
+                tId += 1
+            }
+
+            if 4 <= bestTokId {
+                outputTokens.append(bestTokId)
+            }
+            kIdx += 1
+        }
+
+        return vocabulary.idsToText(outputTokens)
+    }
 }

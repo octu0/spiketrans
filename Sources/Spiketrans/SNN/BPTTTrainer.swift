@@ -539,4 +539,278 @@ public final class BPTTTrainer: @unchecked Sendable {
         applyGradientsAndStep(grads: grads, sampleCount: 1)
         return result
     }
+
+    /// 単一スライスのシーケンス順伝播と対数確率系列の生成
+    public func forwardSequenceLogProbs(
+        featuresSeq: [[Float]],
+        slice: MatryoshkaSlice
+    ) -> (cache: ForwardCache, logProbs: [[Float]]) {
+        let seqLen = featuresSeq.count
+        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let tSteps = network.timeSteps
+        let outDim = network.outputDim
+
+        let cache = ForwardCache(seqLen: seqLen, timeSteps: tSteps, hiddenDim: hSize, outputDim: outDim)
+        var logProbs = [[Float]](repeating: [Float](repeating: 0.0, count: outDim), count: seqLen)
+        if seqLen <= 0 {
+            return (cache, logProbs)
+        }
+
+        var vPrev = [Float](repeating: 0.0, count: hSize)
+        var sPrev = [Float](repeating: 0.0, count: hSize)
+
+        var k = 0
+        while k < seqLen {
+            let feat = featuresSeq[k]
+            var spikeSum = [Float](repeating: 0.0, count: hSize)
+
+            var t = 0
+            while t < tSteps {
+                var vNew = [Float](repeating: 0.0, count: hSize)
+                var sNew = [Float](repeating: 0.0, count: hSize)
+
+                var i = 0
+                while i < hSize {
+                    let wInOffset = i * network.inputDim
+                    var current: Float = network.pBH.data[i]
+                    var d = 0
+                    while d < network.inputDim {
+                        current += network.pWIn.data[wInOffset + d] * feat[d]
+                        d += 1
+                    }
+
+                    let wRecOffset = i * network.maxHiddenDim
+                    var j = 0
+                    while j < hSize {
+                        current += network.pWRec.data[wRecOffset + j] * sPrev[j]
+                        j += 1
+                    }
+
+                    let vDecayed = network.lifConfig.beta * vPrev[i] * (1.0 - sPrev[i])
+                    let vUpdated = vDecayed + current
+                    vNew[i] = vUpdated
+
+                    if network.lifConfig.vTh <= vUpdated {
+                        sNew[i] = 1.0
+                    }
+                    if vUpdated < network.lifConfig.vTh {
+                        sNew[i] = 0.0
+                    }
+
+                    spikeSum[i] += sNew[i]
+                    cache.vStates[k][t][i] = vNew[i]
+                    cache.sStates[k][t][i] = sNew[i]
+                    i += 1
+                }
+
+                vPrev = vNew
+                sPrev = sNew
+                t += 1
+            }
+
+            let invT = 1.0 / Float(tSteps)
+            var i = 0
+            while i < hSize {
+                let sAvg = spikeSum[i] * invT
+                cache.spikeAvg[k][i] = sAvg
+                i += 1
+            }
+
+            // 出力層ロジット計算
+            var maxL: Float = -.infinity
+            var c = 0
+            while c < outDim {
+                var sum: Float = network.pBOut.data[c]
+                let wOutOffset = c * network.maxHiddenDim
+                var h = 0
+                while h < hSize {
+                    sum += network.pWOut.data[wOutOffset + h] * cache.spikeAvg[k][h]
+                    h += 1
+                }
+                cache.logits[k][c] = sum
+                if maxL < sum {
+                    maxL = sum
+                }
+                c += 1
+            }
+
+            // Log-Softmax
+            var sumExp: Float = 0.0
+            c = 0
+            while c < outDim {
+                let e = exp(cache.logits[k][c] - maxL)
+                cache.probs[k][c] = e
+                sumExp += e
+                c += 1
+            }
+            let logSumExp = maxL + log(max(1e-12, sumExp))
+            c = 0
+            while c < outDim {
+                logProbs[k][c] = cache.logits[k][c] - logSumExp
+                cache.probs[k][c] /= max(1e-12, sumExp)
+                c += 1
+            }
+
+            k += 1
+        }
+
+        return (cache, logProbs)
+    }
+
+    /// CTC 損失から供給された勾配 (dLogits: T x V) による時間逆伝播
+    public func backwardCTCSequence(
+        featuresSeq: [[Float]],
+        dLogits: [[Float]],
+        cache: ForwardCache,
+        slice: MatryoshkaSlice,
+        lossWeight: Float = 1.0,
+        grads: inout NetworkGradients
+    ) {
+        let seqLen = cache.seqLen
+        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let tSteps = cache.timeSteps
+        let outDim = cache.outputDim
+
+        if seqLen <= 0 {
+            return
+        }
+
+        var dVNextStep = [Float](repeating: 0.0, count: hSize)
+        var dSNextStep = [Float](repeating: 0.0, count: hSize)
+        let invT = 1.0 / Float(tSteps)
+
+        var k = seqLen - 1
+        while 0 <= k {
+            let feat = featuresSeq[k]
+            let spikeAvg = cache.spikeAvg[k]
+
+            // 1. 出力層の勾配計算
+            var dSpikeAvg = [Float](repeating: 0.0, count: hSize)
+            var c = 0
+            while c < outDim {
+                let dL = dLogits[k][c] * lossWeight
+                grads.gradBOut[c] += dL
+
+                let wOutOffset = c * network.maxHiddenDim
+                var h = 0
+                while h < hSize {
+                    grads.gradWOut[wOutOffset + h] += dL * spikeAvg[h]
+                    dSpikeAvg[h] += network.pWOut.data[wOutOffset + h] * dL
+                    h += 1
+                }
+                c += 1
+            }
+
+            // 2. 隠れ層タイムステップ逆伝播
+            var t = tSteps - 1
+            while 0 <= t {
+                let vCurr = cache.vStates[k][t]
+                let sCurr = cache.sStates[k][t]
+                let vPrev: [Float]
+                let sPrev: [Float]
+
+                if 0 < t {
+                    vPrev = cache.vStates[k][t - 1]
+                    sPrev = cache.sStates[k][t - 1]
+                } else {
+                    if 0 < k {
+                        vPrev = cache.vStates[k - 1][tSteps - 1]
+                        sPrev = cache.sStates[k - 1][tSteps - 1]
+                    } else {
+                        vPrev = [Float](repeating: 0.0, count: hSize)
+                        sPrev = [Float](repeating: 0.0, count: hSize)
+                    }
+                }
+
+                var dVThisStep = [Float](repeating: 0.0, count: hSize)
+                var dSThisStep = [Float](repeating: 0.0, count: hSize)
+
+                var i = 0
+                while i < hSize {
+                    let dS = (dSpikeAvg[i] * invT) + dSNextStep[i]
+                    let surrogate = SurrogateGradient.derivative(
+                        v: vCurr[i],
+                        vTh: network.lifConfig.vTh,
+                        alpha: network.lifConfig.alpha
+                    )
+                    let dV = dVNextStep[i] + (dS * surrogate)
+
+                    // 入力重み勾配
+                    let wInOffset = i * network.inputDim
+                    var d = 0
+                    while d < network.inputDim {
+                        grads.gradWIn[wInOffset + d] += dV * feat[d]
+                        d += 1
+                    }
+
+                    // 再帰重み勾配
+                    let wRecOffset = i * network.maxHiddenDim
+                    var j = 0
+                    while j < hSize {
+                        grads.gradWRec[wRecOffset + j] += dV * sPrev[j]
+                        dSThisStep[j] += network.pWRec.data[wRecOffset + j] * dV
+                        j += 1
+                    }
+
+                    dVThisStep[i] = dV * network.lifConfig.beta * (1.0 - sPrev[i])
+                    i += 1
+                }
+
+                dVNextStep = dVThisStep
+                dSNextStep = dSThisStep
+                t -= 1
+            }
+
+            k -= 1
+        }
+    }
+
+    /// CTC 損失による Matryoshka 多重スライス勾配計算
+    public func computeSampleCTCGradients(
+        featuresSeq: [[Float]],
+        targets: [Int],
+        grads: inout NetworkGradients,
+        ctcLossCalc: CTCLossCalculator = CTCLossCalculator(blankId: 0)
+    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
+        var totalLoss: Float = 0.0
+        var lossBase: Float = 0.0
+        var lossMiddle: Float = 0.0
+        var lossHigh: Float = 0.0
+
+        for slice in MatryoshkaSlice.allCases {
+            let lossWeight: Float
+            switch slice {
+            case .base:
+                lossWeight = 0.2
+            case .middle:
+                lossWeight = 0.3
+            case .high:
+                lossWeight = 0.5
+            }
+
+            let fwd = forwardSequenceLogProbs(featuresSeq: featuresSeq, slice: slice)
+            let ctcResult = ctcLossCalc.computeLossAndGradients(logProbs: fwd.logProbs, targets: targets)
+
+            switch slice {
+            case .base:
+                lossBase = ctcResult.loss
+            case .middle:
+                lossMiddle = ctcResult.loss
+            case .high:
+                lossHigh = ctcResult.loss
+            }
+            totalLoss += ctcResult.loss * lossWeight
+
+            backwardCTCSequence(
+                featuresSeq: featuresSeq,
+                dLogits: ctcResult.gradients,
+                cache: fwd.cache,
+                slice: slice,
+                lossWeight: lossWeight,
+                grads: &grads
+            )
+        }
+
+        return (totalLoss, lossBase, lossMiddle, lossHigh)
+    }
 }

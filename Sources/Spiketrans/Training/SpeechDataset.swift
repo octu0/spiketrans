@@ -4,26 +4,29 @@ import Foundation
 public struct AudioTextSample: Sendable {
     public let audioPCM: [Float]
     public let rawText: String
+    public let hiraganaText: String
     public let textIds: [Int]
-    public let phonemeIds: [Int] // フォールバック音素教師（ひらがな・カタカナのみ、漢字はpad）
-    public let acousticFeatures: [[Float]] // [frames][64]
+    public let phonemeIds: [Int]
+    public let acousticFeatures: [[Float]] // [frames][128]
 
     public init(
         audioPCM: [Float],
         rawText: String,
+        hiraganaText: String = "",
         textIds: [Int],
         phonemeIds: [Int] = [],
         acousticFeatures: [[Float]]
     ) {
         self.audioPCM = audioPCM
         self.rawText = rawText
+        self.hiraganaText = hiraganaText
         self.textIds = textIds
         self.phonemeIds = phonemeIds
         self.acousticFeatures = acousticFeatures
     }
 }
 
-/// 音声・漢字テキスト学習用データセット (読み変換不要・直接漢字テキストを学習)
+/// 音声・漢字テキスト学習用データセット (音素・かな音響学習 & 言語SNN統合)
 public final class SpeechDataset: @unchecked Sendable {
     public let samples: [AudioTextSample]
 
@@ -39,26 +42,10 @@ public final class SpeechDataset: @unchecked Sendable {
         return samples[index]
     }
 
-    /// テキスト中のひらがな・カタカナのみを音素化（漢字は読み推定せず pad）
+    /// テキスト中の全発音から音素トークン ID 列を抽出
     public static func extractFallbackPhonemeIds(text: String, phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary()) -> [Int] {
-        var phonemeTokens: [Int] = []
         let converter = KanjiConverter(vocabulary: phonemeVocabulary)
-        let normalized = converter.normalizeKana(text)
-
-        for c in normalized {
-            let scalarVal = c.unicodeScalars.first?.value ?? 0
-            if 0x3041 <= scalarVal && scalarVal <= 0x3096 || c == "ー" {
-                let pList = phonemeVocabulary.kanaToPhonemes(String(c))
-                var pIdx = 0
-                while pIdx < pList.count {
-                    phonemeTokens.append(phonemeVocabulary.id(for: pList[pIdx]))
-                    pIdx += 1
-                }
-            } else {
-                phonemeTokens.append(PhonemeVocabulary.padId)
-            }
-        }
-        return phonemeTokens
+        return converter.toPhonemeTokenIds(text)
     }
 
     /// 任意のサンプリングレートの PCM データを 16kHz にリサンプリング (48kHz時は 3 サンプル平均のアンチエイリアシング間引き)
@@ -119,13 +106,16 @@ public final class SpeechDataset: @unchecked Sendable {
             let wavData = try parser.parse(bytes: pair.wavBytes)
             let pcm16k = resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
             let textIds = textVocabulary.textToIds(pair.text)
-            let phonemeIds = extractFallbackPhonemeIds(text: pair.text, phonemeVocabulary: phonemeVocabulary)
+            let converter = KanjiConverter(vocabulary: phonemeVocabulary)
+            let hiraganaText = converter.convertToHiragana(pair.text)
+            let phonemeIds = converter.toPhonemeTokenIds(pair.text)
             let featuresSeq = extractFeaturesFromPCM(pcmData: pcm16k)
 
             if 0 < featuresSeq.count {
                 sampleList.append(AudioTextSample(
                     audioPCM: pcm16k,
                     rawText: pair.text,
+                    hiraganaText: hiraganaText,
                     textIds: textIds,
                     phonemeIds: phonemeIds,
                     acousticFeatures: featuresSeq

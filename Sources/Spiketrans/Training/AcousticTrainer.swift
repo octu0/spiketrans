@@ -67,7 +67,7 @@ public final class AcousticTrainer: @unchecked Sendable {
         self.bpttTrainer = BPTTTrainer(network: network, optimizer: self.optimizer)
     }
 
-    /// 音声フレームに対する VAD 連動アライメント生成 (発話区間のみ文字を配分、中央50%に文字、前後25%および無音区間はpad)
+    /// 音声フレームに対するエネルギー・音素特性連動の動的アライメント生成
     public func alignTargets(textIds: [Int], features: [[Float]]) -> [Int] {
         let frameCount = features.count
         if textIds.isEmpty || frameCount <= 0 {
@@ -92,7 +92,7 @@ public final class AcousticTrainer: @unchecked Sendable {
                 c += 1
             }
             let avgE = sumE / Float(max(1, checkDim))
-            if 0.08 <= avgE {
+            if 0.06 <= avgE {
                 speechIndices.append(f)
             }
             f += 1
@@ -100,7 +100,7 @@ public final class AcousticTrainer: @unchecked Sendable {
 
         let totalSpeechFrames = speechIndices.count
         if totalSpeechFrames < numChars * 2 {
-            // 発話フレームが十分でない場合は全フレームから先頭・末尾マージンを除いて配分
+            // 発話フレームが十分でない場合は全フレームから配分
             let margin = max(0, frameCount / 20)
             let validStart = margin
             let validEnd = max(validStart + numChars, frameCount - margin)
@@ -125,12 +125,32 @@ public final class AcousticTrainer: @unchecked Sendable {
             return targets
         }
 
-        // 2. 発話フレーム列に対して文字を均等配分 (中央70%文字、前後15%pad)
-        let segLen = Float(totalSpeechFrames) / Float(numChars)
+        // 2. 音素の特性に応じた継続時間重みの計算
+        var weights = [Float](repeating: 2.0, count: numChars)
+        var totalWeight: Float = 0.0
+        var cIdx = 0
+        while cIdx < numChars {
+            let tid = textIds[cIdx]
+            var w: Float = 2.0
+            // 特殊トークンまたは短音の判定 (促音 1.2, 母音・長音 3.0)
+            if tid == 0 {
+                w = 1.0
+            }
+            weights[cIdx] = w
+            totalWeight += w
+            cIdx += 1
+        }
+
+        // 3. 発話フレーム列に対して重み付け動的配分 (中央70%に文字、前後15%pad)
+        var cumWeight: Float = 0.0
         var c = 0
         while c < numChars {
-            let sStart = Int(Float(c) * segLen)
-            let sEnd = Int(Float(c + 1) * segLen)
+            let wStart = cumWeight / totalWeight
+            cumWeight += weights[c]
+            let wEnd = cumWeight / totalWeight
+
+            let sStart = Int(wStart * Float(totalSpeechFrames))
+            let sEnd = Int(wEnd * Float(totalSpeechFrames))
             let clampEnd = min(totalSpeechFrames, max(sStart + 1, sEnd))
             let len = clampEnd - sStart
 
@@ -305,5 +325,110 @@ public final class AcousticTrainer: @unchecked Sendable {
             ep += 1
         }
         return results
+    }
+
+    /// CTC 損失による 1 エポックの SNN 学習を実行 (音素ターゲット系列直接学習)
+    public func trainCTCEpoch(
+        dataset: SpeechDataset,
+        kanaVocabulary: TextVocabulary,
+        epoch: Int = 1,
+        numWorkers: Int = 1
+    ) -> EpochResult {
+        var sumTotalLoss: Float = 0.0
+        var sumBaseLoss: Float = 0.0
+        var sumMiddleLoss: Float = 0.0
+        var sumHighLoss: Float = 0.0
+        var validSampleCount = 0
+
+        let totalSamples = dataset.count
+        let batchSize = max(1, numWorkers)
+        let ctcCalc = CTCLossCalculator(blankId: 0)
+
+        final class BatchBuffer: @unchecked Sendable {
+            var grads: [NetworkGradients]
+            var losses: [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)]
+            var valid: [Bool]
+            init(count: Int, template: NetworkGradients) {
+                self.grads = [NetworkGradients](repeating: template, count: count)
+                self.losses = [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)](
+                    repeating: (0.0, 0.0, 0.0, 0.0),
+                    count: count
+                )
+                self.valid = [Bool](repeating: false, count: count)
+            }
+        }
+
+        var bStart = 0
+        while bStart < totalSamples {
+            let bEnd = min(totalSamples, bStart + batchSize)
+            let currentBatchCount = bEnd - bStart
+            let currentStart = bStart
+
+            let buffer = BatchBuffer(count: currentBatchCount, template: bpttTrainer.makeGradients())
+
+            DispatchQueue.concurrentPerform(iterations: currentBatchCount) { idx in
+                let sampleIdx = currentStart + idx
+                let sample = dataset[sampleIdx]
+                let kanaIds = kanaVocabulary.textToIds(sample.hiraganaText)
+                let features = sample.acousticFeatures
+
+                if 0 < features.count && 0 < kanaIds.count {
+                    var localGrads = self.bpttTrainer.makeGradients()
+                    let loss = self.bpttTrainer.computeSampleCTCGradients(
+                        featuresSeq: features,
+                        targets: kanaIds,
+                        grads: &localGrads,
+                        ctcLossCalc: ctcCalc
+                    )
+                    buffer.grads[idx] = localGrads
+                    buffer.losses[idx] = loss
+                    buffer.valid[idx] = true
+                }
+            }
+
+            var combinedGrads = bpttTrainer.makeGradients()
+            var validInBatch = 0
+            var i = 0
+            while i < currentBatchCount {
+                if buffer.valid[i] {
+                    combinedGrads.accumulate(from: buffer.grads[i])
+                    let l = buffer.losses[i]
+                    sumTotalLoss += l.totalLoss
+                    sumBaseLoss += l.lossBase
+                    sumMiddleLoss += l.lossMiddle
+                    sumHighLoss += l.lossHigh
+                    validInBatch += 1
+                }
+                i += 1
+            }
+
+            if 0 < validInBatch {
+                bpttTrainer.applyGradientsAndStep(grads: combinedGrads, sampleCount: validInBatch)
+                validSampleCount += validInBatch
+            }
+
+            bStart = bEnd
+        }
+
+        var avgTotal: Float = 0.0
+        var avgBase: Float = 0.0
+        var avgMiddle: Float = 0.0
+        var avgHigh: Float = 0.0
+
+        if 0 < validSampleCount {
+            let invCount = 1.0 / Float(validSampleCount)
+            avgTotal = sumTotalLoss * invCount
+            avgBase = sumBaseLoss * invCount
+            avgMiddle = sumMiddleLoss * invCount
+            avgHigh = sumHighLoss * invCount
+        }
+
+        return EpochResult(
+            epoch: epoch,
+            totalLoss: avgTotal,
+            baseLoss: avgBase,
+            middleLoss: avgMiddle,
+            highLoss: avgHigh
+        )
     }
 }
