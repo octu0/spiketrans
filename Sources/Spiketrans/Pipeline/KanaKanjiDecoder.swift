@@ -333,13 +333,73 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
 public final class KanaKanjiDecoder: @unchecked Sendable {
     public let dictionary: KanaKanjiDictionary
     public let languageDecoder: LanguageDecoder?
+    /// 言語 SNN に入力するかな側の語彙 (languageDecoder 併用時に必須)
+    public let kanaVocabulary: TextVocabulary?
+    /// 言語 SNN のスライス
+    public let languageSlice: MatryoshkaSlice
+    /// 言語 SNN の予測と一致した 1 文字あたりの加点 (0.0 で言語 SNN を無効化)
+    public let languageBonus: Float
 
     public init(
         dictionary: KanaKanjiDictionary,
-        languageDecoder: LanguageDecoder? = nil
+        languageDecoder: LanguageDecoder? = nil,
+        kanaVocabulary: TextVocabulary? = nil,
+        languageSlice: MatryoshkaSlice = .high,
+        languageBonus: Float = 4.0
     ) {
         self.dictionary = dictionary
         self.languageDecoder = languageDecoder
+        self.kanaVocabulary = kanaVocabulary
+        self.languageSlice = languageSlice
+        self.languageBonus = languageBonus
+    }
+
+    /// 区間 [start, end) のかなに対する言語 SNN 予測と表記の一致文字数を数える
+    private func languageAgreement(
+        surface: String,
+        hints: [Character?],
+        start: Int,
+        end: Int
+    ) -> Float {
+        if hints.isEmpty {
+            return 0.0
+        }
+
+        var available: [Character] = []
+        available.reserveCapacity(end - start)
+        var h = start
+        while h < end {
+            if h < hints.count {
+                switch hints[h] {
+                case .some(let c):
+                    available.append(c)
+                case .none:
+                    break
+                }
+            }
+            h += 1
+        }
+        if available.isEmpty {
+            return 0.0
+        }
+
+        var matched: Float = 0.0
+        for ch in surface {
+            var found = -1
+            var a = 0
+            while a < available.count {
+                if available[a] == ch {
+                    found = a
+                    break
+                }
+                a += 1
+            }
+            if 0 <= found {
+                available.remove(at: found)
+                matched += 1.0
+            }
+        }
+        return matched
     }
 
     /// 助詞・機能語の保護判定
@@ -366,6 +426,26 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
 
         let chars = Array(kanaText)
         let n = chars.count
+
+        // 第2段 言語 SNN による、かな 1 文字ごとの漢字予測 (DP の区間スコアに加算)
+        var lmHints: [Character?] = []
+        switch languageDecoder {
+        case .some(let lmDecoder):
+            switch kanaVocabulary {
+            case .some(let kanaVocab):
+                if 0.0 < languageBonus {
+                    lmHints = lmDecoder.predictKanjiPerKana(
+                        kanaText: kanaText,
+                        kanaVocabulary: kanaVocab,
+                        slice: languageSlice
+                    )
+                }
+            case .none:
+                break
+            }
+        case .none:
+            break
+        }
 
         struct DPState {
             var score: Float
@@ -425,7 +505,15 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
                         transScore = prob * 8.0
                     }
 
-                    let nextScore = curScore + bonus + Float(entry.frequency * 3) + transScore
+                    // 第2段 言語 SNN の予測と一致した文字数に応じた加点
+                    let lmScore = languageBonus * languageAgreement(
+                        surface: entry.surface,
+                        hints: lmHints,
+                        start: i,
+                        end: i + l
+                    )
+
+                    let nextScore = curScore + bonus + Float(entry.frequency * 3) + transScore + lmScore
                     if dp[i + l].score < nextScore {
                         dp[i + l] = DPState(score: nextScore, text: curText + entry.surface, lastWord: entry.surface)
                     }
@@ -447,7 +535,14 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
                             transScore = prob * 6.0
                         }
 
-                        let nextScore = curScore + bonus + Float(entry.frequency) + transScore
+                        let lmScore = languageBonus * languageAgreement(
+                            surface: entry.surface,
+                            hints: lmHints,
+                            start: i,
+                            end: i + l
+                        )
+
+                        let nextScore = curScore + bonus + Float(entry.frequency) + transScore + lmScore
                         if dp[i + l].score < nextScore {
                             dp[i + l] = DPState(score: nextScore, text: curText + entry.surface, lastWord: entry.surface)
                         }

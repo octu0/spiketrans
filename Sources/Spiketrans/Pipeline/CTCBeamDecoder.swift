@@ -22,20 +22,26 @@ public final class CTCBeamDecoder: @unchecked Sendable {
     public let blankId: Int
     public let beamWidth: Int
     public let lmWeight: Float
+    /// 文字数に応じた対数スコアへの加点。対数確率と単位が異なるため既定は 0.0。
+    /// 正値にすると未収束モデルで長い繰り返し出力が選ばれやすくなる。
     public let lengthBonus: Float
+    /// 1 フレームあたりに展開する非 Blank トークンの上限 (確率上位から選択)
+    public let tokenPruneCount: Int
 
     public init(
         vocabulary: TextVocabulary,
         blankId: Int = 0,
         beamWidth: Int = 16,
         lmWeight: Float = 0.3,
-        lengthBonus: Float = 0.1
+        lengthBonus: Float = 0.0,
+        tokenPruneCount: Int = 8
     ) {
         self.vocabulary = vocabulary
         self.blankId = blankId
         self.beamWidth = beamWidth
         self.lmWeight = lmWeight
         self.lengthBonus = lengthBonus
+        self.tokenPruneCount = max(1, tokenPruneCount)
     }
 
     /// 対数確率系列 (T x V) から CTC プレフィックスビーム探索により最尤テキストをデコード
@@ -52,10 +58,46 @@ public final class CTCBeamDecoder: @unchecked Sendable {
             []: CTCPrefixHypothesis(prefix: [], pBlank: 0.0, pNonBlank: -.infinity)
         ]
 
+        // 展開候補トークンのバッファ (毎フレーム再利用してアロケーションを避ける)
+        var candidateTokens = [Int](repeating: 0, count: max(1, vCount))
+        var candidateScores = [Float](repeating: -.infinity, count: max(1, vCount))
+
         var t = 0
         while t < tCount {
             let lp = logProbs[t]
             var nextBeams: [[Int]: CTCPrefixHypothesis] = [:]
+
+            // 全語彙を展開すると T × beam × V 回のプレフィックス辞書操作となり非常に遅いため、
+            // このフレームで確率上位の tokenPruneCount 個だけを展開対象とする。
+            var candidateCount = 0
+            var c = 1
+            while c < vCount {
+                let p = lp[c]
+                if candidateCount < tokenPruneCount {
+                    // まだ空きがあるので挿入位置を探して挿入
+                    var insertAt = candidateCount
+                    while 0 < insertAt && candidateScores[insertAt - 1] < p {
+                        candidateScores[insertAt] = candidateScores[insertAt - 1]
+                        candidateTokens[insertAt] = candidateTokens[insertAt - 1]
+                        insertAt -= 1
+                    }
+                    candidateScores[insertAt] = p
+                    candidateTokens[insertAt] = c
+                    candidateCount += 1
+                } else {
+                    if candidateScores[candidateCount - 1] < p {
+                        var insertAt = candidateCount - 1
+                        while 0 < insertAt && candidateScores[insertAt - 1] < p {
+                            candidateScores[insertAt] = candidateScores[insertAt - 1]
+                            candidateTokens[insertAt] = candidateTokens[insertAt - 1]
+                            insertAt -= 1
+                        }
+                        candidateScores[insertAt] = p
+                        candidateTokens[insertAt] = c
+                    }
+                }
+                c += 1
+            }
 
             for (_, hyp) in beams {
                 let pBlankCurr = lp[blankId]
@@ -66,9 +108,10 @@ public final class CTCBeamDecoder: @unchecked Sendable {
                 existingSame.pBlank = CTCLossCalculator.logAdd(existingSame.pBlank, pBNext)
                 nextBeams[hyp.prefix] = existingSame
 
-                // 2. Non-Blank トークンの遷移
-                var c = 1
-                while c < vCount {
+                // 2. Non-Blank トークンの遷移 (確率上位の候補のみ展開)
+                var ci = 0
+                while ci < candidateCount {
+                    let c = candidateTokens[ci]
                     let pChar = lp[c]
                     var endToken = -1
                     if 0 < hyp.prefix.count {
@@ -99,7 +142,7 @@ public final class CTCBeamDecoder: @unchecked Sendable {
                         existingNew.pNonBlank = CTCLossCalculator.logAdd(existingNew.pNonBlank, pNew)
                         nextBeams[newPref] = existingNew
                     }
-                    c += 1
+                    ci += 1
                 }
             }
 

@@ -9,8 +9,11 @@ public final class AcousticWorkspace: @unchecked Sendable {
     public var logits: [Float]
     public var probabilities: [Float]
     public var quantizedWorkspace: QuantizedWorkspace?
+    /// forwardSlice の中間バッファ (Hot Path ゼロアロケーション用)
+    public let scratch: MatryoshkaScratch
 
     public init(maxHiddenDim: Int = 4096, outputDim: Int = 523, inputDim: Int = 64) {
+        self.scratch = MatryoshkaScratch(maxHiddenDim: maxHiddenDim)
         self.vPrev = [Float](repeating: 0.0, count: maxHiddenDim)
         self.sPrev = [Float](repeating: 0.0, count: maxHiddenDim)
         self.aPrev = [Float](repeating: 0.0, count: maxHiddenDim)
@@ -137,7 +140,8 @@ public final class AcousticDecoder: @unchecked Sendable {
                 aPrev: &workspace.aPrev,
                 spikeSum: &workspace.spikeSum,
                 logits: &workspace.logits,
-                probabilities: &workspace.probabilities
+                probabilities: &workspace.probabilities,
+                scratch: workspace.scratch
             )
         }
 

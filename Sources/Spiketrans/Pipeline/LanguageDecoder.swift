@@ -100,6 +100,8 @@ public final class LanguageDecoder: @unchecked Sendable {
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
 
+        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
+
         var prevToken = TextVocabulary.sosId
         var accumulatedScore: Float = 0.0
         var selectedTokens: [Int] = []
@@ -125,7 +127,8 @@ public final class LanguageDecoder: @unchecked Sendable {
                 aPrev: &aLM,
                 spikeSum: &spikeSumLM,
                 logits: &logitsLM,
-                probabilities: &probsLM
+                probabilities: &probsLM,
+                scratch: scratchLM
             )
 
             // 2. 結合スコア最大トークンの選択
@@ -141,7 +144,16 @@ public final class LanguageDecoder: @unchecked Sendable {
 
                 switch tokId {
                 case TextVocabulary.padId:
-                    score = log(pAc) + config.blankPenalty
+                    score = log(pAc) - config.blankPenalty
+                case TextVocabulary.unkId:
+                    score = log(pAc) - 1.0 // 未知トークンのペナルティ
+                case TextVocabulary.eosId:
+                    // 系列の途中で eos を選ぶと出力が途中で切れるため終端付近のみ許可
+                    if acousticProbs.count - 5 <= fIdx {
+                        score = log(pAc) + (config.lmWeight * log(pLm))
+                    } else {
+                        score = -Float.greatestFiniteMagnitude
+                    }
                 default:
                     score = log(pAc) + (config.lmWeight * log(pLm)) + config.wordBonus
                 }
@@ -214,6 +226,7 @@ public final class LanguageDecoder: @unchecked Sendable {
         var spikeSumLM = [Float](repeating: 0.0, count: hSize)
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
+        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
 
         var fIdx = 0
         while fIdx < acousticProbs.count {
@@ -236,7 +249,10 @@ public final class LanguageDecoder: @unchecked Sendable {
 
                 var vLM = hyp.lmVState
                 var sLM = hyp.lmSState
-                var aLM = hyp.lmAState.isEmpty ? [Float](repeating: 0.0, count: hSize) : hyp.lmAState
+                var aLM = hyp.lmAState
+                if aLM.isEmpty {
+                    aLM = [Float](repeating: 0.0, count: hSize)
+                }
                 let tokenFeatures = buildTokenFeature(tokenId: prevTok)
 
                 lmNetwork.forwardSlice(
@@ -247,7 +263,8 @@ public final class LanguageDecoder: @unchecked Sendable {
                     aPrev: &aLM,
                     spikeSum: &spikeSumLM,
                     logits: &logitsLM,
-                    probabilities: &probsLM
+                    probabilities: &probsLM,
+                    scratch: scratchLM
                 )
 
                 // 各候補トークンを展開
@@ -259,7 +276,18 @@ public final class LanguageDecoder: @unchecked Sendable {
 
                     switch tokId {
                     case TextVocabulary.padId:
-                        let newScore = hyp.score + log(pAc) + config.blankPenalty
+                        let newScore = hyp.score + log(pAc) - config.blankPenalty
+                        candidates.append(BeamHypothesis(
+                            tokenIds: hyp.tokenIds,
+                            score: newScore,
+                            lmVState: vLM,
+                            lmSState: sLM,
+                            lmAState: aLM,
+                            isFinished: false
+                        ))
+                    case TextVocabulary.unkId:
+                        // 未知トークンのペナルティ (系列には追加しない)
+                        let newScore = hyp.score + log(pAc) - 1.0
                         candidates.append(BeamHypothesis(
                             tokenIds: hyp.tokenIds,
                             score: newScore,
@@ -269,15 +297,18 @@ public final class LanguageDecoder: @unchecked Sendable {
                             isFinished: false
                         ))
                     case TextVocabulary.eosId:
-                        let newScore = hyp.score + log(pAc) + (config.lmWeight * log(pLm))
-                        candidates.append(BeamHypothesis(
-                            tokenIds: hyp.tokenIds,
-                            score: newScore,
-                            lmVState: vLM,
-                            lmSState: sLM,
-                            lmAState: aLM,
-                            isFinished: true
-                        ))
+                        // 系列の途中で確定させると出力が途中で切れるため終端付近のみ許可
+                        if acousticProbs.count - 5 <= fIdx {
+                            let newScore = hyp.score + log(pAc) + (config.lmWeight * log(pLm))
+                            candidates.append(BeamHypothesis(
+                                tokenIds: hyp.tokenIds,
+                                score: newScore,
+                                lmVState: vLM,
+                                lmSState: sLM,
+                                lmAState: aLM,
+                                isFinished: true
+                            ))
+                        }
                     default:
                         var newTokens = hyp.tokenIds
                         // 連続同一トークンの重複圧縮判定 (直前が同じトークンかつ直前が pad でない場合はマージ)
@@ -357,6 +388,8 @@ public final class LanguageDecoder: @unchecked Sendable {
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
 
+        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
+
         var outputTokens: [Int] = []
         var kIdx = 0
         while kIdx < kanaIds.count {
@@ -371,7 +404,8 @@ public final class LanguageDecoder: @unchecked Sendable {
                 aPrev: &aLM,
                 spikeSum: &spikeSumLM,
                 logits: &logitsLM,
-                probabilities: &probsLM
+                probabilities: &probsLM,
+                scratch: scratchLM
             )
 
             // Top-1 漢字トークン（4 <= ID）の選択
@@ -394,5 +428,75 @@ public final class LanguageDecoder: @unchecked Sendable {
         }
 
         return vocabulary.idsToText(outputTokens)
+    }
+
+    /// かな 1 文字ごとに言語 SNN が予測する漢字 1 文字を返す (予測不能な位置は nil)
+    ///
+    /// かな位置と 1:1 対応するため、第2段 Viterbi DP の区間スコアに
+    /// 言語 SNN の予測を局所的な手掛かりとして加算できる。
+    public func predictKanjiPerKana(
+        kanaText: String,
+        kanaVocabulary: TextVocabulary,
+        slice: MatryoshkaSlice = .high
+    ) -> [Character?] {
+        let kanaChars = Array(kanaText)
+        if kanaChars.isEmpty {
+            return []
+        }
+
+        var hints = [Character?](repeating: nil, count: kanaChars.count)
+
+        let hSize = min(slice.rawValue, lmNetwork.maxHiddenDim)
+        let outDim = lmNetwork.outputDim
+        var vLM = [Float](repeating: 0.0, count: hSize)
+        var sLM = [Float](repeating: 0.0, count: hSize)
+        var aLM = [Float](repeating: 0.0, count: hSize)
+        var spikeSumLM = [Float](repeating: 0.0, count: hSize)
+        var logitsLM = [Float](repeating: 0.0, count: outDim)
+        var probsLM = [Float](repeating: 0.0, count: outDim)
+        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
+
+        var kIdx = 0
+        while kIdx < kanaChars.count {
+            let ids = kanaVocabulary.textToIds(String(kanaChars[kIdx]))
+            var kId = TextVocabulary.unkId
+            if ids.isEmpty != true {
+                kId = ids[0]
+            }
+
+            lmNetwork.forwardSlice(
+                features: buildTokenFeature(tokenId: kId),
+                slice: slice,
+                vPrev: &vLM,
+                sPrev: &sLM,
+                aPrev: &aLM,
+                spikeSum: &spikeSumLM,
+                logits: &logitsLM,
+                probabilities: &probsLM,
+                scratch: scratchLM
+            )
+
+            var bestTokId = -1
+            var bestProb: Float = -1.0
+            var tId = 4
+            while tId < outDim {
+                let p = probsLM[tId]
+                if bestProb < p {
+                    bestProb = p
+                    bestTokId = tId
+                }
+                tId += 1
+            }
+
+            if 4 <= bestTokId {
+                let predicted = vocabulary.idsToText([bestTokId])
+                if predicted.count == 1 {
+                    hints[kIdx] = Array(predicted)[0]
+                }
+            }
+            kIdx += 1
+        }
+
+        return hints
     }
 }

@@ -9,6 +9,7 @@ public final class ForwardCache: @unchecked Sendable {
 
     public var vStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim]
     public var sStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim]
+    public var aStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim] (ALIF 適応閾値状態)
     public var spikeAvg: [[Float]]   // [seqLen][hiddenDim]
     public var logits: [[Float]]     // [seqLen][outputDim]
     public var probs: [[Float]]      // [seqLen][outputDim]
@@ -24,6 +25,10 @@ public final class ForwardCache: @unchecked Sendable {
             count: seqLen
         )
         self.sStates = [[[Float]]](
+            repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
+            count: seqLen
+        )
+        self.aStates = [[[Float]]](
             repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
             count: seqLen
         )
@@ -47,13 +52,29 @@ public struct NetworkGradients: @unchecked Sendable {
     public var gradWIn: [Float]
     public var gradWRec: [Float]
     public var gradWOut: [Float]
-    public var gradBOut: [Float]
+    public var gradBOut: [Float]        // High スライス用
+    public var gradBOutBase: [Float]
+    public var gradBOutMiddle: [Float]
 
     public init(inputDim: Int, maxHiddenDim: Int, outputDim: Int) {
         self.gradWIn = [Float](repeating: 0.0, count: maxHiddenDim * inputDim)
         self.gradWRec = [Float](repeating: 0.0, count: maxHiddenDim * maxHiddenDim)
         self.gradWOut = [Float](repeating: 0.0, count: outputDim * maxHiddenDim)
         self.gradBOut = [Float](repeating: 0.0, count: outputDim)
+        self.gradBOutBase = [Float](repeating: 0.0, count: outputDim)
+        self.gradBOutMiddle = [Float](repeating: 0.0, count: outputDim)
+    }
+
+    /// スライスに対応するバイアス勾配へのアクセス
+    public mutating func addBiasGradient(slice: MatryoshkaSlice, index: Int, value: Float) {
+        switch slice {
+        case .base:
+            gradBOutBase[index] += value
+        case .middle:
+            gradBOutMiddle[index] += value
+        case .high:
+            gradBOut[index] += value
+        }
     }
 
     public mutating func zeroGrad() {
@@ -65,6 +86,10 @@ public struct NetworkGradients: @unchecked Sendable {
         while i < gradWOut.count { gradWOut[i] = 0.0; i += 1 }
         i = 0
         while i < gradBOut.count { gradBOut[i] = 0.0; i += 1 }
+        i = 0
+        while i < gradBOutBase.count { gradBOutBase[i] = 0.0; i += 1 }
+        i = 0
+        while i < gradBOutMiddle.count { gradBOutMiddle[i] = 0.0; i += 1 }
     }
 
     public mutating func accumulate(from other: NetworkGradients) {
@@ -76,6 +101,10 @@ public struct NetworkGradients: @unchecked Sendable {
         while i < gradWOut.count { gradWOut[i] += other.gradWOut[i]; i += 1 }
         i = 0
         while i < gradBOut.count { gradBOut[i] += other.gradBOut[i]; i += 1 }
+        i = 0
+        while i < gradBOutBase.count { gradBOutBase[i] += other.gradBOutBase[i]; i += 1 }
+        i = 0
+        while i < gradBOutMiddle.count { gradBOutMiddle[i] += other.gradBOutMiddle[i]; i += 1 }
     }
 }
 
@@ -114,8 +143,11 @@ public final class BPTTTrainer: @unchecked Sendable {
             return (cache, 0.0)
         }
 
+        let sliceBiasData = network.outputBias(for: slice).data
+
         var vPrev = [Float](repeating: 0.0, count: hSize)
         var sPrev = [Float](repeating: 0.0, count: hSize)
+        var aPrev = [Float](repeating: 0.0, count: hSize)
 
         var totalLoss: Float = 0.0
         var numTargets: Float = 0.0
@@ -129,6 +161,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             while t < tSteps {
                 var vNew = [Float](repeating: 0.0, count: hSize)
                 var sNew = [Float](repeating: 0.0, count: hSize)
+                var aNew = [Float](repeating: 0.0, count: hSize)
 
                 var i = 0
                 while i < hSize {
@@ -154,22 +187,29 @@ public final class BPTTTrainer: @unchecked Sendable {
                     let vUpdated = vDecayed + current
                     vNew[i] = vUpdated
 
+                    // ALIF 適応閾値の更新 (gamma = 0.0 のとき固定閾値 LIF と等価)
+                    let aUpdated = (network.lifConfig.rho * aPrev[i]) + (network.lifConfig.gamma * sPrev[i])
+                    aNew[i] = aUpdated
+                    let dynVTh = network.lifConfig.vTh + aUpdated
+
                     // スパイク発火
-                    if network.lifConfig.vTh <= vUpdated {
+                    if dynVTh <= vUpdated {
                         sNew[i] = 1.0
                     }
-                    if vUpdated < network.lifConfig.vTh {
+                    if vUpdated < dynVTh {
                         sNew[i] = 0.0
                     }
 
                     spikeSum[i] += sNew[i]
                     cache.vStates[k][t][i] = vNew[i]
                     cache.sStates[k][t][i] = sNew[i]
+                    cache.aStates[k][t][i] = aUpdated
                     i += 1
                 }
 
                 vPrev = vNew
                 sPrev = sNew
+                aPrev = aNew
                 t += 1
             }
 
@@ -194,7 +234,7 @@ public final class BPTTTrainer: @unchecked Sendable {
                     sumW += network.pWOut.data[wOutOffset + j] * cache.spikeAvg[k][j]
                     j += 1
                 }
-                let logit = network.pBOut.data[c] + (sumW * sliceNorm)
+                let logit = sliceBiasData[c] + (sumW * sliceNorm)
                 cache.logits[k][c] = logit
                 if maxLogit < logit {
                     maxLogit = logit
@@ -283,6 +323,8 @@ public final class BPTTTrainer: @unchecked Sendable {
         i = 0
         while i < network.pBOut.grad.count {
             network.pBOut.grad[i] += grads.gradBOut[i]
+            network.pBOutBase.grad[i] += grads.gradBOutBase[i]
+            network.pBOutMiddle.grad[i] += grads.gradBOutMiddle[i]
             i += 1
         }
     }
@@ -362,7 +404,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             var c = 0
             while c < outDim {
                 let dL = dLogits[c]
-                grads.gradBOut[c] += dL
+                grads.addBiasGradient(slice: slice, index: c, value: dL)
                 let wOffset = c * network.maxHiddenDim
                 var i = 0
                 while i < hSize {
@@ -395,13 +437,17 @@ public final class BPTTTrainer: @unchecked Sendable {
                     sPrevT = cache.sStates[k][t - 1]
                 }
 
+                let aCurr = cache.aStates[k][t]
+
                 var dVList = [Float](repeating: 0.0, count: hSize)
                 var i = 0
                 while i < hSize {
                     let dS_total = (dSpikeAvg[i] * invT) + dSTime[i]
+                    // 代理勾配は順伝播で実際に用いた動的閾値で評価する
+                    // (適応状態 a は定数扱い = detached adaptation 近似)
                     let surrogateGrad = SurrogateGradient.derivative(
                         v: vCurr[i],
-                        vTh: network.lifConfig.vTh,
+                        vTh: network.lifConfig.vTh + aCurr[i],
                         alpha: network.lifConfig.alpha
                     )
                     let dV_i = dVTime[i] + (dS_total * surrogateGrad)
@@ -523,6 +569,8 @@ public final class BPTTTrainer: @unchecked Sendable {
         while i < network.pBOut.grad.count {
             // 出力層バイアスの特定文字張り付きを抑え、重み主導の分類を促進
             network.pBOut.grad[i] = grads.gradBOut[i] * scale * 0.05
+            network.pBOutBase.grad[i] = grads.gradBOutBase[i] * scale * 0.05
+            network.pBOutMiddle.grad[i] = grads.gradBOutMiddle[i] * scale * 0.05
             i += 1
         }
 
@@ -556,8 +604,11 @@ public final class BPTTTrainer: @unchecked Sendable {
             return (cache, logProbs)
         }
 
+        let sliceBiasData = network.outputBias(for: slice).data
+
         var vPrev = [Float](repeating: 0.0, count: hSize)
         var sPrev = [Float](repeating: 0.0, count: hSize)
+        var aPrev = [Float](repeating: 0.0, count: hSize)
 
         var k = 0
         while k < seqLen {
@@ -568,6 +619,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             while t < tSteps {
                 var vNew = [Float](repeating: 0.0, count: hSize)
                 var sNew = [Float](repeating: 0.0, count: hSize)
+                var aNew = [Float](repeating: 0.0, count: hSize)
 
                 var i = 0
                 while i < hSize {
@@ -590,21 +642,28 @@ public final class BPTTTrainer: @unchecked Sendable {
                     let vUpdated = vDecayed + current
                     vNew[i] = vUpdated
 
-                    if network.lifConfig.vTh <= vUpdated {
+                    // ALIF 適応閾値の更新 (gamma = 0.0 のとき固定閾値 LIF と等価)
+                    let aUpdated = (network.lifConfig.rho * aPrev[i]) + (network.lifConfig.gamma * sPrev[i])
+                    aNew[i] = aUpdated
+                    let dynVTh = network.lifConfig.vTh + aUpdated
+
+                    if dynVTh <= vUpdated {
                         sNew[i] = 1.0
                     }
-                    if vUpdated < network.lifConfig.vTh {
+                    if vUpdated < dynVTh {
                         sNew[i] = 0.0
                     }
 
                     spikeSum[i] += sNew[i]
                     cache.vStates[k][t][i] = vNew[i]
                     cache.sStates[k][t][i] = sNew[i]
+                    cache.aStates[k][t][i] = aUpdated
                     i += 1
                 }
 
                 vPrev = vNew
                 sPrev = sNew
+                aPrev = aNew
                 t += 1
             }
 
@@ -620,7 +679,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             var maxL: Float = -.infinity
             var c = 0
             while c < outDim {
-                var sum: Float = network.pBOut.data[c]
+                var sum: Float = sliceBiasData[c]
                 let wOutOffset = c * network.maxHiddenDim
                 var h = 0
                 while h < hSize {
@@ -689,7 +748,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             var c = 0
             while c < outDim {
                 let dL = dLogits[k][c] * lossWeight
-                grads.gradBOut[c] += dL
+                grads.addBiasGradient(slice: slice, index: c, value: dL)
 
                 let wOutOffset = c * network.maxHiddenDim
                 var h = 0
@@ -705,19 +764,15 @@ public final class BPTTTrainer: @unchecked Sendable {
             var t = tSteps - 1
             while 0 <= t {
                 let vCurr = cache.vStates[k][t]
-                let sCurr = cache.sStates[k][t]
-                let vPrev: [Float]
+                let aCurr = cache.aStates[k][t]
                 let sPrev: [Float]
 
                 if 0 < t {
-                    vPrev = cache.vStates[k][t - 1]
                     sPrev = cache.sStates[k][t - 1]
                 } else {
                     if 0 < k {
-                        vPrev = cache.vStates[k - 1][tSteps - 1]
                         sPrev = cache.sStates[k - 1][tSteps - 1]
                     } else {
-                        vPrev = [Float](repeating: 0.0, count: hSize)
                         sPrev = [Float](repeating: 0.0, count: hSize)
                     }
                 }
@@ -728,9 +783,11 @@ public final class BPTTTrainer: @unchecked Sendable {
                 var i = 0
                 while i < hSize {
                     let dS = (dSpikeAvg[i] * invT) + dSNextStep[i]
+                    // 代理勾配は順伝播で実際に用いた動的閾値で評価する
+                    // (適応状態 a は定数扱い = detached adaptation 近似)
                     let surrogate = SurrogateGradient.derivative(
                         v: vCurr[i],
-                        vTh: network.lifConfig.vTh,
+                        vTh: network.lifConfig.vTh + aCurr[i],
                         alpha: network.lifConfig.alpha
                     )
                     let dV = dVNextStep[i] + (dS * surrogate)

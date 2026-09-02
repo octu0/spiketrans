@@ -372,15 +372,59 @@ extension SpiketransTrainer {
     }
 
     /// 音響 SNN の対数確率から CTC プレフィックスビーム探索文字起こしを実行
+    ///
+    /// フォワードには Event-driven 疎スパイク推論 (`AcousticDecoder`) を用いる。
+    /// BPTT 用の密なフォワードと違い発話ごとの巨大キャッシュを確保せず、
+    /// 学習側と同じ sliceNorm を適用するためスライス間のスケールも一致する。
     public func transcribeAcousticCTC(
         featuresSeq: [[Float]],
         slice: MatryoshkaSlice = .high,
         beamWidth: Int = 16
     ) -> String {
-        let fwd = acousticTrainer.bpttTrainer.forwardSequenceLogProbs(featuresSeq: featuresSeq, slice: slice)
-        let decoder = CTCBeamDecoder(vocabulary: textVocabulary, blankId: 0, beamWidth: beamWidth)
-        let result = decoder.decode(logProbs: fwd.logProbs)
-        return result.text
+        if featuresSeq.isEmpty {
+            return ""
+        }
+
+        let network = acousticTrainer.network
+        let acDecoder = AcousticDecoder(
+            network: network,
+            vocabulary: textVocabulary,
+            fallbackVocabulary: phonemeVocabulary,
+            slice: slice
+        )
+        let acWorkspace = AcousticWorkspace(
+            maxHiddenDim: network.maxHiddenDim,
+            outputDim: network.outputDim,
+            inputDim: network.inputDim
+        )
+
+        let frameProbs = acDecoder.decodeSequence(
+            featuresSeq: featuresSeq,
+            workspace: acWorkspace
+        )
+
+        let outDim = network.outputDim
+        var logProbs = [[Float]](
+            repeating: [Float](repeating: 0.0, count: outDim),
+            count: frameProbs.count
+        )
+        var f = 0
+        while f < frameProbs.count {
+            let probs = frameProbs[f].probabilities
+            var c = 0
+            while c < outDim {
+                logProbs[f][c] = log(max(1e-30, probs[c]))
+                c += 1
+            }
+            f += 1
+        }
+
+        let decoder = CTCBeamDecoder(
+            vocabulary: textVocabulary,
+            blankId: TextVocabulary.padId,
+            beamWidth: beamWidth
+        )
+        return decoder.decode(logProbs: logProbs).text
     }
 
     /// 2段階音声文字起こし (第1段 音響 SNN かな推定 -> 第2段 漢字かな混じり文復元)
@@ -392,7 +436,8 @@ extension SpiketransTrainer {
         minDurationFrames: Int = 3,
         minConfidence: Float = 0.05,
         boundaries: [Int]? = nil,
-        useCTC: Bool = false
+        useCTC: Bool = false,
+        languageBonus: Float = 4.0
     ) -> (kana: String, kanji: String) {
         let kanaText: String
         if useCTC {
@@ -410,7 +455,18 @@ extension SpiketransTrainer {
         var kanjiText = ""
         switch dictionary {
         case .some(let dict):
-            let decoder = KanaKanjiDecoder(dictionary: dict)
+            // 辞書 Viterbi DP に、学習済み第2段 言語 SNN の予測も手掛かりとして与える
+            let lmDecoder = LanguageDecoder(
+                lmNetwork: languageTrainer.network,
+                vocabulary: kanjiVocabulary
+            )
+            let decoder = KanaKanjiDecoder(
+                dictionary: dict,
+                languageDecoder: lmDecoder,
+                kanaVocabulary: textVocabulary,
+                languageSlice: slice,
+                languageBonus: languageBonus
+            )
             kanjiText = decoder.decode(kanaText: kanaText)
         case .none:
             let decoder = LanguageDecoder(

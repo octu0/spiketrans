@@ -14,7 +14,12 @@ public final class MLXMatryoshkaNetwork: Module, @unchecked Sendable {
     public var wRec: MLXArray      // [maxHiddenDim, maxHiddenDim]
     public var bH: MLXArray        // [maxHiddenDim]
     public var wOut: MLXArray      // [maxHiddenDim, outputDim]
-    public var bOut: MLXArray      // [outputDim]
+    public var bOut: MLXArray      // [outputDim] (High スライス用)
+    // スライスごとに blank の閾値を独立に較正するための出力バイアス。
+    // sliceNorm は重み付き和にしか掛からないため、バイアスを共有すると
+    // 小さいスライスほど非 blank 側が相対的に持ち上がり挿入過多になる。
+    public var bOutBase: MLXArray  // [outputDim]
+    public var bOutMid: MLXArray   // [outputDim]
 
     public init(
         inputDim: Int = 128,
@@ -38,6 +43,8 @@ public final class MLXMatryoshkaNetwork: Module, @unchecked Sendable {
         self.bH = MLXArray.zeros([maxHiddenDim])
         self.wOut = MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, outputDim])
         self.bOut = MLXArray.zeros([outputDim])
+        self.bOutBase = MLXArray.zeros([outputDim])
+        self.bOutMid = MLXArray.zeros([outputDim])
 
         super.init()
     }
@@ -51,40 +58,45 @@ public final class MLXMatryoshkaNetwork: Module, @unchecked Sendable {
         // wOut: Pure Swift は [outputDim, maxHiddenDim] なので転置して [maxHiddenDim, outputDim] に変換
         let wOutArr = MLXArray(data.wOut, [data.outputDim, data.maxHiddenDim]).transposed()
         let bOutArr = MLXArray(data.bOut, [data.outputDim])
+        let bOutBaseArr = MLXArray(data.bOutBase, [data.outputDim])
+        let bOutMidArr = MLXArray(data.bOutMiddle, [data.outputDim])
 
         self.wIn = wInArr
         self.wRec = wRecArr
         self.bH = bHArr
         self.wOut = wOutArr
         self.bOut = bOutArr
-        eval(self.wIn, self.wRec, self.bH, self.wOut, self.bOut)
+        self.bOutBase = bOutBaseArr
+        self.bOutMid = bOutMidArr
+        eval(self.wIn, self.wRec, self.bH, self.wOut, self.bOut, self.bOutBase, self.bOutMid)
     }
 
     /// Pure Swift の MatryoshkaWeightsData へ重みをエクスポート
     public func exportWeights() -> MatryoshkaWeightsData {
-        eval(self.wIn, self.wRec, self.bH, self.wOut, self.bOut)
-        
+        eval(self.wIn, self.wRec, self.bH, self.wOut, self.bOut, self.bOutBase, self.bOutMid)
+
         // [inputDim, maxHiddenDim] -> transposed [maxHiddenDim, inputDim] -> [Float]
         let wInFlat = self.wIn.transposed().asArray(Float.self)
         let wRecFlat = self.wRec.transposed().asArray(Float.self)
         let bHFlat = self.bH.asArray(Float.self)
         let wOutFlat = self.wOut.transposed().asArray(Float.self)
         let bOutFlat = self.bOut.asArray(Float.self)
+        let bOutBaseFlat = self.bOutBase.asArray(Float.self)
+        let bOutMidFlat = self.bOutMid.asArray(Float.self)
 
         return MatryoshkaWeightsData(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
             timeSteps: timeSteps,
-            beta: lifConfig.beta,
-            vTh: lifConfig.vTh,
-            vReset: lifConfig.vReset,
-            alpha: lifConfig.alpha,
+            lifConfig: lifConfig,
             wIn: wInFlat,
             wRec: wRecFlat,
             bH: bHFlat,
             wOut: wOutFlat,
-            bOut: bOutFlat
+            bOut: bOutFlat,
+            bOutBase: bOutBaseFlat,
+            bOutMiddle: bOutMidFlat
         )
     }
 }

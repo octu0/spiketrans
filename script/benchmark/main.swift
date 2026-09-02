@@ -58,28 +58,31 @@ while i < shortTotalSamples {
 let shortStartTime = CFAbsoluteTimeGetCurrent()
 var shortProcessedFrames = 0
 var shortOffset = 0
+// 最適化による計測対象の消去を防ぐためのチェックサム
+var dspChecksum: Float = 0.0
 
 shortPcm.withUnsafeBufferPointer { pcmPtr in
     let base = pcmPtr.baseAddress!
     while (shortOffset + frameSize) <= shortTotalSamples {
         let framePtr = base.advanced(by: shortOffset)
-        
+
         vad.processFrame(ptr: framePtr, count: frameSize, workspace: workspace)
         let pitchRes = pitchDetector.detectPitch(ptr: framePtr, count: frameSize, workspace: workspace)
+        dspChecksum += pitchRes.f0
         let lpcSuccess = lpc.computeCoefficients(ptr: framePtr, count: frameSize, workspace: workspace)
-        
-        var formantRes = FormantResult(f1: 0.0, f2: 0.0, f3: 0.0, b1: 0.0, b2: 0.0, b3: 0.0, count: 0)
+
         if lpcSuccess {
             workspace.lpcCoeffs.withUnsafeBufferPointer { cPtr in
                 let solverSuccess = solver.solve(coefficients: cPtr.baseAddress!, order: config.lpcOrder, workspace: workspace)
                 if solverSuccess {
                     workspace.durandKernerCurr.withUnsafeBufferPointer { rPtr in
-                        formantRes = formantExtractor.extractFormants(roots: rPtr.baseAddress!, count: config.lpcOrder)
+                        let formantRes = formantExtractor.extractFormants(roots: rPtr.baseAddress!, count: config.lpcOrder)
+                        dspChecksum += formantRes.f1
                     }
                 }
             }
         }
-        
+
         filterbank.extractFeatures(
             pcmPtr: framePtr,
             count: frameSize,
@@ -98,6 +101,7 @@ print("処理フレーム数: \(shortProcessedFrames) フレーム")
 print("実音声時間: \(shortDuration) 秒")
 print("処理所要時間: \(String(format: "%.4f", shortElapsed)) 秒")
 print("Real-Time Factor (RTF): \(String(format: "%.6f", shortRtf)) xRT")
+print("DSP チェックサム: \(String(format: "%.3f", dspChecksum))")
 
 // ----------------------------------------------------
 // 2. SNN コア推論スループット計測
@@ -116,7 +120,9 @@ for slice in MatryoshkaSlice.allCases {
     var logits = [Float](repeating: 0.0, count: 64)
     var probs = [Float](repeating: 0.0, count: 64)
     let feat = [Float](repeating: 0.5, count: 64)
-    
+    // Hot Path ゼロアロケーション計測のため中間バッファは事前確保
+    let scratch = MatryoshkaScratch(maxHiddenDim: hSize)
+
     let benchSteps = 10000
     let start = CFAbsoluteTimeGetCurrent()
     var step = 0
@@ -129,7 +135,8 @@ for slice in MatryoshkaSlice.allCases {
             aPrev: &a,
             spikeSum: &sum,
             logits: &logits,
-            probabilities: &probs
+            probabilities: &probs,
+            scratch: scratch
         )
         step += 1
     }

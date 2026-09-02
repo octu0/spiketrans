@@ -77,13 +77,17 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
     public let maxHiddenDim: Int  // 4096
     public let outputDim: Int
     public let timeSteps: Int
-    public let lifConfig: LIFConfig
+    /// LIF / ALIF 設定 (重みインポート時に保存済みの値へ追従するため var)
+    public private(set) var lifConfig: LIFConfig
 
     public let pWIn: Parameter
     public let pWRec: Parameter
     public let pBH: Parameter
     public let pWOut: Parameter
-    public let pBOut: Parameter
+    public let pBOut: Parameter        // High スライス用
+    // スライスごとに blank の閾値を独立に較正するための出力バイアス
+    public let pBOutBase: Parameter
+    public let pBOutMiddle: Parameter
 
     public init(
         inputDim: Int = 64,
@@ -132,10 +136,12 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         self.pBH = Parameter(count: maxHiddenDim, initialData: initBH)
         self.pWOut = Parameter(count: outputDim * maxHiddenDim, initialData: initWOut)
         self.pBOut = Parameter(count: outputDim, initialData: initBOut)
+        self.pBOutBase = Parameter(count: outputDim, initialData: initBOut)
+        self.pBOutMiddle = Parameter(count: outputDim, initialData: initBOut)
     }
 
     public var parameters: [Parameter] {
-        return [pWIn, pWRec, pBH, pWOut, pBOut]
+        return [pWIn, pWRec, pBH, pWOut, pBOut, pBOutBase, pBOutMiddle]
     }
 
     /// Base 単体モデルのエクスポート
@@ -258,6 +264,18 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         }
     }
 
+    /// スライスに対応する出力バイアス
+    public func outputBias(for slice: MatryoshkaSlice) -> Parameter {
+        switch slice {
+        case .base:
+            return pBOutBase
+        case .middle:
+            return pBOutMiddle
+        case .high:
+            return pBOut
+        }
+    }
+
     /// 全体重みのエクスポート
     public func exportWeights() -> MatryoshkaWeightsData {
         return MatryoshkaWeightsData(
@@ -265,20 +283,21 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
             timeSteps: timeSteps,
-            beta: lifConfig.beta,
-            vTh: lifConfig.vTh,
-            vReset: lifConfig.vReset,
-            alpha: lifConfig.alpha,
+            lifConfig: lifConfig,
             wIn: pWIn.data,
             wRec: pWRec.data,
             bH: pBH.data,
             wOut: pWOut.data,
-            bOut: pBOut.data
+            bOut: pBOut.data,
+            bOutBase: pBOutBase.data,
+            bOutMiddle: pBOutMiddle.data
         )
     }
 
-    /// 全体重みのインポート
+    /// 全体重みのインポート (学習時の LIF / ALIF パラメータも同時に復元)
     public func importWeights(from weightsData: MatryoshkaWeightsData) {
+        // 学習時と推論時で発火ダイナミクスがずれないよう ALIF パラメータごと引き継ぐ
+        self.lifConfig = weightsData.lifConfig
         if weightsData.wIn.count == pWIn.data.count {
             pWIn.data = weightsData.wIn
         }
@@ -294,9 +313,18 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         if weightsData.bOut.count == pBOut.data.count {
             pBOut.data = weightsData.bOut
         }
+        if weightsData.bOutBase.count == pBOutBase.data.count {
+            pBOutBase.data = weightsData.bOutBase
+        }
+        if weightsData.bOutMiddle.count == pBOutMiddle.data.count {
+            pBOutMiddle.data = weightsData.bOutMiddle
+        }
     }
 
-    /// 指定スライスでの推論（ALIF 適応型発火閾値 & Event-driven 疎スパイク高速化）
+    /// 指定スライスでの推論（ALIF 適応型発火閾値 & Event-driven 疎スパイク高速化 & ゼロアロケーション）
+    ///
+    /// Hot Path でのヒープ再アロケーションを避けるため、中間バッファは呼び出し側が
+    /// `MatryoshkaScratch` として事前確保して渡す。
     public func forwardSlice(
         features: [Float],
         slice: MatryoshkaSlice,
@@ -305,7 +333,8 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         aPrev: inout [Float],
         spikeSum: inout [Float],
         logits: inout [Float],
-        probabilities: inout [Float]
+        probabilities: inout [Float],
+        scratch: MatryoshkaScratch
     ) {
         if features.count < inputDim {
             return
@@ -320,7 +349,6 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         }
 
         // 2. 入力電流の事前計算 (全タイムステップで不変のためループ外へ Hoist)
-        var inputCurrents = [Float](repeating: 0.0, count: hSize)
         var n = 0
         while n < hSize {
             var curr = pBH.data[n]
@@ -330,39 +358,33 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
                 curr += pWIn.data[inOffset + d] * features[d]
                 d += 1
             }
-            inputCurrents[n] = curr
+            scratch.inputCurrents[n] = curr
             n += 1
         }
-
-        var vNext = [Float](repeating: 0.0, count: hSize)
-        var sNext = [Float](repeating: 0.0, count: hSize)
-        var aNext = [Float](repeating: 0.0, count: hSize)
-        var activeSpikes: [Int] = []
-        activeSpikes.reserveCapacity(hSize)
 
         // 3. 時間ステップループ (ALIF 適応型閾値 & Event-driven 疎スパイク加算)
         var t = 0
         while t < timeSteps {
             // 3.1 直前ステップで発火したニューロンのインデックスのみを収集
-            activeSpikes.removeAll(keepingCapacity: true)
+            var activeCount = 0
             var j = 0
             while j < hSize {
                 if sPrev[j] != 0.0 {
-                    activeSpikes.append(j)
+                    scratch.activeSpikes[activeCount] = j
+                    activeCount += 1
                 }
                 j += 1
             }
-            let activeCount = activeSpikes.count
 
             n = 0
             while n < hSize {
-                var current = inputCurrents[n]
+                var current = scratch.inputCurrents[n]
                 let recOffset = n * maxHiddenDim
 
                 // 発火ニューロンの重みのみを加算 (ゼロ乗算を完全スキップ)
                 var a = 0
                 while a < activeCount {
-                    let spikeIdx = activeSpikes[a]
+                    let spikeIdx = scratch.activeSpikes[a]
                     current += pWRec.data[recOffset + spikeIdx]
                     a += 1
                 }
@@ -375,9 +397,9 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
                     aPrev: aPrev[n],
                     inputCurrent: current
                 )
-                vNext[n] = stepRes.vNext
-                sNext[n] = stepRes.sNext
-                aNext[n] = stepRes.aNext
+                scratch.vNext[n] = stepRes.vNext
+                scratch.sNext[n] = stepRes.sNext
+                scratch.aNext[n] = stepRes.aNext
                 spikeSum[n] += stepRes.sNext
                 n += 1
             }
@@ -385,9 +407,9 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             // ステップ終了時に状態を更新
             n = 0
             while n < hSize {
-                vPrev[n] = vNext[n]
-                sPrev[n] = sNext[n]
-                aPrev[n] = aNext[n]
+                vPrev[n] = scratch.vNext[n]
+                sPrev[n] = scratch.sNext[n]
+                aPrev[n] = scratch.aNext[n]
                 n += 1
             }
 
@@ -397,22 +419,20 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         // 4. リードアウト層計算 (Event-driven 疎加算 & スケール正規化)
         let invT = 1.0 / Float(timeSteps)
         let sliceNorm = sqrt(Float(maxHiddenDim) / Float(hSize))
+        // sliceNorm は重み付き和にのみ掛かるため、バイアスはスライス専用のものを使う
+        let biasData = outputBias(for: slice).data
 
-        var activeReadoutIndices: [Int] = []
-        var activeRates: [Float] = []
-        activeReadoutIndices.reserveCapacity(hSize)
-        activeRates.reserveCapacity(hSize)
-
+        var activeOutCount = 0
         var k = 0
         while k < hSize {
             let sRate = spikeSum[k] * invT
             if sRate != 0.0 {
-                activeReadoutIndices.append(k)
-                activeRates.append(sRate)
+                scratch.activeReadoutIndices[activeOutCount] = k
+                scratch.activeRates[activeOutCount] = sRate
+                activeOutCount += 1
             }
             k += 1
         }
-        let activeOutCount = activeReadoutIndices.count
 
         var maxLogit: Float = -Float.greatestFiniteMagnitude
         var c = 0
@@ -421,11 +441,11 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             let wOffset = c * maxHiddenDim
             var a = 0
             while a < activeOutCount {
-                let idx = activeReadoutIndices[a]
-                sumW += pWOut.data[wOffset + idx] * activeRates[a]
+                let idx = scratch.activeReadoutIndices[a]
+                sumW += pWOut.data[wOffset + idx] * scratch.activeRates[a]
                 a += 1
             }
-            let logit = pBOut.data[c] + (sumW * sliceNorm)
+            let logit = biasData[c] + (sumW * sliceNorm)
             logits[c] = logit
             if maxLogit < logit {
                 maxLogit = logit
@@ -450,7 +470,35 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         }
     }
 
-    /// 既存テスト・クライアント用後方互換メソッド (aPrev を自動管理)
+    /// 中間バッファを都度確保する簡便版 (Hot Path 以外・テスト用)
+    public func forwardSlice(
+        features: [Float],
+        slice: MatryoshkaSlice,
+        vPrev: inout [Float],
+        sPrev: inout [Float],
+        aPrev: inout [Float],
+        spikeSum: inout [Float],
+        logits: inout [Float],
+        probabilities: inout [Float]
+    ) {
+        let scratch = MatryoshkaScratch(maxHiddenDim: min(slice.rawValue, maxHiddenDim))
+        forwardSlice(
+            features: features,
+            slice: slice,
+            vPrev: &vPrev,
+            sPrev: &sPrev,
+            aPrev: &aPrev,
+            spikeSum: &spikeSum,
+            logits: &logits,
+            probabilities: &probabilities,
+            scratch: scratch
+        )
+    }
+
+    /// 適応閾値状態を呼び出し側で保持しない簡便版 (Hot Path 以外・テスト用)
+    ///
+    /// 注意: 呼び出しごとに ALIF の適応状態がゼロから始まるため、フレームを跨いだ
+    /// 神経順応は再現されない。連続フレーム推論では aPrev を保持する版を使うこと。
     public func forwardSlice(
         features: [Float],
         slice: MatryoshkaSlice,
@@ -471,5 +519,29 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             logits: &logits,
             probabilities: &probabilities
         )
+    }
+}
+
+/// forwardSlice の Hot Path 用事前確保中間バッファ (ゼロアロケーション維持)
+///
+/// スレッドセーフではないため、並列推論では推論スレッドごとに 1 つ確保すること。
+public final class MatryoshkaScratch: @unchecked Sendable {
+    public var inputCurrents: [Float]
+    public var vNext: [Float]
+    public var sNext: [Float]
+    public var aNext: [Float]
+    public var activeSpikes: [Int]
+    public var activeReadoutIndices: [Int]
+    public var activeRates: [Float]
+
+    public init(maxHiddenDim: Int) {
+        let size = max(1, maxHiddenDim)
+        self.inputCurrents = [Float](repeating: 0.0, count: size)
+        self.vNext = [Float](repeating: 0.0, count: size)
+        self.sNext = [Float](repeating: 0.0, count: size)
+        self.aNext = [Float](repeating: 0.0, count: size)
+        self.activeSpikes = [Int](repeating: 0, count: size)
+        self.activeReadoutIndices = [Int](repeating: 0, count: size)
+        self.activeRates = [Float](repeating: 0.0, count: size)
     }
 }

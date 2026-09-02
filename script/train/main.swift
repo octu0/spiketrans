@@ -17,13 +17,30 @@ print("==================================================")
 var numWorkers = ProcessInfo.processInfo.activeProcessorCount
 var epochs = 20
 var maxTrainSamples: Int? = nil
-var datasetPath = ".tmp/loanword128"
+var datasetPath = ""
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
 var minConfidence: Float = 0.05
 var minDuration: Int = 2
 var useCTC = false
+// ALIF (適応型発火閾値): gamma = 0.0 で従来の固定閾値 LIF と等価
+var alifBeta: Float = 0.92
+var alifRho: Float = 0.85
+var alifGamma: Float = 0.15
+// 第2段 Viterbi DP における言語 SNN 予測一致の加点 (0.0 で言語 SNN を使わない)
+var languageBonus: Float = 4.0
+// 切り詰め BPTT の窓幅 (フレーム単位)。1 でフレーム間の勾配を完全に切る
+var bpttWindow = 16
+// GPU 学習の Cosine 学習率スケジュール
+var lrMax: Float = 0.035
+var lrMin: Float = 0.0005
+// N エポックごとに重みを書き出す (0 で無効)。長時間実行の途中経過を残すため
+var checkpointEvery = 0
+// マトリョーシカ各スライスの損失重み (Base を実用対象とするなら Base を上げる)
+var sliceWeightBase: Float = 0.1
+var sliceWeightMiddle: Float = 0.2
+var sliceWeightHigh: Float = 1.0
 let reportPath = "/dev/stdout"
 
 var argIdx = 1
@@ -86,6 +103,83 @@ while argIdx < args.count {
             }
             argIdx += 1
         }
+    case "--alif-beta":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                alifBeta = val
+            }
+            argIdx += 1
+        }
+    case "--alif-rho":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                alifRho = val
+            }
+            argIdx += 1
+        }
+    case "--alif-gamma":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                alifGamma = val
+            }
+            argIdx += 1
+        }
+    case "--bptt-window":
+        if (argIdx + 1) < args.count {
+            if let val = Int(args[argIdx + 1]) {
+                bpttWindow = max(1, val)
+            }
+            argIdx += 1
+        }
+    case "--checkpoint-every":
+        if (argIdx + 1) < args.count {
+            if let val = Int(args[argIdx + 1]) {
+                checkpointEvery = max(0, val)
+            }
+            argIdx += 1
+        }
+    case "--slice-weight-base":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                sliceWeightBase = val
+            }
+            argIdx += 1
+        }
+    case "--slice-weight-middle":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                sliceWeightMiddle = val
+            }
+            argIdx += 1
+        }
+    case "--slice-weight-high":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                sliceWeightHigh = val
+            }
+            argIdx += 1
+        }
+    case "--lr-max":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                lrMax = val
+            }
+            argIdx += 1
+        }
+    case "--lr-min":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                lrMin = val
+            }
+            argIdx += 1
+        }
+    case "--language-bonus":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                languageBonus = val
+            }
+            argIdx += 1
+        }
     case "--ctc":
         useCTC = true
     default:
@@ -94,6 +188,14 @@ while argIdx < args.count {
         }
     }
     argIdx += 1
+}
+
+// データセットのパスは必須。特定コーパスを既定値に埋め込まない
+if datasetPath.isEmpty {
+    print("エラー: データセットディレクトリを指定してください。")
+    print("  使い方: train -d <データセットディレクトリ> [-s 件数] [-e エポック数]")
+    print("  ディレクトリ構成: <dir>/transcript_utf8.txt と <dir>/wav/<fileId>.wav")
+    exit(1)
 }
 
 let useGPU: Bool
@@ -152,21 +254,26 @@ for line in transcriptContent.components(separatedBy: .newlines) {
     }
 }
 
+// 語彙・かな漢字辞書は学習セット (先頭 sampleLimit 件) のみから構築する。
+// 未学習セットの正解テキストを混ぜると第2段が答えを含む辞書を引いてしまい、
+// 未学習 CER が実力より良く出てしまうため。
+let sampleLimit = maxTrainSamples ?? rawPairs.count
+let trainTextLines = Array(textLines.prefix(sampleLimit))
+
 let kanjiConverter = KanjiConverter()
-let allHiraganaLines = textLines.map { kanjiConverter.convertToHiragana($0) }
-let phoneticVocabulary = TextVocabulary(corpus: allHiraganaLines)
-let textVocabulary = TextVocabulary(corpus: textLines)
+let trainHiraganaLines = trainTextLines.map { kanjiConverter.convertToHiragana($0) }
+let phoneticVocabulary = TextVocabulary(corpus: trainHiraganaLines)
+let textVocabulary = TextVocabulary(corpus: trainTextLines)
 
 let kanaKanjiDict = KanaKanjiDictionary()
-kanaKanjiDict.buildFromCorpus(rawTexts: textLines)
+kanaKanjiDict.buildFromCorpus(rawTexts: trainTextLines)
 
-print("コーパス総行数: \(textLines.count) 件")
-print("第1段 音響 SNN (かな・音素) 語彙数: \(phoneticVocabulary.size) 文字")
-print("第2段 言語 SNN (漢字かな混じり) 語彙数: \(textVocabulary.size) 文字")
-print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語")
+print("コーパス総行数: \(textLines.count) 件 (うち学習セット: \(trainTextLines.count) 件)")
+print("第1段 音響 SNN (かな・音素) 語彙数: \(phoneticVocabulary.size) 文字 (学習セットのみ)")
+print("第2段 言語 SNN (漢字かな混じり) 語彙数: \(textVocabulary.size) 文字 (学習セットのみ)")
+print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語 (学習セットのみ)")
 
 // 3. WAV ファイルを読み込んでデータセット構築
-let sampleLimit = maxTrainSamples ?? rawPairs.count
 print("\n--- 1. WAV ファイル読み込みとかな・漢字データセット構築 (最大 \(sampleLimit) 件) ---")
 let startTime = CFAbsoluteTimeGetCurrent()
 
@@ -222,12 +329,26 @@ let trainConfig = TrainingConfig(
     clipNorm: 5.0
 )
 
+// 第1段 音響 SNN に ALIF (適応型発火閾値) を適用し、強い母音の過剰発火を抑えて
+// 微小な子音スパイクを分離しやすくする
+let acousticLIFConfig = LIFConfig(
+    beta: alifBeta,
+    vTh: 1.0,
+    vReset: 0.0,
+    alpha: 2.0,
+    rho: alifRho,
+    gamma: alifGamma
+)
+print("第1段 LIF/ALIF 設定: beta=\(alifBeta), rho=\(alifRho), gamma=\(alifGamma) (gamma=0.0 で固定閾値 LIF)")
+print("第2段 言語 SNN 加点 (--language-bonus): \(languageBonus)")
+
 let trainer = SpiketransTrainer(
     acousticNetwork: MatryoshkaNetwork(
         inputDim: 128,
         maxHiddenDim: 1024,
         outputDim: phoneticVocabulary.size,
-        timeSteps: 4
+        timeSteps: 4,
+        lifConfig: acousticLIFConfig
     ),
     languageNetwork: MatryoshkaNetwork(
         inputDim: 128,
@@ -251,16 +372,27 @@ if let impPath = importWeightsPath {
     }
 } else if useGPU {
     print("  Apple Silicon GPU (MLX Swift Metal) による超並列ミニバッチ学習を開始 (バッチサイズ: 16)...")
-    print("  [前処理] LPC フォルマント遷移解析による動的音素アライメントを抽出中...")
-    let allAlignedTargets: [[Int]] = (0..<dataset.count).map { idx in
-        let sample = dataset[idx]
-        let hiraIds = phoneticVocabulary.textToIds(sample.hiraganaText)
-        return trainer.acousticTrainer.alignTargets(
-            textIds: hiraIds,
-            features: sample.acousticFeatures
-        )
+
+    // CTC ではフレーム整列を行わず、かな ID 列をそのまま教師とする。
+    // フレーム整列 (交差エントロピー) では、発話フレームを文字数で等分した近似アライメントを使う。
+    let allTargets: [[Int]]
+    if useCTC {
+        print("  [教師] CTC 損失: フレーム整列なしのかな ID 列をそのまま使用")
+        allTargets = (0..<dataset.count).map { idx in
+            return phoneticVocabulary.textToIds(dataset[idx].hiraganaText)
+        }
+    } else {
+        print("  [前処理] メルエネルギー VAD による近似フレームアライメントを抽出中...")
+        allTargets = (0..<dataset.count).map { idx in
+            let sample = dataset[idx]
+            let hiraIds = phoneticVocabulary.textToIds(sample.hiraganaText)
+            return trainer.acousticTrainer.alignTargets(
+                textIds: hiraIds,
+                features: sample.acousticFeatures
+            )
+        }
+        print("  ✓ 全 \(dataset.count) サンプルのフレームアライメント抽出完了")
     }
-    print("  ✓ 全 \(dataset.count) サンプルの動的音素・かなアライメント抽出完了")
 
     let mlxNet = MLXMatryoshkaNetwork(
         inputDim: 128,
@@ -269,8 +401,18 @@ if let impPath = importWeightsPath {
         timeSteps: 4,
         lifConfig: trainer.acousticTrainer.network.lifConfig
     )
-    let mlxTrainer = MLXBPTTTrainer(network: mlxNet, config: trainConfig)
-    let scheduler = CosineLRScheduler(lrMax: 0.035, lrMin: 0.0005, totalEpochs: epochs, warmupEpochs: 4)
+    let mlxTrainer = MLXBPTTTrainer(
+        network: mlxNet,
+        config: trainConfig,
+        bpttWindow: bpttWindow,
+        sliceWeightBase: sliceWeightBase,
+        sliceWeightMiddle: sliceWeightMiddle,
+        sliceWeightHigh: sliceWeightHigh
+    )
+    print("  スライス損失重み (Base/Middle/High): \(sliceWeightBase) / \(sliceWeightMiddle) / \(sliceWeightHigh)")
+    print("  切り詰め BPTT 窓幅 (--bptt-window): \(bpttWindow) フレーム")
+    let scheduler = CosineLRScheduler(lrMax: lrMax, lrMin: lrMin, totalEpochs: epochs, warmupEpochs: 4)
+    print("  学習率 (--lr-max / --lr-min): \(lrMax) / \(lrMin)")
     let trainStartTime = CFAbsoluteTimeGetCurrent()
 
     let batchSize = 16
@@ -282,6 +424,7 @@ if let impPath = importWeightsPath {
         mlxTrainer.updateLearningRate(curLR)
 
         var epLossSum: Float = 0.0
+        var epHighLossSum: Float = 0.0
         var batchCount = 0
 
         var bStart = 0
@@ -292,22 +435,50 @@ if let impPath = importWeightsPath {
             var idx = bStart
             while idx < bEnd {
                 fBatch.append(dataset[idx].acousticFeatures)
-                tBatch.append(allAlignedTargets[idx])
+                tBatch.append(allTargets[idx])
                 idx += 1
             }
 
-            let bLoss = mlxTrainer.trainBatch(
-                featuresBatch: fBatch,
-                targetsBatch: tBatch
-            )
-            epLossSum += bLoss
+            if useCTC {
+                let res = mlxTrainer.trainBatchCTC(
+                    featuresBatch: fBatch,
+                    targetsBatch: tBatch,
+                    blankId: TextVocabulary.padId
+                )
+                epLossSum += res.totalLoss
+                epHighLossSum += res.lossHigh
+            } else {
+                let bLoss = mlxTrainer.trainBatch(
+                    featuresBatch: fBatch,
+                    targetsBatch: tBatch
+                )
+                epLossSum += bLoss
+                epHighLossSum += bLoss
+            }
             batchCount += 1
             bStart = bEnd
         }
 
         let avgLoss = epLossSum / Float(max(1, batchCount))
+        let avgHighLoss = epHighLossSum / Float(max(1, batchCount))
         let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
-        print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
+        print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) [High: \(String(format: "%.4f", avgHighLoss))] (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
+
+        // 定期チェックポイント: 長時間実行が途中で止まっても成果を失わないようにする
+        if 0 < checkpointEvery && (ep % checkpointEvery) == 0 && ep < epochs {
+            switch exportWeightsPath {
+            case .some(let basePath):
+                let ckptPath = "\(basePath).ep\(ep).json"
+                do {
+                    try mlxNet.exportWeights().save(to: URL(fileURLWithPath: ckptPath))
+                    print("    ✓ チェックポイント保存: \(ckptPath)")
+                } catch {
+                    print("    ✕ チェックポイント保存に失敗: \(error)")
+                }
+            case .none:
+                break
+            }
+        }
         ep += 1
     }
 
@@ -355,24 +526,29 @@ if let impPath = importWeightsPath {
 }
 
 // 4.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド 8並列)
-print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド 8並列) ---")
-let lmStartTime = CFAbsoluteTimeGetCurrent()
-var lmEpoch = 1
-let lmMaxEpochs = 40
-while lmEpoch <= lmMaxEpochs {
-    let res = trainer.languageTrainer.trainKanaToKanjiEpoch(
-        dataset: dataset,
-        kanaVocabulary: phoneticVocabulary,
-        epoch: lmEpoch,
-        numWorkers: 8
-    )
-    if lmEpoch % 10 == 0 || lmEpoch == lmMaxEpochs {
-        print("  LM Epoch [\(lmEpoch)/\(lmMaxEpochs)] - 損失: \(String(format: "%.4f", res.totalLoss)) [Base(128): \(String(format: "%.4f", res.baseLoss)), Mid(512): \(String(format: "%.4f", res.middleLoss)), High(1024): \(String(format: "%.4f", res.highLoss))]")
+// --language-bonus 0 のときは言語 SNN の出力が第2段で一切使われないため学習を丸ごと省略する
+if 0.0 < languageBonus {
+    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド 8並列) ---")
+    let lmStartTime = CFAbsoluteTimeGetCurrent()
+    var lmEpoch = 1
+    let lmMaxEpochs = 40
+    while lmEpoch <= lmMaxEpochs {
+        let res = trainer.languageTrainer.trainKanaToKanjiEpoch(
+            dataset: dataset,
+            kanaVocabulary: phoneticVocabulary,
+            epoch: lmEpoch,
+            numWorkers: 8
+        )
+        if lmEpoch % 10 == 0 || lmEpoch == lmMaxEpochs {
+            print("  LM Epoch [\(lmEpoch)/\(lmMaxEpochs)] - 損失: \(String(format: "%.4f", res.totalLoss)) [Base(128): \(String(format: "%.4f", res.baseLoss)), Mid(512): \(String(format: "%.4f", res.middleLoss)), High(1024): \(String(format: "%.4f", res.highLoss))]")
+        }
+        lmEpoch += 1
     }
-    lmEpoch += 1
+    let lmElapsed = CFAbsoluteTimeGetCurrent() - lmStartTime
+    print("  ✓ 言語 SNN 学習完了 (所要時間: \(String(format: "%.2f", lmElapsed)) 秒)")
+} else {
+    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習をスキップ (--language-bonus 0) ---")
 }
-let lmElapsed = CFAbsoluteTimeGetCurrent() - lmStartTime
-print("  ✓ 言語 SNN 学習完了 (所要時間: \(String(format: "%.2f", lmElapsed)) 秒)")
 
 if let expPath = exportWeightsPath {
     print("\n[重み保存] モデル重みをファイルにエクスポート中: \(expPath)")
@@ -389,7 +565,7 @@ if let expPath = exportWeightsPath {
 // 5. 学習済みモデルによるマトリョーシカスライス別 (Base / Middle / High) 推論テスト
 print("\n--- 3. マトリョーシカスライス別 (Base: 128 / Middle: 512 / High: 1024) 音声文字起こし比較テスト ---")
 
-// === 一次診断ログ (第1発話: 突然のことにパニクって…) ===
+// === 一次診断ログ (データセット先頭の発話) ===
 if 0 < dataset.count {
     let s0 = dataset[0]
     let feat0 = s0.acousticFeatures
@@ -397,7 +573,7 @@ if 0 < dataset.count {
     let hiraIds0 = phoneticVocabulary.textToIds(s0.hiraganaText)
 
     print("\n==================================================")
-    print("=== [一次診断] 第1発話 空文字起こし原因調査 ===")
+    print("=== [一次診断] 先頭発話のアライメント・発火状況 ===")
     print("==================================================")
     print("正解テキスト: \"\(s0.rawText)\"")
     print("正解かな発音: \"\(s0.hiraganaText)\" (\(hiraIds0.count) 文字), 音響フレーム数: \(totalF) フレーム")
@@ -673,10 +849,10 @@ if 0 < dataset.count {
 }
 
 // ==================================================
-// === 4. loanword128 全件 (128件) 正誤率・CER 評価 ===
+// === 4. データセット全件の正誤率・CER 評価 ===
 // ==================================================
 print("\n==================================================")
-print("=== 4. loanword128 全 128 サンプル 音響直接デコード CER 評価 ===")
+print("=== 4. 全 \(rawPairs.count) サンプル 音響直接デコード CER 評価 ===")
 print("==================================================")
 
 @Sendable
@@ -728,6 +904,10 @@ struct EvalResult {
     let cer: Float
     let isExact: Bool
     let isTrain: Bool
+    // 第1段 (音響 SNN) のかな出力。音素が正しく発火しているかの切り分け用
+    let targetKana: String
+    let predKana: String
+    let kanaCer: Float
 }
 
 struct GroupSummary {
@@ -736,17 +916,27 @@ struct GroupSummary {
     let exactRate: Float
     let meanCer: Float
     let medianCer: Float
+    // 第1段 音響 SNN のかな出力に対する CER (音素発火精度の指標)
+    let meanKanaCer: Float
+    let medianKanaCer: Float
 }
 
 func computeSummary(_ results: [EvalResult]) -> GroupSummary {
     if results.isEmpty {
-        return GroupSummary(count: 0, exactCount: 0, exactRate: 0.0, meanCer: 0.0, medianCer: 0.0)
+        return GroupSummary(
+            count: 0, exactCount: 0, exactRate: 0.0,
+            meanCer: 0.0, medianCer: 0.0,
+            meanKanaCer: 0.0, medianKanaCer: 0.0
+        )
     }
     let n = results.count
     var exact = 0
     var sumCer: Float = 0.0
+    var sumKanaCer: Float = 0.0
     var cers: [Float] = []
+    var kanaCers: [Float] = []
     cers.reserveCapacity(n)
+    kanaCers.reserveCapacity(n)
 
     for r in results {
         if r.isExact {
@@ -754,27 +944,33 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
         }
         sumCer += r.cer
         cers.append(r.cer)
+        sumKanaCer += r.kanaCer
+        kanaCers.append(r.kanaCer)
     }
     cers.sort()
-    let median = cers[n / 2]
+    kanaCers.sort()
     return GroupSummary(
         count: n,
         exactCount: exact,
         exactRate: Float(exact) * 100.0 / Float(n),
         meanCer: (sumCer / Float(n)) * 100.0,
-        medianCer: median * 100.0
+        medianCer: cers[n / 2] * 100.0,
+        meanKanaCer: (sumKanaCer / Float(n)) * 100.0,
+        medianKanaCer: kanaCers[n / 2] * 100.0
     )
 }
 
 let parser = WavParser()
-let dummyEval = EvalResult(index: 0, fileId: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false)
+let dummyEval = EvalResult(index: 0, fileId: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0)
 
 final class BatchEvalBuffer: @unchecked Sendable {
     var evalBase: [EvalResult]
+    var evalMiddle: [EvalResult]
     var evalHigh: [EvalResult]
     var valid: [Bool]
     init(count: Int, dummy: EvalResult) {
         self.evalBase = [EvalResult](repeating: dummy, count: count)
+        self.evalMiddle = [EvalResult](repeating: dummy, count: count)
         self.evalHigh = [EvalResult](repeating: dummy, count: count)
         self.valid = [Bool](repeating: false, count: count)
     }
@@ -784,8 +980,10 @@ let evalBuffer = BatchEvalBuffer(count: rawPairs.count, dummy: dummyEval)
 let evalMinDuration = minDuration
 let evalMinConfidence = minConfidence
 let evalUseCTC = useCTC
+let evalLanguageBonus = languageBonus
 let evalLimit = sampleLimit
 let evalPairs = rawPairs
+let evalKanjiConverter = KanjiConverter()
 
 print("全 \(rawPairs.count) 件の WAV 読み込み・マルチスレッド並列推論実行中...")
 DispatchQueue.concurrentPerform(iterations: evalPairs.count) { idx in
@@ -804,62 +1002,59 @@ DispatchQueue.concurrentPerform(iterations: evalPairs.count) { idx in
     let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
     let isTrain = idx < evalLimit
 
-    // 1. Base 2段階推論 (かな推定 -> 漢字復元)
-    let resBase = trainer.transcribeTwoStage(
-        featuresSeq: features,
-        kanjiVocabulary: textVocabulary,
-        dictionary: kanaKanjiDict,
-        slice: .base,
-        minDurationFrames: evalMinDuration,
-        minConfidence: evalMinConfidence,
-        boundaries: boundaries,
-        useCTC: evalUseCTC
-    )
-    let distBase = levenshteinDistance(pair.text, resBase.kanji)
-    let cerBase = Float(distBase) / Float(max(1, pair.text.count))
-    evalBuffer.evalBase[idx] = EvalResult(
-        index: idx + 1,
-        fileId: pair.fileId,
-        targetText: pair.text,
-        predText: resBase.kanji,
-        editDistance: distBase,
-        cer: cerBase,
-        isExact: pair.text == resBase.kanji,
-        isTrain: isTrain
-    )
+    // 正解のかな読み (第1段の評価基準)
+    let targetKana = evalKanjiConverter.convertToHiragana(pair.text)
 
-    // 2. High 2段階推論 (かな推定 -> 漢字復元)
-    let resHigh = trainer.transcribeTwoStage(
-        featuresSeq: features,
-        kanjiVocabulary: textVocabulary,
-        dictionary: kanaKanjiDict,
-        slice: .high,
-        minDurationFrames: evalMinDuration,
-        minConfidence: evalMinConfidence,
-        boundaries: boundaries,
-        useCTC: evalUseCTC
-    )
-    let distHigh = levenshteinDistance(pair.text, resHigh.kanji)
-    let cerHigh = Float(distHigh) / Float(max(1, pair.text.count))
-    evalBuffer.evalHigh[idx] = EvalResult(
-        index: idx + 1,
-        fileId: pair.fileId,
-        targetText: pair.text,
-        predText: resHigh.kanji,
-        editDistance: distHigh,
-        cer: cerHigh,
-        isExact: pair.text == resHigh.kanji,
-        isTrain: isTrain
-    )
+    // マトリョーシカ 3 スライスすべてを評価する。
+    // Base(128) は「多少の誤字は許容するが文字起こしとして成立する」ことが要件、
+    // Middle(512) はその中間、High(1024) は最高精度が目的のため、
+    // どのスライスで音素が正しく発火し始めるかを比較できるようにする。
+    func evaluateSlice(_ slice: MatryoshkaSlice) -> EvalResult {
+        let res = trainer.transcribeTwoStage(
+            featuresSeq: features,
+            kanjiVocabulary: textVocabulary,
+            dictionary: kanaKanjiDict,
+            slice: slice,
+            minDurationFrames: evalMinDuration,
+            minConfidence: evalMinConfidence,
+            boundaries: boundaries,
+            useCTC: evalUseCTC,
+            languageBonus: evalLanguageBonus
+        )
+        let dist = levenshteinDistance(pair.text, res.kanji)
+        let cer = Float(dist) / Float(max(1, pair.text.count))
+        let kanaDist = levenshteinDistance(targetKana, res.kana)
+        let kanaCer = Float(kanaDist) / Float(max(1, targetKana.count))
+
+        return EvalResult(
+            index: idx + 1,
+            fileId: pair.fileId,
+            targetText: pair.text,
+            predText: res.kanji,
+            editDistance: dist,
+            cer: cer,
+            isExact: pair.text == res.kanji,
+            isTrain: isTrain,
+            targetKana: targetKana,
+            predKana: res.kana,
+            kanaCer: kanaCer
+        )
+    }
+
+    evalBuffer.evalBase[idx] = evaluateSlice(.base)
+    evalBuffer.evalMiddle[idx] = evaluateSlice(.middle)
+    evalBuffer.evalHigh[idx] = evaluateSlice(.high)
     evalBuffer.valid[idx] = true
 }
 
 var allEvalBase: [EvalResult] = []
+var allEvalMiddle: [EvalResult] = []
 var allEvalHigh: [EvalResult] = []
 var evIdx = 0
 while evIdx < rawPairs.count {
     if evalBuffer.valid[evIdx] {
         allEvalBase.append(evalBuffer.evalBase[evIdx])
+        allEvalMiddle.append(evalBuffer.evalMiddle[evIdx])
         allEvalHigh.append(evalBuffer.evalHigh[evIdx])
     }
     evIdx += 1
@@ -867,53 +1062,73 @@ while evIdx < rawPairs.count {
 
 let trainBaseResults = allEvalBase.filter { $0.isTrain }
 let unseenBaseResults = allEvalBase.filter { $0.isTrain != true }
+let trainMiddleResults = allEvalMiddle.filter { $0.isTrain }
+let unseenMiddleResults = allEvalMiddle.filter { $0.isTrain != true }
 let trainHighResults = allEvalHigh.filter { $0.isTrain }
 let unseenHighResults = allEvalHigh.filter { $0.isTrain != true }
 
 let trainBaseSummary = computeSummary(trainBaseResults)
 let unseenBaseSummary = computeSummary(unseenBaseResults)
+let trainMiddleSummary = computeSummary(trainMiddleResults)
+let unseenMiddleSummary = computeSummary(unseenMiddleResults)
 let trainHighSummary = computeSummary(trainHighResults)
 let unseenHighSummary = computeSummary(unseenHighResults)
 
+func printSliceSummary(
+    _ label: String,
+    train: GroupSummary,
+    unseen: GroupSummary
+) {
+    print("\n[\(label)]")
+    print("  • 学習セット (\(train.count)件):   Exact率: \(String(format: "%.1f", train.exactRate))% (\(train.exactCount)/\(train.count)), 漢字CER: \(String(format: "%.2f", train.meanCer))% (中央値 \(String(format: "%.2f", train.medianCer))%), かなCER: \(String(format: "%.2f", train.meanKanaCer))% (中央値 \(String(format: "%.2f", train.medianKanaCer))%)")
+    print("  • 未学習セット (\(unseen.count)件): Exact率: \(String(format: "%.1f", unseen.exactRate))% (\(unseen.exactCount)/\(unseen.count)), 漢字CER: \(String(format: "%.2f", unseen.meanCer))% (中央値 \(String(format: "%.2f", unseen.medianCer))%), かなCER: \(String(format: "%.2f", unseen.meanKanaCer))% (中央値 \(String(format: "%.2f", unseen.medianKanaCer))%)")
+}
+
 print("\n==================================================")
 print("=== [集計結果] 学習セット (\(trainHighSummary.count)件) vs 未学習セット (\(unseenHighSummary.count)件) ===")
+print("=== かなCER = 第1段 音響 SNN の音素発火精度 / 漢字CER = 第2段 通過後の最終精度 ===")
 print("==================================================")
-print("\n[Base スライス (128次元)]")
-print("  • 学習セット (\(trainBaseSummary.count)件):   Exact率: \(String(format: "%.1f", trainBaseSummary.exactRate))% (\(trainBaseSummary.exactCount)/\(trainBaseSummary.count)), 平均CER: \(String(format: "%.2f", trainBaseSummary.meanCer))%, CER中央値: \(String(format: "%.2f", trainBaseSummary.medianCer))%")
-print("  • 未学習セット (\(unseenBaseSummary.count)件): Exact率: \(String(format: "%.1f", unseenBaseSummary.exactRate))% (\(unseenBaseSummary.exactCount)/\(unseenBaseSummary.count)), 平均CER: \(String(format: "%.2f", unseenBaseSummary.meanCer))%, CER中央値: \(String(format: "%.2f", unseenBaseSummary.medianCer))%")
-
-print("\n[High スライス (1024次元)]")
-print("  • 学習セット (\(trainHighSummary.count)件):   Exact率: \(String(format: "%.1f", trainHighSummary.exactRate))% (\(trainHighSummary.exactCount)/\(trainHighSummary.count)), 平均CER: \(String(format: "%.2f", trainHighSummary.meanCer))%, CER中央値: \(String(format: "%.2f", trainHighSummary.medianCer))%")
-print("  • 未学習セット (\(unseenHighSummary.count)件): Exact率: \(String(format: "%.1f", unseenHighSummary.exactRate))% (\(unseenHighSummary.exactCount)/\(unseenHighSummary.count)), 平均CER: \(String(format: "%.2f", unseenHighSummary.meanCer))%, CER中央値: \(String(format: "%.2f", unseenHighSummary.medianCer))%")
+printSliceSummary("Base スライス (128次元)", train: trainBaseSummary, unseen: unseenBaseSummary)
+printSliceSummary("Middle スライス (512次元)", train: trainMiddleSummary, unseen: unseenMiddleSummary)
+printSliceSummary("High スライス (1024次元)", train: trainHighSummary, unseen: unseenHighSummary)
 
 // 未学習セットのソート (High スライスの CER 順)
 let sortedUnseenHigh = unseenHighResults.sorted { $0.cer < $1.cer }
 let top5Best = Array(sortedUnseenHigh.prefix(5))
 let top5Worst = Array(sortedUnseenHigh.suffix(5).reversed())
 
-print("\n--- [未学習セット High スライス 良い例 Top 5] ---")
-for (i, r) in top5Best.enumerated() {
-    print("  [\(i+1)] \(r.fileId) (CER: \(String(format: "%.1f", r.cer * 100.0))%, 距離: \(r.editDistance))")
-    print("      正解: \"\(r.targetText)\"")
-    print("      推論: \"\(r.predText)\"")
+func printExamples(_ title: String, _ list: [EvalResult]) {
+    print("\n--- [\(title)] ---")
+    for (i, r) in list.enumerated() {
+        print("  [\(i+1)] \(r.fileId) (漢字CER: \(String(format: "%.1f", r.cer * 100.0))%, かなCER: \(String(format: "%.1f", r.kanaCer * 100.0))%)")
+        print("      正解かな: \"\(r.targetKana)\"")
+        print("      推論かな: \"\(r.predKana)\"")
+        print("      正解漢字: \"\(r.targetText)\"")
+        print("      推論漢字: \"\(r.predText)\"")
+    }
 }
 
-print("\n--- [未学習セット High スライス 悪い例 Top 5] ---")
-for (i, r) in top5Worst.enumerated() {
-    print("  [\(i+1)] \(r.fileId) (CER: \(String(format: "%.1f", r.cer * 100.0))%, 距離: \(r.editDistance))")
-    print("      正解: \"\(r.targetText)\"")
-    print("      推論: \"\(r.predText)\"")
-}
+printExamples("未学習セット High スライス 良い例 Top 5", top5Best)
+printExamples("未学習セット High スライス 悪い例 Top 5", top5Worst)
+
+// Base スライスは「多少の誤字は許容するが文字起こしとして成立するか」が要件のため個別に例示する
+let sortedTrainBase = trainBaseResults.sorted { $0.kanaCer < $1.kanaCer }
+printExamples("学習セット Base スライス(128次元) かなCER 良い例 Top 5", Array(sortedTrainBase.prefix(5)))
+
+let sortedTrainMiddle = trainMiddleResults.sorted { $0.kanaCer < $1.kanaCer }
+printExamples("学習セット Middle スライス(512次元) かなCER 良い例 Top 5", Array(sortedTrainMiddle.prefix(5)))
 
 // レポートファイルの生成
 var reportContent = """
-# loanword128 全 128 発話 正誤率・CER 評価レポート
+# \(datasetPath) 全 \(rawPairs.count) 発話 正誤率・CER 評価レポート
 
 ## 1. 概要
-- **評価対象**: `.tmp/loanword128` 全 128 発話 (WAV + UTF-8 正解テキスト)
-- **モデル**: `-s 3 -e 30` で学習した直接漢字音響 SNN (3 発話のみ学習)
+- **評価対象**: `\(datasetPath)` 全 \(rawPairs.count) 発話 (WAV + UTF-8 正解テキスト)
+- **モデル**: `-s \(sampleLimit) -e \(epochs)` で学習した直接漢字音響 SNN (学習セット \(sampleLimit) 発話)
+- **第1段 LIF/ALIF**: beta = \(alifBeta), rho = \(alifRho), gamma = \(alifGamma)
+- **語彙・かな漢字辞書**: 学習セット \(trainTextLines.count) 件のみから構築 (未学習セットの正解テキストは不使用)
 - **サンプリング**: 48kHz $\to$ 16kHz リサンプリング (アンチエイリアス 3:1 間引き)
-- **デコーダ**: 音響直接デコード (Float32, `minDurationFrames = 3`, `minConfidence = 0.45`, 短padマージ, 重複除外)
+- **デコーダ**: 音響直接デコード (Float32, `minDurationFrames = \(minDuration)`, `minConfidence = \(minConfidence)`, 短padマージ, 重複除外), 第2段 言語 SNN 加点 = \(languageBonus)
 - **評価指標**:
   - **CER (Character Error Rate)**: $\\text{Levenshtein}(target, pred) / \\text{len}(target)$
   - **Exact Match 率**: 完全一致割合 (%)
