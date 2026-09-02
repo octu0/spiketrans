@@ -336,7 +336,6 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
     /// 言語 SNN に入力するかな側の語彙 (languageDecoder 併用時に必須)
     public let kanaVocabulary: TextVocabulary?
     /// 言語 SNN のスライス
-    public let languageSlice: MatryoshkaSlice
     /// 言語 SNN の予測と一致した 1 文字あたりの加点 (0.0 で言語 SNN を無効化)
     public let languageBonus: Float
 
@@ -344,13 +343,11 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
         dictionary: KanaKanjiDictionary,
         languageDecoder: LanguageDecoder? = nil,
         kanaVocabulary: TextVocabulary? = nil,
-        languageSlice: MatryoshkaSlice = .high,
         languageBonus: Float = 4.0
     ) {
         self.dictionary = dictionary
         self.languageDecoder = languageDecoder
         self.kanaVocabulary = kanaVocabulary
-        self.languageSlice = languageSlice
         self.languageBonus = languageBonus
     }
 
@@ -436,8 +433,7 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
                 if 0.0 < languageBonus {
                     lmHints = lmDecoder.predictKanjiPerKana(
                         kanaText: kanaText,
-                        kanaVocabulary: kanaVocab,
-                        slice: languageSlice
+                        kanaVocabulary: kanaVocab
                     )
                 }
             case .none:

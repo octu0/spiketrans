@@ -95,7 +95,8 @@ public final class SpeechDataset: @unchecked Sendable {
     public static func fromWavPairs(
         pairs: [(wavBytes: [UInt8], text: String)],
         textVocabulary: TextVocabulary,
-        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary()
+        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
+        frameStack: Int = 1
     ) throws -> SpeechDataset {
         let parser = WavParser()
         var sampleList: [AudioTextSample] = []
@@ -109,7 +110,7 @@ public final class SpeechDataset: @unchecked Sendable {
             let converter = KanjiConverter(vocabulary: phonemeVocabulary)
             let hiraganaText = converter.convertToHiragana(pair.text)
             let phonemeIds = converter.toPhonemeTokenIds(pair.text)
-            let featuresSeq = extractFeaturesFromPCM(pcmData: pcm16k)
+            let featuresSeq = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack)
 
             if 0 < featuresSeq.count {
                 sampleList.append(AudioTextSample(
@@ -132,7 +133,8 @@ public final class SpeechDataset: @unchecked Sendable {
     public static func fromPCMPairs(
         pairs: [(pcmData: [Float], text: String)],
         textVocabulary: TextVocabulary,
-        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary()
+        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
+        frameStack: Int = 1
     ) -> SpeechDataset {
         var sampleList: [AudioTextSample] = []
         var pIdx = 0
@@ -141,7 +143,7 @@ public final class SpeechDataset: @unchecked Sendable {
             let pair = pairs[pIdx]
             let textIds = textVocabulary.textToIds(pair.text)
             let phonemeIds = extractFallbackPhonemeIds(text: pair.text, phonemeVocabulary: phonemeVocabulary)
-            let featuresSeq = extractFeaturesFromPCM(pcmData: pair.pcmData)
+            let featuresSeq = extractFeaturesFromPCM(pcmData: pair.pcmData, frameStack: frameStack)
 
             if 0 < featuresSeq.count {
                 sampleList.append(AudioTextSample(
@@ -160,7 +162,7 @@ public final class SpeechDataset: @unchecked Sendable {
     }
 
     /// PCM 配列から 128次元音響特徴量系列 (Preemphasis + 64ch Mel + 3-tap 平滑/差分) を抽出
-    public static func extractFeaturesFromPCM(pcmData: [Float]) -> [[Float]] {
+    public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = 1) -> [[Float]] {
         let totalSamples = pcmData.count
         if totalSamples < 400 {
             return []
@@ -237,6 +239,57 @@ public final class SpeechDataset: @unchecked Sendable {
             t += 1
         }
 
-        return featuresSeq
+        return stackFrames(featuresSeq, stack: frameStack)
+    }
+
+    /// 連続する stack フレームを 1 フレームに束ねて時間解像度を落とす
+    ///
+    /// hopSize=160 (16kHz) では 1 フレーム 10ms と CTC には過剰に細かく、
+    /// SNN の逐次ステップ数がそのまま学習時間に効く。3 フレーム束ねて 30ms 相当に
+    /// すると情報を捨てずに逐次ステップを 1/3 にできる。
+    /// stack = 1 のときは何もしない。
+    public static func stackFrames(_ featuresSeq: [[Float]], stack: Int) -> [[Float]] {
+        if stack <= 1 || featuresSeq.isEmpty {
+            return featuresSeq
+        }
+
+        let frameDim = featuresSeq[0].count
+        let outCount = featuresSeq.count / stack
+        if outCount <= 0 {
+            // 束ねるには短すぎる場合は 1 フレームに全部詰めてゼロ埋め
+            var single = [Float](repeating: 0.0, count: frameDim * stack)
+            var f = 0
+            while f < featuresSeq.count {
+                let src = featuresSeq[f]
+                var d = 0
+                while d < frameDim {
+                    single[(f * frameDim) + d] = src[d]
+                    d += 1
+                }
+                f += 1
+            }
+            return [single]
+        }
+
+        var out = [[Float]](
+            repeating: [Float](repeating: 0.0, count: frameDim * stack),
+            count: outCount
+        )
+        var o = 0
+        while o < outCount {
+            var k = 0
+            while k < stack {
+                let src = featuresSeq[(o * stack) + k]
+                let offset = k * frameDim
+                var d = 0
+                while d < frameDim {
+                    out[o][offset + d] = src[d]
+                    d += 1
+                }
+                k += 1
+            }
+            o += 1
+        }
+        return out
     }
 }

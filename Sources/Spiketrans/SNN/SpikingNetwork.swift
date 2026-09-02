@@ -1,78 +1,7 @@
 import Foundation
 
-/// マトリョーシカスライス粒度
-public enum MatryoshkaSlice: Int, Sendable, CaseIterable {
-    case base   = 128
-    case middle = 512
-    case high   = 1024
-}
-
-/// SNN 全体重みコンテナ
-public struct MatryoshkaWeights: Sendable, Equatable {
-    public let inputDim: Int
-    public let hiddenDim: Int     // 1024 (High)
-    public let outputDim: Int
-    public var wIn: [Float]       // [hiddenDim, inputDim]
-    public var wRec: [Float]      // [hiddenDim, hiddenDim]
-    public var bH: [Float]        // [hiddenDim]
-    public var wOut: [Float]      // [outputDim, hiddenDim]
-    public var bOut: [Float]      // [outputDim]
-
-    public init(
-        inputDim: Int,
-        hiddenDim: Int,
-        outputDim: Int,
-        wIn: [Float],
-        wRec: [Float],
-        bH: [Float],
-        wOut: [Float],
-        bOut: [Float]
-    ) {
-        self.inputDim = inputDim
-        self.hiddenDim = hiddenDim
-        self.outputDim = outputDim
-        self.wIn = wIn
-        self.wRec = wRec
-        self.bH = bH
-        self.wOut = wOut
-        self.bOut = bOut
-    }
-}
-
-/// Base 単体エクスポート用モデル重みコンテナ
-public struct BaseSNNWeights: Codable, Sendable, Equatable {
-    public let inputDim: Int
-    public let hiddenDim: Int     // 1024
-    public let outputDim: Int
-    public let wIn: [Float]       // 1024 * inputDim
-    public let wRec: [Float]      // 1024 * 1024
-    public let bH: [Float]        // 1024
-    public let wOut: [Float]      // outputDim * 1024
-    public let bOut: [Float]      // outputDim
-
-    public init(
-        inputDim: Int,
-        hiddenDim: Int,
-        outputDim: Int,
-        wIn: [Float],
-        wRec: [Float],
-        bH: [Float],
-        wOut: [Float],
-        bOut: [Float]
-    ) {
-        self.inputDim = inputDim
-        self.hiddenDim = hiddenDim
-        self.outputDim = outputDim
-        self.wIn = wIn
-        self.wRec = wRec
-        self.bH = bH
-        self.wOut = wOut
-        self.bOut = bOut
-    }
-}
-
-/// マトリョーシカ SNN ネットワーク本体 (Float32)
-public final class MatryoshkaNetwork: @unchecked Sendable {
+/// スパイキングニューラルネットワーク本体 (Float32)
+public final class SpikingNetwork: @unchecked Sendable {
     public let inputDim: Int
     public let maxHiddenDim: Int  // 4096
     public let outputDim: Int
@@ -83,11 +12,8 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
     public let pWIn: Parameter
     public let pWRec: Parameter
     public let pBH: Parameter
-    public let pWOut: Parameter
-    public let pBOut: Parameter        // High スライス用
-    // スライスごとに blank の閾値を独立に較正するための出力バイアス
-    public let pBOutBase: Parameter
-    public let pBOutMiddle: Parameter
+    public let pWOut: Parameter        // 全スライスで共有 [outputDim, maxHiddenDim]
+    public let pBOut: Parameter
 
     public init(
         inputDim: Int = 64,
@@ -136,149 +62,15 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         self.pBH = Parameter(count: maxHiddenDim, initialData: initBH)
         self.pWOut = Parameter(count: outputDim * maxHiddenDim, initialData: initWOut)
         self.pBOut = Parameter(count: outputDim, initialData: initBOut)
-        self.pBOutBase = Parameter(count: outputDim, initialData: initBOut)
-        self.pBOutMiddle = Parameter(count: outputDim, initialData: initBOut)
     }
 
     public var parameters: [Parameter] {
-        return [pWIn, pWRec, pBH, pWOut, pBOut, pBOutBase, pBOutMiddle]
-    }
-
-    /// Base 単体モデルのエクスポート
-    public func exportBaseWeights() -> BaseSNNWeights {
-        let hBase = min(MatryoshkaSlice.base.rawValue, maxHiddenDim)
-        var baseWIn = [Float](repeating: 0.0, count: hBase * inputDim)
-        var baseWRec = [Float](repeating: 0.0, count: hBase * hBase)
-        var baseBH = [Float](repeating: 0.0, count: hBase)
-        var baseWOut = [Float](repeating: 0.0, count: outputDim * hBase)
-        var baseBOut = [Float](repeating: 0.0, count: outputDim)
-
-        // WIn
-        var r = 0
-        while r < hBase {
-            var c = 0
-            while c < inputDim {
-                baseWIn[r * inputDim + c] = pWIn.data[r * inputDim + c]
-                c += 1
-            }
-            r += 1
-        }
-
-        // WRec
-        r = 0
-        while r < hBase {
-            var c = 0
-            while c < hBase {
-                baseWRec[r * hBase + c] = pWRec.data[r * maxHiddenDim + c]
-                c += 1
-            }
-            r += 1
-        }
-
-        // BH
-        r = 0
-        while r < hBase {
-            baseBH[r] = pBH.data[r]
-            r += 1
-        }
-
-        // WOut
-        var o = 0
-        while o < outputDim {
-            var c = 0
-            while c < hBase {
-                baseWOut[o * hBase + c] = pWOut.data[o * maxHiddenDim + c]
-                c += 1
-            }
-            o += 1
-        }
-
-        // BOut
-        o = 0
-        while o < outputDim {
-            baseBOut[o] = pBOut.data[o]
-            o += 1
-        }
-
-        return BaseSNNWeights(
-            inputDim: inputDim,
-            hiddenDim: hBase,
-            outputDim: outputDim,
-            wIn: baseWIn,
-            wRec: baseWRec,
-            bH: baseBH,
-            wOut: baseWOut,
-            bOut: baseBOut
-        )
-    }
-
-    /// Base 単体モデルのインポート
-    public func importBaseWeights(_ base: BaseSNNWeights) {
-        let hBase = min(MatryoshkaSlice.base.rawValue, maxHiddenDim)
-
-        // WIn: 先頭 hBase 行
-        var r = 0
-        while r < hBase {
-            var c = 0
-            while c < inputDim {
-                pWIn.data[r * inputDim + c] = base.wIn[r * inputDim + c]
-                c += 1
-            }
-            r += 1
-        }
-
-        // WRec: 左上 hBase x hBase
-        r = 0
-        while r < hBase {
-            var c = 0
-            while c < hBase {
-                pWRec.data[r * maxHiddenDim + c] = base.wRec[r * hBase + c]
-                c += 1
-            }
-            r += 1
-        }
-
-        // BH: 先頭 hBase
-        r = 0
-        while r < hBase {
-            pBH.data[r] = base.bH[r]
-            r += 1
-        }
-
-        // WOut: outputDim 行 x 先頭 hBase 列
-        var o = 0
-        while o < outputDim {
-            var c = 0
-            while c < hBase {
-                pWOut.data[o * maxHiddenDim + c] = base.wOut[o * hBase + c]
-                c += 1
-            }
-            o += 1
-        }
-
-        // BOut
-        o = 0
-        while o < outputDim {
-            pBOut.data[o] = base.bOut[o]
-            o += 1
-        }
-    }
-
-    /// スライスに対応する出力バイアス
-    public func outputBias(for slice: MatryoshkaSlice) -> Parameter {
-        switch slice {
-        case .base:
-            return pBOutBase
-        case .middle:
-            return pBOutMiddle
-        case .high:
-            return pBOut
-        }
+        return [pWIn, pWRec, pBH, pWOut, pBOut]
     }
 
     /// 全体重みのエクスポート
-    public func exportWeights() -> MatryoshkaWeightsData {
-        return MatryoshkaWeightsData(
+    public func exportWeights() -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
@@ -288,14 +80,12 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             wRec: pWRec.data,
             bH: pBH.data,
             wOut: pWOut.data,
-            bOut: pBOut.data,
-            bOutBase: pBOutBase.data,
-            bOutMiddle: pBOutMiddle.data
+            bOut: pBOut.data
         )
     }
 
     /// 全体重みのインポート (学習時の LIF / ALIF パラメータも同時に復元)
-    public func importWeights(from weightsData: MatryoshkaWeightsData) {
+    public func importWeights(from weightsData: SpikingNetworkWeights) {
         // 学習時と推論時で発火ダイナミクスがずれないよう ALIF パラメータごと引き継ぐ
         self.lifConfig = weightsData.lifConfig
         if weightsData.wIn.count == pWIn.data.count {
@@ -313,33 +103,26 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         if weightsData.bOut.count == pBOut.data.count {
             pBOut.data = weightsData.bOut
         }
-        if weightsData.bOutBase.count == pBOutBase.data.count {
-            pBOutBase.data = weightsData.bOutBase
-        }
-        if weightsData.bOutMiddle.count == pBOutMiddle.data.count {
-            pBOutMiddle.data = weightsData.bOutMiddle
-        }
     }
 
-    /// 指定スライスでの推論（ALIF 適応型発火閾値 & Event-driven 疎スパイク高速化 & ゼロアロケーション）
+    /// 1 フレームの推論（ALIF 適応型発火閾値 & Event-driven 疎スパイク加算 & ゼロアロケーション）
     ///
     /// Hot Path でのヒープ再アロケーションを避けるため、中間バッファは呼び出し側が
-    /// `MatryoshkaScratch` として事前確保して渡す。
-    public func forwardSlice(
+    /// `ForwardScratch` として事前確保して渡す。
+    public func forward(
         features: [Float],
-        slice: MatryoshkaSlice,
         vPrev: inout [Float],
         sPrev: inout [Float],
         aPrev: inout [Float],
         spikeSum: inout [Float],
         logits: inout [Float],
         probabilities: inout [Float],
-        scratch: MatryoshkaScratch
+        scratch: ForwardScratch
     ) {
         if features.count < inputDim {
             return
         }
-        let hSize = min(slice.rawValue, maxHiddenDim)
+        let hSize = maxHiddenDim
 
         // 1. 各ニューロンのスパイク積算リセット
         var i = 0
@@ -418,9 +201,7 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
 
         // 4. リードアウト層計算 (Event-driven 疎加算 & スケール正規化)
         let invT = 1.0 / Float(timeSteps)
-        let sliceNorm = sqrt(Float(maxHiddenDim) / Float(hSize))
-        // sliceNorm は重み付き和にのみ掛かるため、バイアスはスライス専用のものを使う
-        let biasData = outputBias(for: slice).data
+        let biasData = pBOut.data
 
         var activeOutCount = 0
         var k = 0
@@ -445,7 +226,7 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
                 sumW += pWOut.data[wOffset + idx] * scratch.activeRates[a]
                 a += 1
             }
-            let logit = biasData[c] + (sumW * sliceNorm)
+            let logit = biasData[c] + sumW
             logits[c] = logit
             if maxLogit < logit {
                 maxLogit = logit
@@ -470,21 +251,22 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
         }
     }
 
-    /// 中間バッファを都度確保する簡便版 (Hot Path 以外・テスト用)
-    public func forwardSlice(
+    /// 中間バッファと適応閾値状態を呼び出し側で保持しない簡便版 (Hot Path 以外)
+    ///
+    /// 呼び出しごとに ALIF の適応状態がゼロから始まるため、フレームを跨いだ
+    /// 神経順応は再現されない。連続フレーム推論では aPrev を保持する版を使うこと。
+    public func forward(
         features: [Float],
-        slice: MatryoshkaSlice,
         vPrev: inout [Float],
         sPrev: inout [Float],
-        aPrev: inout [Float],
         spikeSum: inout [Float],
         logits: inout [Float],
         probabilities: inout [Float]
     ) {
-        let scratch = MatryoshkaScratch(maxHiddenDim: min(slice.rawValue, maxHiddenDim))
-        forwardSlice(
+        var aPrev = [Float](repeating: 0.0, count: maxHiddenDim)
+        let scratch = ForwardScratch(maxHiddenDim: maxHiddenDim)
+        forward(
             features: features,
-            slice: slice,
             vPrev: &vPrev,
             sPrev: &sPrev,
             aPrev: &aPrev,
@@ -494,38 +276,12 @@ public final class MatryoshkaNetwork: @unchecked Sendable {
             scratch: scratch
         )
     }
-
-    /// 適応閾値状態を呼び出し側で保持しない簡便版 (Hot Path 以外・テスト用)
-    ///
-    /// 注意: 呼び出しごとに ALIF の適応状態がゼロから始まるため、フレームを跨いだ
-    /// 神経順応は再現されない。連続フレーム推論では aPrev を保持する版を使うこと。
-    public func forwardSlice(
-        features: [Float],
-        slice: MatryoshkaSlice,
-        vPrev: inout [Float],
-        sPrev: inout [Float],
-        spikeSum: inout [Float],
-        logits: inout [Float],
-        probabilities: inout [Float]
-    ) {
-        var aPrev = [Float](repeating: 0.0, count: min(slice.rawValue, maxHiddenDim))
-        forwardSlice(
-            features: features,
-            slice: slice,
-            vPrev: &vPrev,
-            sPrev: &sPrev,
-            aPrev: &aPrev,
-            spikeSum: &spikeSum,
-            logits: &logits,
-            probabilities: &probabilities
-        )
-    }
 }
 
-/// forwardSlice の Hot Path 用事前確保中間バッファ (ゼロアロケーション維持)
+/// forward の Hot Path 用事前確保中間バッファ (ゼロアロケーション維持)
 ///
 /// スレッドセーフではないため、並列推論では推論スレッドごとに 1 つ確保すること。
-public final class MatryoshkaScratch: @unchecked Sendable {
+public final class ForwardScratch: @unchecked Sendable {
     public var inputCurrents: [Float]
     public var vNext: [Float]
     public var sNext: [Float]

@@ -25,7 +25,7 @@ final class Tier2BoundaryTests: XCTestCase {
     }
 
     func testB1SNNEmptyFeatures() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         var vPrev = [Float](repeating: 0.0, count: 256)
         var sPrev = [Float](repeating: 0.0, count: 256)
         var spikeSum = [Float](repeating: 0.0, count: 256)
@@ -34,14 +34,14 @@ final class Tier2BoundaryTests: XCTestCase {
 
         let emptyFeatures: [Float] = []
         // Should safely return without crashing
-        net.forwardSlice(features: emptyFeatures, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: emptyFeatures, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertEqual(probs.count, 64)
     }
 
     func testB1TranscriberEmptyAudio() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
         transcriber.appendAudio(pcm: [])
         transcriber.flush()
@@ -60,8 +60,8 @@ final class Tier2BoundaryTests: XCTestCase {
 
     func testB2TranscriberHugeBurst() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let hugeAudio = [Float](repeating: 0.1, count: 100000)
@@ -101,7 +101,7 @@ final class Tier2BoundaryTests: XCTestCase {
     }
 
     func testB2SNNHighDimensionFullForward() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let features = [Float](repeating: 0.9, count: 32)
         var vPrev = [Float](repeating: 0.0, count: 256)
         var sPrev = [Float](repeating: 0.0, count: 256)
@@ -109,7 +109,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var logits = [Float](repeating: 0.0, count: 64)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        net.forwardSlice(features: features, slice: .high, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertEqual(probs.count, 64)
     }
 
@@ -173,8 +173,8 @@ final class Tier2BoundaryTests: XCTestCase {
 
     func testB3TranscriberZeroSilence() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let zeros = [Float](repeating: 0.0, count: 16000)
@@ -265,8 +265,8 @@ final class Tier2BoundaryTests: XCTestCase {
 
     func testB4TranscriberClippedSpeech() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         var clipped = [Float](repeating: 0.0, count: 8000)
@@ -350,8 +350,8 @@ final class Tier2BoundaryTests: XCTestCase {
 
     func testB5TranscriberDCOffsetAudio() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let dcAudio = [Float](repeating: 0.7, count: 4800)
@@ -501,7 +501,8 @@ final class Tier2BoundaryTests: XCTestCase {
         var i = 0
         while i < 8 {
             XCTAssertEqual(s[i], 1.0)
-            XCTAssertEqual(v[i], 50.0)
+            // 膜電位は学習側と同じ範囲に飽和する
+            XCTAssertEqual(v[i], LIFNeuronEngine.vClampMax)
             i += 1
         }
     }
@@ -542,8 +543,8 @@ final class Tier2BoundaryTests: XCTestCase {
         }
     }
 
-    func testB7MatryoshkaAllSpikeInputSoftmax() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+    func testB7AllSpikeInputSoftmax() {
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let features = [Float](repeating: 100.0, count: 32)
         var vPrev = [Float](repeating: 0.0, count: 256)
         var sPrev = [Float](repeating: 1.0, count: 256)
@@ -551,7 +552,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var logits = [Float](repeating: 0.0, count: 64)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        net.forwardSlice(features: features, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
 
         var sumP: Float = 0.0
         var i = 0
@@ -563,8 +564,8 @@ final class Tier2BoundaryTests: XCTestCase {
         XCTAssertLessThanOrEqual(abs(sumP - 1.0), 1e-4)
     }
 
-    func testB7MatryoshkaNoSpikeInputSoftmax() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+    func testB7NoSpikeInputSoftmax() {
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let features = [Float](repeating: 0.0, count: 32)
         var vPrev = [Float](repeating: 0.0, count: 256)
         var sPrev = [Float](repeating: 0.0, count: 256)
@@ -572,7 +573,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var logits = [Float](repeating: 0.0, count: 64)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        net.forwardSlice(features: features, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
 
         var sumP: Float = 0.0
         var i = 0
@@ -585,7 +586,7 @@ final class Tier2BoundaryTests: XCTestCase {
     }
 
     func testB7QuantizedEngineAllSpikeState() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let config = QuantizedConfig.int32Config()
         let qWeights = QuantizedEngine.quantize(network: net, config: config)
         let engine = QuantizedEngine(weights: qWeights, timeSteps: 4)
@@ -599,7 +600,7 @@ final class Tier2BoundaryTests: XCTestCase {
 
         let features = [Float](repeating: 1.0, count: 32)
         var probs = [Float](repeating: 0.0, count: 64)
-        engine.predictSlice(features: features, slice: .base, workspace: workspace, outputProbs: &probs)
+        engine.predict(features: features, workspace: workspace, outputProbs: &probs)
         XCTAssertFalse(probs[0].isNaN)
     }
 
@@ -651,8 +652,8 @@ final class Tier2BoundaryTests: XCTestCase {
 
     func testB8TranscriberNaNInputProtection() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         var audio = [Float](repeating: 0.0, count: 1600)
@@ -721,7 +722,7 @@ final class Tier2BoundaryTests: XCTestCase {
     // MARK: - B10: 浮動小数点アンダーフロー (5 tests)
 
     func testB10SoftmaxExtremeNegativeLogits() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         var logits: [Float] = [Float](repeating: -1000.0, count: 64)
         logits[0] = -999.0
         var probs = [Float](repeating: 0.0, count: 64)
@@ -732,7 +733,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var sPrev = [Float](repeating: 0.0, count: 256)
         var spikeSum = [Float](repeating: 0.0, count: 256)
 
-        net.forwardSlice(features: features, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertFalse(probs[0].isNaN)
     }
 
@@ -864,7 +865,7 @@ final class Tier2BoundaryTests: XCTestCase {
     // MARK: - B13: 固定小数点オーバーフロー (5 tests)
 
     func testB13QuantizedEngineHugeAccumulation() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let config = QuantizedConfig.int32Config()
         let qWeights = QuantizedEngine.quantize(network: net, config: config)
         let engine = QuantizedEngine(weights: qWeights, timeSteps: 4)
@@ -873,12 +874,12 @@ final class Tier2BoundaryTests: XCTestCase {
         // Extremely high inputs
         let hugeFeatures = [Float](repeating: 100.0, count: 32)
         var probs = [Float](repeating: 0.0, count: 64)
-        engine.predictSlice(features: hugeFeatures, slice: .high, workspace: workspace, outputProbs: &probs)
+        engine.predict(features: hugeFeatures, workspace: workspace, outputProbs: &probs)
         XCTAssertFalse(probs[0].isNaN)
     }
 
     func testB13QuantizedWeightsExtremeScale() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let config = QuantizedConfig(vThInt: 1048576, decayNum: 52429, decayBits: 16, scale: 1048576.0, scaleBits: 20)
         let qWeights = QuantizedEngine.quantize(network: net, config: config)
         XCTAssertEqual(qWeights.config.scale, 1048576.0)
@@ -899,7 +900,7 @@ final class Tier2BoundaryTests: XCTestCase {
     }
 
     func testB13QuantizedEngineMultiStepAccumulation() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let config = QuantizedConfig.int16Config()
         let qWeights = QuantizedEngine.quantize(network: net, config: config)
         let engine = QuantizedEngine(weights: qWeights, timeSteps: 4)
@@ -909,7 +910,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var probs = [Float](repeating: 0.0, count: 64)
         var step = 0
         while step < 50 {
-            engine.predictSlice(features: features, slice: .base, workspace: workspace, outputProbs: &probs)
+            engine.predict(features: features, workspace: workspace, outputProbs: &probs)
             step += 1
         }
         XCTAssertFalse(probs[0].isNaN)
@@ -976,8 +977,8 @@ final class Tier2BoundaryTests: XCTestCase {
 
     func testB14TranscriberImpulseAudio() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         var impulseAudio = [Float](repeating: 0.0, count: 1600)
@@ -991,8 +992,8 @@ final class Tier2BoundaryTests: XCTestCase {
 
     func testB15TranscriberContinuousFlush() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         var i = 0

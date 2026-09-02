@@ -54,6 +54,21 @@ public final class LIFState: @unchecked Sendable {
 
 /// SIMD8 ベクトル化 LIF 膜電位更新エンジン
 public enum LIFNeuronEngine {
+    /// 膜電位の飽和範囲。学習側 (MLX) が同じ範囲でクリップしているため、
+    /// 推論側でも揃えないと発火パターンが学習時と食い違う。
+    public static let vClampMin: Float = -20.0
+    public static let vClampMax: Float = 20.0
+
+    @inline(__always)
+    public static func clampMembrane(_ v: Float) -> Float {
+        if v < vClampMin {
+            return vClampMin
+        }
+        if vClampMax < v {
+            return vClampMax
+        }
+        return v
+    }
     /// 1 ニューロンのスカラー更新ステップ
     @inline(__always)
     public static func stepScalar(
@@ -63,7 +78,7 @@ public enum LIFNeuronEngine {
         inputCurrent: Float
     ) -> (vNext: Float, sNext: Float) {
         let vDecayed = config.beta * vPrev * (1.0 - sPrev)
-        let vNext = vDecayed + inputCurrent
+        let vNext = clampMembrane(vDecayed + inputCurrent)
         var sNext: Float = 0.0
         if config.vTh <= vNext {
             sNext = 1.0
@@ -81,7 +96,7 @@ public enum LIFNeuronEngine {
         inputCurrent: Float
     ) -> (vNext: Float, sNext: Float, aNext: Float) {
         let vDecayed = config.beta * vPrev * (1.0 - sPrev)
-        let vNext = vDecayed + inputCurrent
+        let vNext = clampMembrane(vDecayed + inputCurrent)
         let aNext = (config.rho * aPrev) + (config.gamma * sPrev)
         let dynVTh = config.vTh + aNext
         var sNext: Float = 0.0
@@ -124,7 +139,14 @@ public enum LIFNeuronEngine {
             )
 
             let vDecayed = betaVec * va * (oneVec - sa)
-            let vNext = vDecayed + ia
+            // スカラー版と同じ飽和範囲に揃える
+            let vRaw = vDecayed + ia
+            // clamped() は NaN を境界値に潰してしまうため、比較で置換して
+            // スカラー版と同じく NaN をそのまま通す
+            let lowVec = SIMD8<Float>(repeating: vClampMin)
+            let highVec = SIMD8<Float>(repeating: vClampMax)
+            var vNext = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
+            vNext = vNext.replacing(with: highVec, where: highVec .< vNext)
             let mask = vThVec .<= vNext
 
             vNextPtr[i+0] = vNext[0]

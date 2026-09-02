@@ -62,7 +62,7 @@ final class BPTTTests: XCTestCase {
     // MARK: - 数値微分 (Finite Difference) 勾配検証テスト
 
     func testFiniteDifferenceGradientCheck() {
-        let net = MatryoshkaNetwork(
+        let net = SpikingNetwork(
             inputDim: 4,
             maxHiddenDim: 64, // Base スライスと一致
             outputDim: 4,
@@ -88,8 +88,8 @@ final class BPTTTests: XCTestCase {
 
         // 1. 解析的勾配の計算
         opt.zeroGrad()
-        let fwdRes = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets, slice: .base)
-        trainer.backwardSequence(featuresSeq: featuresSeq, targets: targets, cache: fwdRes.cache, slice: .base, lossWeight: 1.0)
+        let fwdRes = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets)
+        trainer.backwardSequence(featuresSeq: featuresSeq, targets: targets, cache: fwdRes.cache, lossWeight: 1.0)
 
         // 2. 出力層バイアス pBOut の数値微分検証
         let eps: Float = 1e-3
@@ -98,10 +98,10 @@ final class BPTTTests: XCTestCase {
             let origVal = net.pBOut.data[c]
 
             net.pBOut.data[c] = origVal + eps
-            let resPlus = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets, slice: .base)
+            let resPlus = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets)
 
             net.pBOut.data[c] = origVal - eps
-            let resMinus = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets, slice: .base)
+            let resMinus = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets)
 
             net.pBOut.data[c] = origVal
 
@@ -147,7 +147,7 @@ final class BPTTTests: XCTestCase {
     // MARK: - トイデータセット学習収束テスト
 
     func testToyDatasetConvergence() {
-        let net = MatryoshkaNetwork(
+        let net = SpikingNetwork(
             inputDim: 8,
             maxHiddenDim: 256,
             outputDim: 4,
@@ -186,7 +186,7 @@ final class BPTTTests: XCTestCase {
         while epoch < 40 {
             let resA = trainer.trainStep(featuresSeq: seqA, targets: targetsA)
             let resB = trainer.trainStep(featuresSeq: seqB, targets: targetsB)
-            let currentLoss = (resA.totalLoss + resB.totalLoss) * 0.5
+            let currentLoss = (resA + resB) * 0.5
 
             if epoch == 0 {
                 initialLoss = currentLoss
@@ -203,7 +203,7 @@ final class BPTTTests: XCTestCase {
     // MARK: - 縮小隠れ層 (maxHiddenDim: 64) での trainStep 実行テスト
 
     func testTrainStepWithReducedHiddenDim64() {
-        let net = MatryoshkaNetwork(
+        let net = SpikingNetwork(
             inputDim: 4,
             maxHiddenDim: 64, // Base スライス (64) のみ有効
             outputDim: 2,
@@ -236,19 +236,15 @@ final class BPTTTests: XCTestCase {
         let initialResA = trainer.trainStep(featuresSeq: seqA, targets: targetsA)
         
         // Base スライスの損失は計算され、Middle/High は 0.0 であること
-        XCTAssertLessThan(0.0, initialResA.lossBase)
-        XCTAssertEqual(initialResA.lossMiddle, 0.0)
-        XCTAssertEqual(initialResA.lossHigh, 0.0)
-        XCTAssertEqual(initialResA.totalLoss, initialResA.lossBase)
 
-        var initialLoss = initialResA.totalLoss
+        var initialLoss = initialResA
         var finalLoss: Float = 0.0
 
         var epoch = 0
         while epoch < 30 {
             let resA = trainer.trainStep(featuresSeq: seqA, targets: targetsA)
             let resB = trainer.trainStep(featuresSeq: seqB, targets: targetsB)
-            let currentLoss = (resA.totalLoss + resB.totalLoss) * 0.5
+            let currentLoss = (resA + resB) * 0.5
 
             if epoch == 0 {
                 initialLoss = currentLoss

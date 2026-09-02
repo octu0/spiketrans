@@ -2,14 +2,14 @@ import Foundation
 
 /// 第2段 漢字自己回帰言語 SNN (Language SNN) 学習オーケストレータ
 public final class LanguageTrainer: @unchecked Sendable {
-    public let network: MatryoshkaNetwork
+    public let network: SpikingNetwork
     public let optimizer: AdamOptimizer
     public let bpttTrainer: BPTTTrainer
     public let textVocabulary: TextVocabulary
     public let config: TrainingConfig
 
     public init(
-        network: MatryoshkaNetwork,
+        network: SpikingNetwork,
         textVocabulary: TextVocabulary,
         config: TrainingConfig = TrainingConfig()
     ) {
@@ -43,9 +43,6 @@ public final class LanguageTrainer: @unchecked Sendable {
     /// データセットに対する 1 エポックの学習を実行 (並列ワーカー数指定対応)
     public func trainEpoch(dataset: SpeechDataset, epoch: Int = 1, numWorkers: Int = 1) -> EpochResult {
         var sumTotalLoss: Float = 0.0
-        var sumBaseLoss: Float = 0.0
-        var sumMiddleLoss: Float = 0.0
-        var sumHighLoss: Float = 0.0
         var validSampleCount = 0
 
         let totalSamples = dataset.count
@@ -53,14 +50,11 @@ public final class LanguageTrainer: @unchecked Sendable {
 
         final class BatchBuffer: @unchecked Sendable {
             var grads: [NetworkGradients]
-            var losses: [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)]
+            var losses: [Float]
             var valid: [Bool]
             init(count: Int, template: NetworkGradients) {
                 self.grads = [NetworkGradients](repeating: template, count: count)
-                self.losses = [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)](
-                    repeating: (0.0, 0.0, 0.0, 0.0),
-                    count: count
-                )
+                self.losses = [Float](repeating: 0.0, count: count)
                 self.valid = [Bool](repeating: false, count: count)
             }
         }
@@ -110,10 +104,7 @@ public final class LanguageTrainer: @unchecked Sendable {
                 if buffer.valid[i] {
                     combinedGrads.accumulate(from: buffer.grads[i])
                     let l = buffer.losses[i]
-                    sumTotalLoss += l.totalLoss
-                    sumBaseLoss += l.lossBase
-                    sumMiddleLoss += l.lossMiddle
-                    sumHighLoss += l.lossHigh
+                        sumTotalLoss += l
                     validInBatch += 1
                 }
                 i += 1
@@ -128,24 +119,15 @@ public final class LanguageTrainer: @unchecked Sendable {
         }
 
         var avgTotal: Float = 0.0
-        var avgBase: Float = 0.0
-        var avgMiddle: Float = 0.0
-        var avgHigh: Float = 0.0
 
         if 0 < validSampleCount {
             let invCount = 1.0 / Float(validSampleCount)
             avgTotal = sumTotalLoss * invCount
-            avgBase = sumBaseLoss * invCount
-            avgMiddle = sumMiddleLoss * invCount
-            avgHigh = sumHighLoss * invCount
         }
 
         return EpochResult(
             epoch: epoch,
-            totalLoss: avgTotal,
-            baseLoss: avgBase,
-            middleLoss: avgMiddle,
-            highLoss: avgHigh
+            totalLoss: sumTotalLoss / Float(max(1, validSampleCount))
         )
     }
 
@@ -169,9 +151,6 @@ public final class LanguageTrainer: @unchecked Sendable {
         numWorkers: Int = 1
     ) -> EpochResult {
         var sumTotalLoss: Float = 0.0
-        var sumBaseLoss: Float = 0.0
-        var sumMiddleLoss: Float = 0.0
-        var sumHighLoss: Float = 0.0
         var validSampleCount = 0
 
         let totalSamples = dataset.count
@@ -179,14 +158,11 @@ public final class LanguageTrainer: @unchecked Sendable {
 
         final class BatchBuffer: @unchecked Sendable {
             var grads: [NetworkGradients]
-            var losses: [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)]
+            var losses: [Float]
             var valid: [Bool]
             init(count: Int, template: NetworkGradients) {
                 self.grads = [NetworkGradients](repeating: template, count: count)
-                self.losses = [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)](
-                    repeating: (0.0, 0.0, 0.0, 0.0),
-                    count: count
-                )
+                self.losses = [Float](repeating: 0.0, count: count)
                 self.valid = [Bool](repeating: false, count: count)
             }
         }
@@ -246,10 +222,7 @@ public final class LanguageTrainer: @unchecked Sendable {
                 if buffer.valid[i] {
                     combinedGrads.accumulate(from: buffer.grads[i])
                     let l = buffer.losses[i]
-                    sumTotalLoss += l.totalLoss
-                    sumBaseLoss += l.lossBase
-                    sumMiddleLoss += l.lossMiddle
-                    sumHighLoss += l.lossHigh
+                        sumTotalLoss += l
                     validInBatch += 1
                 }
                 i += 1
@@ -264,24 +237,15 @@ public final class LanguageTrainer: @unchecked Sendable {
         }
 
         var avgTotal: Float = 0.0
-        var avgBase: Float = 0.0
-        var avgMiddle: Float = 0.0
-        var avgHigh: Float = 0.0
 
         if 0 < validSampleCount {
             let invCount = 1.0 / Float(validSampleCount)
             avgTotal = sumTotalLoss * invCount
-            avgBase = sumBaseLoss * invCount
-            avgMiddle = sumMiddleLoss * invCount
-            avgHigh = sumHighLoss * invCount
         }
 
         return EpochResult(
             epoch: epoch,
-            totalLoss: avgTotal,
-            baseLoss: avgBase,
-            middleLoss: avgMiddle,
-            highLoss: avgHigh
+            totalLoss: sumTotalLoss / Float(max(1, validSampleCount))
         )
     }
 }

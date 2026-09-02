@@ -65,10 +65,10 @@ private final class ThreadSafeCounter: @unchecked Sendable {
 /// Milestone M3 (Two-Stage STT Pipeline & Streaming Decoder) 敵対的・極限入力検証テストスイート (Challenger 1)
 final class M3AdversarialChallengerTests: XCTestCase {
 
-    private func createTestNetworks() -> (acoustic: MatryoshkaNetwork, language: MatryoshkaNetwork) {
+    private func createTestNetworks() -> (acoustic: SpikingNetwork, language: SpikingNetwork) {
         let vocabSize = TextVocabulary().size
-        let ac = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocabSize, timeSteps: 4)
-        let lm = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocabSize, timeSteps: 4)
+        let ac = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocabSize, timeSteps: 4)
+        let lm = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocabSize, timeSteps: 4)
         return (acoustic: ac, language: lm)
     }
 
@@ -446,12 +446,12 @@ final class M3AdversarialChallengerTests: XCTestCase {
         XCTAssertNotNil(collapsed)
 
         // Greedy デコードがクラッシュせず finite なスコアを返すこと
-        let greedyRes = langDecoder.decodeGreedy(acousticProbs: badFrames, slice: .base)
+        let greedyRes = langDecoder.decodeGreedy(acousticProbs: badFrames)
         XCTAssertFalse(greedyRes.score.isNaN)
         XCTAssertFalse(greedyRes.score.isInfinite)
 
         // BeamSearch デコードがクラッシュせず finite なスコアを返すこと
-        let beamRes = langDecoder.decodeBeamSearch(acousticProbs: badFrames, slice: .base)
+        let beamRes = langDecoder.decodeBeamSearch(acousticProbs: badFrames)
         XCTAssertFalse(beamRes.score.isNaN)
         XCTAssertFalse(beamRes.score.isInfinite)
     }
@@ -484,7 +484,7 @@ final class M3AdversarialChallengerTests: XCTestCase {
     /// 言語デコーダ設定パラメータの極限値 (beamWidth = 1, maxSequenceLength = 0, 1000)
     func testLanguageDecoderExtremeConfigs() {
         let vocab = TextVocabulary(characters: Array("あいうえお"))
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
 
         // 1. maxSequenceLength = 0
         let configZeroLen = LanguageDecoderConfig(beamWidth: 4, maxSequenceLength: 0)

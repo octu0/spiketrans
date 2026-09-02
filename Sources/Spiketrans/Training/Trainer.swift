@@ -20,16 +20,16 @@ public struct TrainingSummary: Sendable {
     }
 }
 
-/// Spiketrans 統合学習フレームワーク (直接漢字テキストEnd-to-End学習 + 量子化 + 文字起こし)
-public final class SpiketransTrainer: @unchecked Sendable {
+/// 第1段 音響 SNN と第2段 言語 SNN を束ねる学習・推論の基盤
+public final class Trainer: @unchecked Sendable {
     public let acousticTrainer: AcousticTrainer
     public let languageTrainer: LanguageTrainer
     public let textVocabulary: TextVocabulary
     public let phonemeVocabulary: PhonemeVocabulary
 
     public init(
-        acousticNetwork: MatryoshkaNetwork,
-        languageNetwork: MatryoshkaNetwork,
+        acousticNetwork: SpikingNetwork,
+        languageNetwork: SpikingNetwork,
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         config: TrainingConfig = TrainingConfig()
@@ -49,20 +49,20 @@ public final class SpiketransTrainer: @unchecked Sendable {
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         config: TrainingConfig = TrainingConfig()
-    ) -> SpiketransTrainer {
-        let acNet = MatryoshkaNetwork(
+    ) -> Trainer {
+        let acNet = SpikingNetwork(
             inputDim: 128,
             maxHiddenDim: 1024,
             outputDim: textVocabulary.size,
             timeSteps: 4
         )
-        let lmNet = MatryoshkaNetwork(
+        let lmNet = SpikingNetwork(
             inputDim: 128,
             maxHiddenDim: 1024,
             outputDim: textVocabulary.size,
             timeSteps: 4
         )
-        return SpiketransTrainer(
+        return Trainer(
             acousticNetwork: acNet,
             languageNetwork: lmNet,
             textVocabulary: textVocabulary,
@@ -94,15 +94,6 @@ public final class SpiketransTrainer: @unchecked Sendable {
         )
     }
 
-    /// 学習済み音響モデルから Base スライスの重みを抽出（超軽量化）
-    public func exportBaseAcousticWeights() -> BaseSNNWeights {
-        return acousticTrainer.network.exportBaseWeights()
-    }
-
-    /// 学習済み言語モデルから Base スライスの重みを抽出（超軽量化）
-    public func exportBaseLanguageWeights() -> BaseSNNWeights {
-        return languageTrainer.network.exportBaseWeights()
-    }
 }
 
 /// 推論実行精度モード
@@ -112,7 +103,7 @@ public enum ExecutionPrecision: String, Sendable, CaseIterable {
     case int16   = "Int16"
 }
 
-extension SpiketransTrainer {
+extension Trainer {
     /// 音響特徴量から母音・子音を推定し、ひらがな（聞こえた音）にフォールバック
     public func decodeFallbackKana(from featuresSeq: [[Float]]) -> String {
         if featuresSeq.isEmpty {
@@ -174,7 +165,6 @@ extension SpiketransTrainer {
     /// PCM 音声から直接漢字・かなテキストを文字起こし (本線: TextVocabulary + Language SNN 自己回帰 + 未知語フォールバック)
     public func transcribe(
         pcmData: [Float],
-        slice: MatryoshkaSlice = .base,
         precision: ExecutionPrecision = .float32,
         unkThreshold: Float = 0.25
     ) -> String {
@@ -205,8 +195,7 @@ extension SpiketransTrainer {
             network: acousticTrainer.network,
             quantizedEngine: qEngine,
             vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary,
-            slice: slice
+            fallbackVocabulary: phonemeVocabulary
         )
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
@@ -237,7 +226,6 @@ extension SpiketransTrainer {
 
         let greedyRes = lmDecoder.decodeGreedy(
             acousticProbs: acousticProbs,
-            slice: slice,
             unkThreshold: unkThreshold
         )
 
@@ -247,7 +235,6 @@ extension SpiketransTrainer {
     /// 音響 SNN のみによる直接文字起こし (低信頼度pad化, 短padマージ, CTC collapse, 最小持続フレーム判定)
     public func transcribeAcousticDirect(
         pcmData: [Float],
-        slice: MatryoshkaSlice = .base,
         minDurationFrames: Int = 3,
         minConfidence: Float = 0.45
     ) -> String {
@@ -256,7 +243,6 @@ extension SpiketransTrainer {
         let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
         return transcribeAcousticDirect(
             featuresSeq: featuresSeq,
-            slice: slice,
             minDurationFrames: minDurationFrames,
             minConfidence: minConfidence,
             boundaries: boundaries
@@ -266,7 +252,6 @@ extension SpiketransTrainer {
     /// 特徴量系列から音響 SNN のみによる直接文字起こし
     public func transcribeAcousticDirect(
         featuresSeq: [[Float]],
-        slice: MatryoshkaSlice = .base,
         minDurationFrames: Int = 3,
         minConfidence: Float = 0.45,
         boundaries: [Int]? = nil
@@ -278,8 +263,7 @@ extension SpiketransTrainer {
         let acDecoder = AcousticDecoder(
             network: acousticTrainer.network,
             vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary,
-            slice: slice
+            fallbackVocabulary: phonemeVocabulary
         )
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
@@ -378,7 +362,6 @@ extension SpiketransTrainer {
     /// 学習側と同じ sliceNorm を適用するためスライス間のスケールも一致する。
     public func transcribeAcousticCTC(
         featuresSeq: [[Float]],
-        slice: MatryoshkaSlice = .high,
         beamWidth: Int = 16
     ) -> String {
         if featuresSeq.isEmpty {
@@ -389,8 +372,7 @@ extension SpiketransTrainer {
         let acDecoder = AcousticDecoder(
             network: network,
             vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary,
-            slice: slice
+            fallbackVocabulary: phonemeVocabulary
         )
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
@@ -432,7 +414,6 @@ extension SpiketransTrainer {
         featuresSeq: [[Float]],
         kanjiVocabulary: TextVocabulary,
         dictionary: KanaKanjiDictionary? = nil,
-        slice: MatryoshkaSlice = .high,
         minDurationFrames: Int = 3,
         minConfidence: Float = 0.05,
         boundaries: [Int]? = nil,
@@ -441,11 +422,10 @@ extension SpiketransTrainer {
     ) -> (kana: String, kanji: String) {
         let kanaText: String
         if useCTC {
-            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, slice: slice, beamWidth: 16)
+            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, beamWidth: 16)
         } else {
             kanaText = transcribeAcousticDirect(
                 featuresSeq: featuresSeq,
-                slice: slice,
                 minDurationFrames: minDurationFrames,
                 minConfidence: minConfidence,
                 boundaries: boundaries
@@ -464,7 +444,6 @@ extension SpiketransTrainer {
                 dictionary: dict,
                 languageDecoder: lmDecoder,
                 kanaVocabulary: textVocabulary,
-                languageSlice: slice,
                 languageBonus: languageBonus
             )
             kanjiText = decoder.decode(kanaText: kanaText)
@@ -475,8 +454,7 @@ extension SpiketransTrainer {
             )
             kanjiText = decoder.decodeKanaToKanji(
                 kanaText: kanaText,
-                kanaVocabulary: textVocabulary,
-                slice: slice
+                kanaVocabulary: textVocabulary
             )
         }
 

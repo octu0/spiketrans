@@ -9,14 +9,14 @@ final class MLXBPTTTests: XCTestCase {
     }
 
     func testMLXNetworkForwardAndExportImport() throws {
-        let mlxNet = MLXMatryoshkaNetwork(inputDim: 128, maxHiddenDim: 1024, outputDim: 523)
+        let mlxNet = MLXSpikingNetwork(inputDim: 128, maxHiddenDim: 1024, outputDim: 523)
         let weights = mlxNet.exportWeights()
         
         XCTAssertEqual(weights.inputDim, 128)
         XCTAssertEqual(weights.maxHiddenDim, 1024)
         XCTAssertEqual(weights.outputDim, 523)
         
-        let cpuNet = MatryoshkaNetwork(inputDim: 128, maxHiddenDim: 1024, outputDim: 523)
+        let cpuNet = SpikingNetwork(inputDim: 128, maxHiddenDim: 1024, outputDim: 523)
         cpuNet.importWeights(from: weights)
         
         // 重みデータの比較
@@ -28,7 +28,7 @@ final class MLXBPTTTests: XCTestCase {
     }
     
     func testMLXBPTTTrainerSingleStep() throws {
-        let mlxNet = MLXMatryoshkaNetwork(inputDim: 128, maxHiddenDim: 512, outputDim: 50)
+        let mlxNet = MLXSpikingNetwork(inputDim: 128, maxHiddenDim: 512, outputDim: 50)
         let trainer = MLXBPTTTrainer(network: mlxNet, config: TrainingConfig(learningRate: 0.01))
         
         let seqLen = 20
@@ -51,8 +51,8 @@ final class MLXBPTTTests: XCTestCase {
         }
         
         let res = trainer.trainStep(features: dummyFeat, targets: dummyTargets)
-        XCTAssertGreaterThan(res.totalLoss, 0.0)
-        XCTAssertFalse(res.totalLoss.isNaN)
-        XCTAssertFalse(res.totalLoss.isInfinite)
+        XCTAssertGreaterThan(res, 0.0)
+        XCTAssertFalse(res.isNaN)
+        XCTAssertFalse(res.isInfinite)
     }
 }

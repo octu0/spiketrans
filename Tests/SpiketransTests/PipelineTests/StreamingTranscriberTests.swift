@@ -75,10 +75,10 @@ final class StreamingTranscriberTests: XCTestCase {
         return [Float](repeating: 0.0, count: sampleCount)
     }
 
-    private func createTestNetworks() -> (acoustic: MatryoshkaNetwork, language: MatryoshkaNetwork, vocab: TextVocabulary) {
+    private func createTestNetworks() -> (acoustic: SpikingNetwork, language: SpikingNetwork, vocab: TextVocabulary) {
         let vocab = TextVocabulary()
-        let ac = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lm = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let ac = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lm = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         return (acoustic: ac, language: lm, vocab: vocab)
     }
 
@@ -178,7 +178,6 @@ final class StreamingTranscriberTests: XCTestCase {
         let (acNet, lmNet, vocab) = createTestNetworks()
 
         let config = StreamingTranscriberConfig(
-            slice: .base,
             beamWidth: 1
         )
 
@@ -315,7 +314,6 @@ final class StreamingTranscriberTests: XCTestCase {
         let (acNet, lmNet, vocab) = createTestNetworks()
 
         let config = StreamingTranscriberConfig(
-            slice: .high,
             useQuantization: true
         )
 

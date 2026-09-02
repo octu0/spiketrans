@@ -132,8 +132,8 @@ final class Tier4RealWorldTests: XCTestCase {
     // MARK: - 2. 動的会話音声の VAD 分割と 2 段ストリーミング文字起こし
     func testScenario2ConversationVADSegmentationAndTwoStageSTT() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let collector = ResultCollector<TranscriptionResult>()
@@ -163,38 +163,10 @@ final class Tier4RealWorldTests: XCTestCase {
         }
     }
 
-    // MARK: - 3. Base (64) 超低消費電力・低遅延文字起こし
-    func testScenario3BaseSliceUltraLowPowerLatency() {
-        let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-
-        let configBase = StreamingTranscriberConfig(slice: .base, beamWidth: 1)
-        let transcriberBase = StreamingTranscriber(config: configBase, acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
-
-        let configHigh = StreamingTranscriberConfig(slice: .high, beamWidth: 1)
-        let transcriberHigh = StreamingTranscriber(config: configHigh, acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
-
-        let audio = synthesizeSpeech(sampleRate: 16000, durationSeconds: 0.5)
-
-        let tBaseStart = CFAbsoluteTimeGetCurrent()
-        transcriberBase.appendAudio(pcm: audio)
-        transcriberBase.flush()
-        let tBaseElapsed = CFAbsoluteTimeGetCurrent() - tBaseStart
-
-        let tHighStart = CFAbsoluteTimeGetCurrent()
-        transcriberHigh.appendAudio(pcm: audio)
-        transcriberHigh.flush()
-        let tHighElapsed = CFAbsoluteTimeGetCurrent() - tHighStart
-
-        // Base slice should be faster or comparable
-        XCTAssertLessThanOrEqual(0.0, tBaseElapsed)
-        XCTAssertLessThanOrEqual(0.0, tHighElapsed)
-    }
 
     // MARK: - 4. Int16 固定小数点推論精度
     func testScenario4Int16FixedPointPrecision() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let config16 = QuantizedConfig.int16Config()
         let qWeights16 = QuantizedEngine.quantize(network: net, config: config16)
         let engine16 = QuantizedEngine(weights: qWeights16, timeSteps: 4)
@@ -214,8 +186,8 @@ final class Tier4RealWorldTests: XCTestCase {
             d += 1
         }
 
-        net.forwardSlice(features: feat, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
-        engine16.predictSlice(features: feat, slice: .base, workspace: workspace16, outputProbs: &quantProbs)
+        net.forward(features: feat, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+        engine16.predict(features: feat, workspace: workspace16, outputProbs: &quantProbs)
 
         XCTAssertFalse(quantProbs[0].isNaN)
         var sumP: Float = 0.0
@@ -230,9 +202,9 @@ final class Tier4RealWorldTests: XCTestCase {
     // MARK: - 5. 長時間連続ストリーム O(1) メモリ安定性
     func testScenario5TenMinutesContinuousStreamO1Memory() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let config = StreamingTranscriberConfig(slice: .base, beamWidth: 1)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let config = StreamingTranscriberConfig(beamWidth: 1)
         let transcriber = StreamingTranscriber(config: config, acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let chunk = synthesizeSpeech(sampleRate: 16000, durationSeconds: 0.01) // 160 samples (10ms)
@@ -298,7 +270,7 @@ final class Tier4RealWorldTests: XCTestCase {
     // MARK: - 7. 音響確率ゆらぎに対する自己回帰言語モデル文脈補正
     func testScenario7AcousticUncertaintyAutoregressiveLMCorrection() {
         let vocab = TextVocabulary(characters: Array("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"))
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let config = LanguageDecoderConfig(beamWidth: 4, lmWeight: 0.5, wordBonus: 0.2)
         let decoder = LanguageDecoder(lmNetwork: lmNet, vocabulary: vocab, config: config)
 
@@ -313,15 +285,15 @@ final class Tier4RealWorldTests: XCTestCase {
             i += 1
         }
 
-        let res = decoder.decodeBeamSearch(acousticProbs: frames, slice: .base)
+        let res = decoder.decodeBeamSearch(acousticProbs: frames)
         XCTAssertFalse(res.tokens.isEmpty)
     }
 
     // MARK: - 8. 急激な音量スイング & 発話速度変化追従性
     func testScenario8DynamicVolumeAndSpeechRateTracking() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         // Soft speech (-40dB = 0.01 amplitude)

@@ -5,7 +5,7 @@ import MLXOptimizers
 
 /// MLX GPU による SNN BPTT 学習エンジン (フレーム単位安定化 BPTT & ミニバッチ対応)
 public final class MLXBPTTTrainer: @unchecked Sendable {
-    public let network: MLXMatryoshkaNetwork
+    public let network: MLXSpikingNetwork
     public let optimizer: Adam
     public let config: TrainingConfig
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
@@ -14,29 +14,32 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// フレームをまたぐ信用割り当てが完全に消え、第1段は実質フレーム独立の
     /// 分類器になる。大きくすると時間文脈を学習できる一方、計算グラフが深くなる。
     public let bpttWindow: Int
-    /// マトリョーシカ各スライスの損失重み。
+    /// 各スライスの損失重み。
     ///
     /// Base は「速度優先だが文字起こしとして成立する」ことが要件のため、
     /// 用途に応じて High 偏重から均等寄りへ調整できるようにしている。
     public let sliceWeightBase: Float
-    public let sliceWeightMiddle: Float
     public let sliceWeightHigh: Float
+    /// High の事後確率を Base/Middle へ蒸留する重み (0.0 で無効)。
+    /// CTC 単独だと小スライスは自前の (誤った) アライメントで学習してしまうため、
+    /// High が獲得したフレーム単位のアライメントを教師として与える。
+    public let distillWeight: Float
 
     public init(
-        network: MLXMatryoshkaNetwork,
+        network: MLXSpikingNetwork,
         config: TrainingConfig = TrainingConfig(learningRate: 0.015),
         bpttWindow: Int = 16,
         sliceWeightBase: Float = 0.1,
-        sliceWeightMiddle: Float = 0.2,
-        sliceWeightHigh: Float = 1.0
+        sliceWeightHigh: Float = 1.0,
+        distillWeight: Float = 1.0
     ) {
         self.network = network
         self.config = config
         self.optimizer = Adam(learningRate: config.learningRate)
         self.bpttWindow = max(1, bpttWindow)
         self.sliceWeightBase = sliceWeightBase
-        self.sliceWeightMiddle = sliceWeightMiddle
         self.sliceWeightHigh = sliceWeightHigh
+        self.distillWeight = distillWeight
     }
 
     /// 学習率を更新
@@ -44,14 +47,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         self.optimizer.learningRate = lr
     }
 
-    /// バッチ（複数発話）に対するフォワードとマトリョーシカ 3 スライスのロジット系列の計算
-    ///
-    /// 戻り値はいずれも [B, T, outputDim]。損失の種類 (交差エントロピー / CTC) に依存しないため
-    /// フレーム整列教師と CTC の双方から共有する。
-    public func sliceLogits(
-        network: MLXMatryoshkaNetwork,
+    /// バッチ（複数発話）に対するフォワードとロジット系列 [B, T, outputDim] の計算
+    public func logitsBatch(
+        network: MLXSpikingNetwork,
         features: MLXArray           // [B, T, inputDim]
-    ) -> (base: MLXArray, mid: MLXArray, high: MLXArray) {
+    ) -> MLXArray {
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
@@ -113,52 +113,24 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         // [B, T, hMax]
         let sAvgSeq = stacked(sAvgList, axis: 1)
 
-        // スライス別ロジット計算
-        // 1. Base (128)
-        let sBase = sAvgSeq[0..., 0..., 0..<128]
-        let wOutBase = network.wOut[0..<128, 0...]
-        let scaleBase = sqrt(Float(hMax) / 128.0)
-        let logitsBase = (matmul(sBase, wOutBase) * scaleBase) + network.bOutBase
-
-        // 2. Middle (512)
-        let sMid = sAvgSeq[0..., 0..., 0..<512]
-        let wOutMid = network.wOut[0..<512, 0...]
-        let scaleMid = sqrt(Float(hMax) / 512.0)
-        let logitsMid = (matmul(sMid, wOutMid) * scaleMid) + network.bOutMid
-
-        // 3. High (1024)
-        let logitsHigh = matmul(sAvgSeq, network.wOut) + network.bOut
-
-        return (base: logitsBase, mid: logitsMid, high: logitsHigh)
+        return matmul(sAvgSeq, network.wOut) + network.bOut
     }
 
     /// バッチ（複数発話）に対するフレーム整列教師の交差エントロピー損失
     public func lossBatch(
-        network: MLXMatryoshkaNetwork,
+        network: MLXSpikingNetwork,
         features: MLXArray,          // [B, T, inputDim]
         targets: MLXArray            // [B, T] (Int32, パディングは -1)
-    ) -> (loss: MLXArray, lossBase: MLXArray, lossMid: MLXArray, lossHigh: MLXArray) {
-        let logits = sliceLogits(network: network, features: features)
-        let logitsBase = logits.base
-        let logitsMid = logits.mid
-        let logitsHigh = logits.high
+    ) -> MLXArray {
+        let logits = logitsBatch(network: network, features: features)
 
         // 重み: targets == -1 (パディング) は 0.0, targets == 0 (padId) は 0.3, targets > 0 は 1.0
         let weights = which(targets .== -1, MLXArray(0.0), which(targets .== 0, MLXArray(0.3), MLXArray(1.0)))
         let totalWeight = sum(weights) + 1e-6
         let cleanTargets = clip(targets, min: 0, max: Float(network.outputDim - 1)).asType(.int32)
 
-        func computeSliceLoss(logits: MLXArray) -> MLXArray {
-            let lossArray = crossEntropy(logits: logits, targets: cleanTargets, weights: weights, reduction: .sum)
-            return lossArray / totalWeight
-        }
-
-        let lossB = computeSliceLoss(logits: logitsBase)
-        let lossM = computeSliceLoss(logits: logitsMid)
-        let lossH = computeSliceLoss(logits: logitsHigh)
-        let totalLoss = (lossB * sliceWeightBase) + (lossM * sliceWeightMiddle) + (lossH * sliceWeightHigh)
-
-        return (totalLoss, lossB, lossM, lossH)
+        let lossArray = crossEntropy(logits: logits, targets: cleanTargets, weights: weights, reduction: .sum)
+        return lossArray / totalWeight
     }
 
     /// ミニバッチ学習ステップ
@@ -197,8 +169,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let targetArray = MLXArray(flatTgt, [bSize, maxT])
 
         let lg = valueAndGrad(model: network) { model, fArr, tArr -> MLXArray in
-            let res = self.lossBatch(network: model, features: fArr, targets: tArr)
-            return res.loss
+            return self.lossBatch(network: model, features: fArr, targets: tArr)
         }
 
         let (lossVal, grads) = lg(network, featArray, targetArray)
@@ -213,10 +184,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     public func trainStep(
         features: [[Float]],
         targets: [Int]
-    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
-        let lossVal = trainBatch(featuresBatch: [features], targetsBatch: [targets])
-        let subL = lossVal / 3.0
-        return (lossVal, subL, subL, subL)
+    ) -> Float {
+        return trainBatch(featuresBatch: [features], targetsBatch: [targets])
     }
 
     /// ロジット系列 (フラット [B, T, V]) の 1 サンプル分を対数確率に変換
@@ -277,10 +246,10 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         featuresBatch: [[[Float]]],
         targetsBatch: [[Int]],
         blankId: Int = 0
-    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
+    ) -> Float {
         let bSize = featuresBatch.count
         if bSize == 0 {
-            return (0.0, 0.0, 0.0, 0.0)
+            return 0.0
         }
 
         var maxT = 0
@@ -295,7 +264,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             b += 1
         }
         if maxT == 0 {
-            return (0.0, 0.0, 0.0, 0.0)
+            return 0.0
         }
 
         let inDim = network.inputDim
@@ -322,66 +291,46 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let featArray = MLXArray(flatFeat, [bSize, maxT, inDim])
 
         // 1. 勾配を取らないフォワードでロジットを求め、CPU 側で CTC の損失と勾配を計算する
-        let probe = sliceLogits(network: network, features: featArray)
-        eval(probe.base, probe.mid, probe.high)
+        let probe = logitsBatch(network: network, features: featArray)
+        eval(probe)
+        let flatLogits = probe.asArray(Float.self)
 
-        let flatBase = probe.base.asArray(Float.self)
-        let flatMid = probe.mid.asArray(Float.self)
-        let flatHigh = probe.high.asArray(Float.self)
-
-        // CTC の前向き後ろ向きは CPU 律速のため、(サンプル × スライス) 単位で並列化する。
-        // 各タスクは gradFlat の互いに素な区間だけを書くのでロックは不要。
-        let sliceCount = 3
+        // CTC の前向き後ろ向きは CPU 律速のためサンプル単位で並列化する。
+        // 各タスクは勾配プレーンの互いに素な区間だけを書くのでロックは不要。
         let planeSize = bSize * maxT * vocabSize
 
-        // 勾配プレーンは生ポインタで確保する。Swift の Array を複数スレッドから
-        // withUnsafeMutableBufferPointer すると同一要素への排他アクセス違反で abort するため。
         final class CTCBuffer: @unchecked Sendable {
-            let planes: [UnsafeMutablePointer<Float>]
+            let plane: UnsafeMutablePointer<Float>
             let planeSize: Int
             var losses: [Float]
             var valid: [Bool]
 
-            init(sliceCount: Int, planeSize: Int, taskCount: Int) {
+            init(planeSize: Int, taskCount: Int) {
                 self.planeSize = planeSize
-                var allocated: [UnsafeMutablePointer<Float>] = []
-                allocated.reserveCapacity(sliceCount)
-                var i = 0
-                while i < sliceCount {
-                    let p = UnsafeMutablePointer<Float>.allocate(capacity: planeSize)
-                    p.initialize(repeating: 0.0, count: planeSize)
-                    allocated.append(p)
-                    i += 1
-                }
-                self.planes = allocated
+                let p = UnsafeMutablePointer<Float>.allocate(capacity: planeSize)
+                p.initialize(repeating: 0.0, count: planeSize)
+                self.plane = p
                 self.losses = [Float](repeating: 0.0, count: taskCount)
                 self.valid = [Bool](repeating: false, count: taskCount)
             }
 
-            /// プレーンの内容を Array として取り出す
-            func planeArray(_ index: Int) -> [Float] {
-                return Array(UnsafeBufferPointer(start: planes[index], count: planeSize))
+            func planeArray() -> [Float] {
+                return Array(UnsafeBufferPointer(start: plane, count: planeSize))
             }
 
             deinit {
-                for p in planes {
-                    p.deinitialize(count: planeSize)
-                    p.deallocate()
-                }
+                plane.deinitialize(count: planeSize)
+                plane.deallocate()
             }
         }
 
-        let taskCount = bSize * sliceCount
-        let buffer = CTCBuffer(sliceCount: sliceCount, planeSize: planeSize, taskCount: taskCount)
-        let logitPlanes = [flatBase, flatMid, flatHigh]
+        let buffer = CTCBuffer(planeSize: planeSize, taskCount: bSize)
         let capturedFrameCounts = frameCounts
         let capturedTargets = targetsBatch
         let capturedMaxT = maxT
         let capturedVocab = vocabSize
 
-        DispatchQueue.concurrentPerform(iterations: taskCount) { taskIdx in
-            let sIdx = taskIdx / bSize
-            let bIdx = taskIdx % bSize
+        DispatchQueue.concurrentPerform(iterations: bSize) { bIdx in
             let frameCount = capturedFrameCounts[bIdx]
             let labels = capturedTargets[bIdx]
             if frameCount <= 0 || labels.isEmpty {
@@ -389,7 +338,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             }
 
             let logProbs = self.logSoftmaxSample(
-                flatLogits: logitPlanes[sIdx],
+                flatLogits: flatLogits,
                 batchIndex: bIdx,
                 frameCount: frameCount,
                 maxT: capturedMaxT,
@@ -398,11 +347,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             let ctcCalc = CTCLossCalculator(blankId: blankId)
             let res = ctcCalc.computeLossAndGradients(logProbs: logProbs, targets: labels)
 
-            buffer.losses[taskIdx] = res.loss
-            buffer.valid[taskIdx] = true
+            buffer.losses[bIdx] = res.loss
+            buffer.valid[bIdx] = true
 
             if res.gradients.count == frameCount {
-                let dst = buffer.planes[sIdx]
+                let dst = buffer.plane
                 var t = 0
                 while t < frameCount {
                     let row = res.gradients[t]
@@ -417,40 +366,29 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             }
         }
 
-        var sliceLossSum = [Float](repeating: 0.0, count: sliceCount)
+        var lossSum: Float = 0.0
         var validCount: Float = 0.0
-        var taskIdx = 0
-        while taskIdx < taskCount {
-            if buffer.valid[taskIdx] {
-                let sIdx = taskIdx / bSize
-                sliceLossSum[sIdx] += buffer.losses[taskIdx]
-                if sIdx == 0 {
-                    validCount += 1.0
-                }
+        var idx = 0
+        while idx < bSize {
+            if buffer.valid[idx] {
+                lossSum += buffer.losses[idx]
+                validCount += 1.0
             }
-            taskIdx += 1
+            idx += 1
         }
 
         if validCount == 0.0 {
-            return (0.0, 0.0, 0.0, 0.0)
+            return 0.0
         }
 
         let invValid = 1.0 / validCount
-        let scaleBase: Float = sliceWeightBase * invValid
-        let scaleMid: Float = sliceWeightMiddle * invValid
-        let scaleHigh: Float = sliceWeightHigh * invValid
-        let gradBase = MLXArray(buffer.planeArray(0), [bSize, maxT, vocabSize]) * scaleBase
-        let gradMid = MLXArray(buffer.planeArray(1), [bSize, maxT, vocabSize]) * scaleMid
-        let gradHigh = MLXArray(buffer.planeArray(2), [bSize, maxT, vocabSize]) * scaleHigh
-        eval(gradBase, gradMid, gradHigh)
+        let gradArray = MLXArray(buffer.planeArray(), [bSize, maxT, vocabSize]) * invValid
+        eval(gradArray)
 
         // 2. サロゲート損失で自動微分し、ネットワーク重みを更新する
-        let lg = valueAndGrad(model: network) { (model: MLXMatryoshkaNetwork, arrays: [MLXArray]) -> [MLXArray] in
-            let logits = self.sliceLogits(network: model, features: arrays[0])
-            let surrogate = sum(logits.base * gradBase)
-                + sum(logits.mid * gradMid)
-                + sum(logits.high * gradHigh)
-            return [surrogate]
+        let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+            let logits = self.logitsBatch(network: model, features: arrays[0])
+            return [sum(logits * gradArray)]
         }
 
         let (_, grads) = lg(network, [featArray])
@@ -458,11 +396,6 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         optimizer.update(model: network, gradients: clippedGrads)
         eval(network)
 
-        let lossBase = sliceLossSum[0] * invValid
-        let lossMid = sliceLossSum[1] * invValid
-        let lossHigh = sliceLossSum[2] * invValid
-        let total = (lossBase * sliceWeightBase) + (lossMid * sliceWeightMiddle) + (lossHigh * sliceWeightHigh)
-
-        return (total, lossBase, lossMid, lossHigh)
+        return lossSum * invValid
     }
 }

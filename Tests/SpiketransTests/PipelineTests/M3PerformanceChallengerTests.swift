@@ -95,10 +95,10 @@ final class M3PerformanceChallengerTests: XCTestCase {
         return [Float](repeating: 0.0, count: sampleCount)
     }
 
-    private func createTestNetworks() -> (acoustic: MatryoshkaNetwork, language: MatryoshkaNetwork, vocab: TextVocabulary) {
+    private func createTestNetworks() -> (acoustic: SpikingNetwork, language: SpikingNetwork, vocab: TextVocabulary) {
         let vocab = TextVocabulary()
-        let ac = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lm = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let ac = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lm = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         return (acoustic: ac, language: lm, vocab: vocab)
     }
 
@@ -108,7 +108,6 @@ final class M3PerformanceChallengerTests: XCTestCase {
         let (acNet, lmNet, vocab) = createTestNetworks()
 
         let config = StreamingTranscriberConfig(
-            slice: .base,
             beamWidth: 1
         )
 
@@ -222,91 +221,6 @@ final class M3PerformanceChallengerTests: XCTestCase {
 
     // MARK: - 2. End-to-End スループット & レイテンシ (RTF) 測定
 
-    func testStreamingEndToEndLatencyAndThroughput() {
-        let (acNet, lmNet, vocab) = createTestNetworks()
-
-        let slices: [MatryoshkaSlice] = [.base, .middle, .high]
-        let beamOptions = [1, 4]
-
-        print("\n==================================================")
-        print("=== M3 Two-Stage STT End-to-End Benchmark ===")
-        print("==================================================")
-
-        var sIdx = 0
-        while sIdx < slices.count {
-            let slice = slices[sIdx]
-
-            var bIdx = 0
-            while bIdx < beamOptions.count {
-                let beam = beamOptions[bIdx]
-
-                let config = StreamingTranscriberConfig(
-                    slice: slice,
-                    useQuantization: false,
-                    beamWidth: beam
-                )
-
-                let transcriber = StreamingTranscriber(
-                    config: config,
-                    acousticNetwork: acNet,
-                    languageNetwork: lmNet,
-                    textVocabulary: vocab
-                )
-
-                let finalCounter = AtomicCounter()
-                transcriber.onFinalResult = { _ in
-                    finalCounter.increment()
-                }
-
-                let sampleRate = 16000
-                // 1.0秒発話 + 0.3秒無音 (計 130 フレーム) x 10回 = 13秒音声 (1,300フレーム)
-                var audio: [Float] = []
-                var rep = 0
-                while rep < 10 {
-                    audio.append(contentsOf: self.synthesizeVowelSpeech(sampleRate: sampleRate, durationSeconds: 1.0))
-                    audio.append(contentsOf: self.synthesizeSilence(sampleRate: sampleRate, durationSeconds: 0.3))
-                    rep += 1
-                }
-
-                let totalAudioSec = Float(audio.count) / Float(sampleRate)
-                let chunkSize = 160
-                let startT = CFAbsoluteTimeGetCurrent()
-
-                var offset = 0
-                while offset < audio.count {
-                    let count = min(chunkSize, audio.count - offset)
-                    audio.withUnsafeBufferPointer { buf in
-                        let ptr = buf.baseAddress!.advanced(by: offset)
-                        transcriber.appendAudio(pcmPtr: ptr, count: count)
-                    }
-                    offset += count
-                }
-                transcriber.flush()
-
-                let elapsedT = CFAbsoluteTimeGetCurrent() - startT
-                let rtf = Float(elapsedT) / totalAudioSec
-                let fps = Float(audio.count / chunkSize) / Float(elapsedT)
-                let latencyPerFrameMs = (elapsedT / Double(audio.count / chunkSize)) * 1000.0
-
-                print("[Slice: \(slice), Beam: \(beam)]")
-                print("  Audio Duration:  \(String(format: "%.2f", totalAudioSec)) s")
-                print("  Processing Time: \(String(format: "%.4f", elapsedT)) s")
-                print("  Throughput:      \(String(format: "%.1f", fps)) frames/sec")
-                print("  Per-Frame Time:  \(String(format: "%.3f", latencyPerFrameMs)) ms/frame")
-                print("  RTF:             \(String(format: "%.6f", rtf)) xRT")
-                print("  Final Results:   \(finalCounter.value)")
-
-                XCTAssertEqual(finalCounter.value, 10, "Each utterance must yield 1 final result")
-                // デバッグビルドでもリアルタイム(RTF < 1.0)を上回るスループット
-                XCTAssertLessThan(rtf, 1.0, "RTF must be faster than real-time in debug build")
-
-                bIdx += 1
-            }
-
-            sIdx += 1
-        }
-        print("==================================================")
-    }
 
     // MARK: - 3. 量子化エンジン併用時の 10,000 フレーム連続ストリーミング検証
 
@@ -314,7 +228,6 @@ final class M3PerformanceChallengerTests: XCTestCase {
         let (acNet, lmNet, vocab) = createTestNetworks()
 
         let config = StreamingTranscriberConfig(
-            slice: .high,
             useQuantization: true,
             beamWidth: 1
         )

@@ -51,30 +51,14 @@ public final class ForwardCache: @unchecked Sendable {
 public struct NetworkGradients: @unchecked Sendable {
     public var gradWIn: [Float]
     public var gradWRec: [Float]
-    public var gradWOut: [Float]
-    public var gradBOut: [Float]        // High スライス用
-    public var gradBOutBase: [Float]
-    public var gradBOutMiddle: [Float]
+    public var gradWOut: [Float]        // 全スライス共有
+    public var gradBOut: [Float]
 
     public init(inputDim: Int, maxHiddenDim: Int, outputDim: Int) {
         self.gradWIn = [Float](repeating: 0.0, count: maxHiddenDim * inputDim)
         self.gradWRec = [Float](repeating: 0.0, count: maxHiddenDim * maxHiddenDim)
         self.gradWOut = [Float](repeating: 0.0, count: outputDim * maxHiddenDim)
         self.gradBOut = [Float](repeating: 0.0, count: outputDim)
-        self.gradBOutBase = [Float](repeating: 0.0, count: outputDim)
-        self.gradBOutMiddle = [Float](repeating: 0.0, count: outputDim)
-    }
-
-    /// スライスに対応するバイアス勾配へのアクセス
-    public mutating func addBiasGradient(slice: MatryoshkaSlice, index: Int, value: Float) {
-        switch slice {
-        case .base:
-            gradBOutBase[index] += value
-        case .middle:
-            gradBOutMiddle[index] += value
-        case .high:
-            gradBOut[index] += value
-        }
     }
 
     public mutating func zeroGrad() {
@@ -86,10 +70,8 @@ public struct NetworkGradients: @unchecked Sendable {
         while i < gradWOut.count { gradWOut[i] = 0.0; i += 1 }
         i = 0
         while i < gradBOut.count { gradBOut[i] = 0.0; i += 1 }
-        i = 0
-        while i < gradBOutBase.count { gradBOutBase[i] = 0.0; i += 1 }
-        i = 0
-        while i < gradBOutMiddle.count { gradBOutMiddle[i] = 0.0; i += 1 }
+
+
     }
 
     public mutating func accumulate(from other: NetworkGradients) {
@@ -101,19 +83,17 @@ public struct NetworkGradients: @unchecked Sendable {
         while i < gradWOut.count { gradWOut[i] += other.gradWOut[i]; i += 1 }
         i = 0
         while i < gradBOut.count { gradBOut[i] += other.gradBOut[i]; i += 1 }
-        i = 0
-        while i < gradBOutBase.count { gradBOutBase[i] += other.gradBOutBase[i]; i += 1 }
-        i = 0
-        while i < gradBOutMiddle.count { gradBOutMiddle[i] += other.gradBOutMiddle[i]; i += 1 }
+
+
     }
 }
 
 /// BPTT 学習トレーナー
 public final class BPTTTrainer: @unchecked Sendable {
-    public let network: MatryoshkaNetwork
+    public let network: SpikingNetwork
     public let optimizer: AdamOptimizer
 
-    public init(network: MatryoshkaNetwork, optimizer: AdamOptimizer) {
+    public init(network: SpikingNetwork, optimizer: AdamOptimizer) {
         self.network = network
         self.optimizer = optimizer
     }
@@ -130,11 +110,10 @@ public final class BPTTTrainer: @unchecked Sendable {
     /// 単一スライスのシーケンス順伝播と損失計算
     public func forwardSequence(
         featuresSeq: [[Float]],
-        targets: [Int],
-        slice: MatryoshkaSlice
+        targets: [Int]
     ) -> (cache: ForwardCache, loss: Float) {
         let seqLen = featuresSeq.count
-        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let hSize = network.maxHiddenDim
         let tSteps = network.timeSteps
         let outDim = network.outputDim
 
@@ -143,7 +122,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             return (cache, 0.0)
         }
 
-        let sliceBiasData = network.outputBias(for: slice).data
+        let sliceBiasData = network.pBOut.data
 
         var vPrev = [Float](repeating: 0.0, count: hSize)
         var sPrev = [Float](repeating: 0.0, count: hSize)
@@ -184,7 +163,7 @@ public final class BPTTTrainer: @unchecked Sendable {
 
                     // LIF 膜電位更新
                     let vDecayed = network.lifConfig.beta * vPrev[i] * (1.0 - sPrev[i])
-                    let vUpdated = vDecayed + current
+                    let vUpdated = LIFNeuronEngine.clampMembrane(vDecayed + current)
                     vNew[i] = vUpdated
 
                     // ALIF 適応閾値の更新 (gamma = 0.0 のとき固定閾値 LIF と等価)
@@ -222,8 +201,7 @@ public final class BPTTTrainer: @unchecked Sendable {
                 i += 1
             }
 
-            // 出力ロジット: sliceNorm * WOut * sAvg + BOut
-            let sliceNorm = sqrt(Float(network.maxHiddenDim) / Float(hSize))
+            // 出力ロジット: WOut * sAvg + BOut
             var maxLogit: Float = -Float.greatestFiniteMagnitude
             var c = 0
             while c < outDim {
@@ -234,7 +212,7 @@ public final class BPTTTrainer: @unchecked Sendable {
                     sumW += network.pWOut.data[wOutOffset + j] * cache.spikeAvg[k][j]
                     j += 1
                 }
-                let logit = sliceBiasData[c] + (sumW * sliceNorm)
+                let logit = sliceBiasData[c] + sumW
                 cache.logits[k][c] = logit
                 if maxLogit < logit {
                     maxLogit = logit
@@ -293,7 +271,6 @@ public final class BPTTTrainer: @unchecked Sendable {
         featuresSeq: [[Float]],
         targets: [Int],
         cache: ForwardCache,
-        slice: MatryoshkaSlice,
         lossWeight: Float = 1.0
     ) {
         var grads = makeGradients()
@@ -301,7 +278,6 @@ public final class BPTTTrainer: @unchecked Sendable {
             featuresSeq: featuresSeq,
             targets: targets,
             cache: cache,
-            slice: slice,
             lossWeight: lossWeight,
             grads: &grads
         )
@@ -323,8 +299,6 @@ public final class BPTTTrainer: @unchecked Sendable {
         i = 0
         while i < network.pBOut.grad.count {
             network.pBOut.grad[i] += grads.gradBOut[i]
-            network.pBOutBase.grad[i] += grads.gradBOutBase[i]
-            network.pBOutMiddle.grad[i] += grads.gradBOutMiddle[i]
             i += 1
         }
     }
@@ -334,12 +308,11 @@ public final class BPTTTrainer: @unchecked Sendable {
         featuresSeq: [[Float]],
         targets: [Int],
         cache: ForwardCache,
-        slice: MatryoshkaSlice,
         lossWeight: Float = 1.0,
         grads: inout NetworkGradients
     ) {
         let seqLen = cache.seqLen
-        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let hSize = network.maxHiddenDim
         let tSteps = cache.timeSteps
         let outDim = cache.outputDim
 
@@ -365,6 +338,7 @@ public final class BPTTTrainer: @unchecked Sendable {
         }
 
         let lossScale = (1.0 / numTargets) * lossWeight
+
         var dVNextStep = [Float](repeating: 0.0, count: hSize)
         var dSNextStep = [Float](repeating: 0.0, count: hSize)
         let invT = 1.0 / Float(tSteps)
@@ -399,17 +373,17 @@ public final class BPTTTrainer: @unchecked Sendable {
                 }
             }
 
-            let sliceNorm = sqrt(Float(network.maxHiddenDim) / Float(hSize))
+
             var dSpikeAvg = [Float](repeating: 0.0, count: hSize)
             var c = 0
             while c < outDim {
                 let dL = dLogits[c]
-                grads.addBiasGradient(slice: slice, index: c, value: dL)
+                grads.gradBOut[c] += dL
                 let wOffset = c * network.maxHiddenDim
                 var i = 0
                 while i < hSize {
-                    grads.gradWOut[wOffset + i] += dL * spikeAvg[i] * sliceNorm
-                    dSpikeAvg[i] += network.pWOut.data[wOffset + i] * dL * sliceNorm
+                    grads.gradWOut[wOffset + i] += dL * spikeAvg[i]
+                    dSpikeAvg[i] += network.pWOut.data[wOffset + i] * dL
                     i += 1
                 }
                 c += 1
@@ -507,42 +481,16 @@ public final class BPTTTrainer: @unchecked Sendable {
         featuresSeq: [[Float]],
         targets: [Int],
         grads: inout NetworkGradients
-    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
-        var lossBase: Float = 0.0
-        var lossMiddle: Float = 0.0
-        var lossHigh: Float = 0.0
-        var totalLoss: Float = 0.0
-
-        var activeSlices: [MatryoshkaSlice] = []
-        for slice in MatryoshkaSlice.allCases {
-            if slice == .base || slice.rawValue <= network.maxHiddenDim {
-                activeSlices.append(slice)
-            }
-        }
-
-        for slice in activeSlices {
-            let cache = forwardSequence(featuresSeq: featuresSeq, targets: targets, slice: slice)
-            switch slice {
-            case .base:
-                lossBase = cache.loss
-            case .middle:
-                lossMiddle = cache.loss
-            case .high:
-                lossHigh = cache.loss
-            }
-            totalLoss += cache.loss
-            let lossWeight: Float = 1.0
-            backwardSequence(
-                featuresSeq: featuresSeq,
-                targets: targets,
-                cache: cache.cache,
-                slice: slice,
-                lossWeight: lossWeight,
-                grads: &grads
-            )
-        }
-
-        return (totalLoss, lossBase, lossMiddle, lossHigh)
+    ) -> Float {
+        let cache = forwardSequence(featuresSeq: featuresSeq, targets: targets)
+        backwardSequence(
+            featuresSeq: featuresSeq,
+            targets: targets,
+            cache: cache.cache,
+            lossWeight: 1.0,
+            grads: &grads
+        )
+        return cache.loss
     }
 
     /// 合算された勾配をメインネットワークに適用して最適化ステップを実行
@@ -569,19 +517,17 @@ public final class BPTTTrainer: @unchecked Sendable {
         while i < network.pBOut.grad.count {
             // 出力層バイアスの特定文字張り付きを抑え、重み主導の分類を促進
             network.pBOut.grad[i] = grads.gradBOut[i] * scale * 0.05
-            network.pBOutBase.grad[i] = grads.gradBOutBase[i] * scale * 0.05
-            network.pBOutMiddle.grad[i] = grads.gradBOutMiddle[i] * scale * 0.05
             i += 1
         }
 
         optimizer.step()
     }
 
-    /// Matryoshka 多重スライス同時学習ステップ (単一サンプル直列用)
+    /// 単一サンプルの学習ステップ (直列用)
     public func trainStep(
         featuresSeq: [[Float]],
         targets: [Int]
-    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
+    ) -> Float {
         var grads = makeGradients()
         let result = computeSampleGradients(featuresSeq: featuresSeq, targets: targets, grads: &grads)
         applyGradientsAndStep(grads: grads, sampleCount: 1)
@@ -590,11 +536,10 @@ public final class BPTTTrainer: @unchecked Sendable {
 
     /// 単一スライスのシーケンス順伝播と対数確率系列の生成
     public func forwardSequenceLogProbs(
-        featuresSeq: [[Float]],
-        slice: MatryoshkaSlice
+        featuresSeq: [[Float]]
     ) -> (cache: ForwardCache, logProbs: [[Float]]) {
         let seqLen = featuresSeq.count
-        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let hSize = network.maxHiddenDim
         let tSteps = network.timeSteps
         let outDim = network.outputDim
 
@@ -604,7 +549,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             return (cache, logProbs)
         }
 
-        let sliceBiasData = network.outputBias(for: slice).data
+        let sliceBiasData = network.pBOut.data
 
         var vPrev = [Float](repeating: 0.0, count: hSize)
         var sPrev = [Float](repeating: 0.0, count: hSize)
@@ -639,7 +584,7 @@ public final class BPTTTrainer: @unchecked Sendable {
                     }
 
                     let vDecayed = network.lifConfig.beta * vPrev[i] * (1.0 - sPrev[i])
-                    let vUpdated = vDecayed + current
+                    let vUpdated = LIFNeuronEngine.clampMembrane(vDecayed + current)
                     vNew[i] = vUpdated
 
                     // ALIF 適応閾値の更新 (gamma = 0.0 のとき固定閾値 LIF と等価)
@@ -721,18 +666,18 @@ public final class BPTTTrainer: @unchecked Sendable {
         featuresSeq: [[Float]],
         dLogits: [[Float]],
         cache: ForwardCache,
-        slice: MatryoshkaSlice,
         lossWeight: Float = 1.0,
         grads: inout NetworkGradients
     ) {
         let seqLen = cache.seqLen
-        let hSize = min(slice.rawValue, network.maxHiddenDim)
+        let hSize = network.maxHiddenDim
         let tSteps = cache.timeSteps
         let outDim = cache.outputDim
 
         if seqLen <= 0 {
             return
         }
+
 
         var dVNextStep = [Float](repeating: 0.0, count: hSize)
         var dSNextStep = [Float](repeating: 0.0, count: hSize)
@@ -748,7 +693,7 @@ public final class BPTTTrainer: @unchecked Sendable {
             var c = 0
             while c < outDim {
                 let dL = dLogits[k][c] * lossWeight
-                grads.addBiasGradient(slice: slice, index: c, value: dL)
+                grads.gradBOut[c] += dL
 
                 let wOutOffset = c * network.maxHiddenDim
                 var h = 0
@@ -822,52 +767,24 @@ public final class BPTTTrainer: @unchecked Sendable {
         }
     }
 
-    /// CTC 損失による Matryoshka 多重スライス勾配計算
+    /// CTC 損失による 多重スライス勾配計算
     public func computeSampleCTCGradients(
         featuresSeq: [[Float]],
         targets: [Int],
         grads: inout NetworkGradients,
         ctcLossCalc: CTCLossCalculator = CTCLossCalculator(blankId: 0)
-    ) -> (totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float) {
-        var totalLoss: Float = 0.0
-        var lossBase: Float = 0.0
-        var lossMiddle: Float = 0.0
-        var lossHigh: Float = 0.0
+    ) -> Float {
+        let fwd = forwardSequenceLogProbs(featuresSeq: featuresSeq)
+        let ctcResult = ctcLossCalc.computeLossAndGradients(logProbs: fwd.logProbs, targets: targets)
 
-        for slice in MatryoshkaSlice.allCases {
-            let lossWeight: Float
-            switch slice {
-            case .base:
-                lossWeight = 0.2
-            case .middle:
-                lossWeight = 0.3
-            case .high:
-                lossWeight = 0.5
-            }
+        backwardCTCSequence(
+            featuresSeq: featuresSeq,
+            dLogits: ctcResult.gradients,
+            cache: fwd.cache,
+            lossWeight: 1.0,
+            grads: &grads
+        )
 
-            let fwd = forwardSequenceLogProbs(featuresSeq: featuresSeq, slice: slice)
-            let ctcResult = ctcLossCalc.computeLossAndGradients(logProbs: fwd.logProbs, targets: targets)
-
-            switch slice {
-            case .base:
-                lossBase = ctcResult.loss
-            case .middle:
-                lossMiddle = ctcResult.loss
-            case .high:
-                lossHigh = ctcResult.loss
-            }
-            totalLoss += ctcResult.loss * lossWeight
-
-            backwardCTCSequence(
-                featuresSeq: featuresSeq,
-                dLogits: ctcResult.gradients,
-                cache: fwd.cache,
-                slice: slice,
-                lossWeight: lossWeight,
-                grads: &grads
-            )
-        }
-
-        return (totalLoss, lossBase, lossMiddle, lossHigh)
+        return ctcResult.loss
     }
 }

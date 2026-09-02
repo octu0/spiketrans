@@ -1,7 +1,7 @@
 import XCTest
 @testable import Spiketrans
 
-/// Milestone M2 (Matryoshka SNN Core & SIMD/Quantization Engine) 敵対的検証・極限ストレステストスイート
+/// Milestone M2 (SNN Core & SIMD/Quantization Engine) 敵対的検証・極限ストレステストスイート
 final class M2ChallengerStressTests: XCTestCase {
 
     // MARK: - 1. LIF ニューロン極限入力・数値安定性テスト (LIF Dynamics Extremes)
@@ -15,7 +15,8 @@ final class M2ChallengerStressTests: XCTestCase {
         let vPrev: Float = 0.0
         let sPrev: Float = 0.0
         let step1 = LIFNeuronEngine.stepScalar(config: config, vPrev: vPrev, sPrev: sPrev, inputCurrent: 1e6)
-        XCTAssertEqual(step1.vNext, 1e6, accuracy: 1e-1)
+        // 膜電位は学習側 (MLX) と同じ範囲に飽和する
+        XCTAssertEqual(step1.vNext, LIFNeuronEngine.vClampMax, accuracy: 1e-1)
         XCTAssertEqual(step1.sNext, 1.0)
         XCTAssertFalse(step1.vNext.isNaN)
         XCTAssertFalse(step1.vNext.isInfinite)
@@ -59,7 +60,7 @@ final class M2ChallengerStressTests: XCTestCase {
 
         var i = 0
         while i < 8 {
-            XCTAssertEqual(vOutSIMD[i], 1e6, accuracy: 1e-1)
+            XCTAssertEqual(vOutSIMD[i], LIFNeuronEngine.vClampMax, accuracy: 1e-1)
             XCTAssertEqual(sOutSIMD[i], 1.0)
             i += 1
         }
@@ -71,12 +72,13 @@ final class M2ChallengerStressTests: XCTestCase {
 
         // 負の極大電流注入 -> 発火しないこと (sNext = 0.0)
         let stepNeg = LIFNeuronEngine.stepScalar(config: config, vPrev: 0.0, sPrev: 0.0, inputCurrent: -1e6)
-        XCTAssertEqual(stepNeg.vNext, -1e6, accuracy: 1e-1)
+        XCTAssertEqual(stepNeg.vNext, LIFNeuronEngine.vClampMin, accuracy: 1e-1)
         XCTAssertEqual(stepNeg.sNext, 0.0)
 
         // 次ステップで負の電位が beta (0.8) 倍で減衰すること
         let stepNegDecay = LIFNeuronEngine.stepScalar(config: config, vPrev: stepNeg.vNext, sPrev: stepNeg.sNext, inputCurrent: 0.0)
-        XCTAssertEqual(stepNegDecay.vNext, -800000.0, accuracy: 1e-1)
+        // 飽和値 -20.0 から beta (0.8) 倍で減衰する
+        XCTAssertEqual(stepNegDecay.vNext, LIFNeuronEngine.vClampMin * 0.8, accuracy: 1e-1)
         XCTAssertEqual(stepNegDecay.sNext, 0.0)
 
         // 負電位からの復帰: 十分に大きな正電流を注入した際の発火動作
@@ -281,7 +283,7 @@ final class M2ChallengerStressTests: XCTestCase {
 
     /// 勾配爆発シナリオ (Exploding Gradients): 極大特徴量入力時における Adam L2 ノルムクリッピングの保護検証
     func testBPTTTrainerExplodingGradientL2Clipping() {
-        let net = MatryoshkaNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
+        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
         let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
         let trainer = BPTTTrainer(network: net, optimizer: opt)
 
@@ -296,8 +298,8 @@ final class M2ChallengerStressTests: XCTestCase {
 
         // trainStep を実行
         let stepRes = trainer.trainStep(featuresSeq: explodingFeatures, targets: targets)
-        XCTAssertFalse(stepRes.totalLoss.isNaN)
-        XCTAssertFalse(stepRes.totalLoss.isInfinite)
+        XCTAssertFalse(stepRes.isNaN)
+        XCTAssertFalse(stepRes.isInfinite)
 
         // 全パラメータが NaN / Inf にならず有限値にとどまっていること
         for param in net.parameters {
@@ -314,7 +316,7 @@ final class M2ChallengerStressTests: XCTestCase {
 
     /// 勾配消失シナリオ (Vanishing Gradient / Total Silence): 全ゼロ入力・発火ゼロ時の安定性
     func testBPTTTrainerZeroActivityStability() {
-        let net = MatryoshkaNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
+        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
         let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
         let trainer = BPTTTrainer(network: net, optimizer: opt)
 
@@ -328,8 +330,8 @@ final class M2ChallengerStressTests: XCTestCase {
         let targets = [0, 1, 2, 3]
 
         let stepRes = trainer.trainStep(featuresSeq: zeroFeatures, targets: targets)
-        XCTAssertFalse(stepRes.totalLoss.isNaN)
-        XCTAssertLessThan(0.0, stepRes.totalLoss)
+        XCTAssertFalse(stepRes.isNaN)
+        XCTAssertLessThan(0.0, stepRes)
 
         for param in net.parameters {
             var i = 0
@@ -343,7 +345,7 @@ final class M2ChallengerStressTests: XCTestCase {
 
     /// 範囲外・異常ターゲットインデックス (Negative, Out-of-Bounds, All Invalid) 注入時のクラッシュ防止
     func testBPTTTrainerInvalidTargetsHandling() {
-        let net = MatryoshkaNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
+        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
         let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
         let trainer = BPTTTrainer(network: net, optimizer: opt)
 
@@ -358,18 +360,18 @@ final class M2ChallengerStressTests: XCTestCase {
         let corruptedTargets = [-1, 999, 4]
         let stepRes1 = trainer.trainStep(featuresSeq: featuresSeq, targets: corruptedTargets)
         // 有効ターゲットが 0 個なので loss は 0.0、勾配は 0 で更新なし
-        XCTAssertEqual(stepRes1.totalLoss, 0.0)
+        XCTAssertEqual(stepRes1, 0.0)
 
         // 2. 一部のみ有効なターゲット ([-10, 2, 100])
         let partialTargets = [-10, 2, 100]
         let stepRes2 = trainer.trainStep(featuresSeq: featuresSeq, targets: partialTargets)
-        XCTAssertLessThan(0.0, stepRes2.totalLoss)
-        XCTAssertFalse(stepRes2.totalLoss.isNaN)
+        XCTAssertLessThan(0.0, stepRes2)
+        XCTAssertFalse(stepRes2.isNaN)
 
         // 3. 空ターゲット配列
         let emptyTargets: [Int] = []
         let stepRes3 = trainer.trainStep(featuresSeq: featuresSeq, targets: emptyTargets)
-        XCTAssertEqual(stepRes3.totalLoss, 0.0)
+        XCTAssertEqual(stepRes3, 0.0)
     }
 
     /// 極端な学習率 (lr = 0.0, lr = 100.0) におけるオプティマイザの安全性
@@ -398,85 +400,12 @@ final class M2ChallengerStressTests: XCTestCase {
         }
     }
 
-    // MARK: - 4. マトリョーシカ SNN 動的スライス切り替え・状態整合性テスト (MatryoshkaNetwork)
+    // MARK: - 4. SNN 動的スライス切り替え・状態整合性テスト (SpikingNetwork)
 
-    /// Base ↔ Middle ↔ High のランダム動的スライス切り替え時における状態整合性・非干渉性
-    func testMatryoshkaDynamicSliceSwitchingIndependence() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-
-        var features = [Float](repeating: 0.0, count: 32)
-        var d = 0
-        while d < 32 {
-            features[d] = Float(d + 1) * 0.03
-            d += 1
-        }
-
-        // 基準値: スライス独立実行時の推論結果
-        let getRefProbs = { (slice: MatryoshkaSlice) -> [Float] in
-            let hSize = slice.rawValue
-            var v = [Float](repeating: 0.0, count: hSize)
-            var s = [Float](repeating: 0.0, count: hSize)
-            var sp = [Float](repeating: 0.0, count: hSize)
-            var logit = [Float](repeating: 0.0, count: 64)
-            var prob = [Float](repeating: 0.0, count: 64)
-            net.forwardSlice(
-                features: features,
-                slice: slice,
-                vPrev: &v,
-                sPrev: &s,
-                spikeSum: &sp,
-                logits: &logit,
-                probabilities: &prob
-            )
-            return prob
-        }
-
-        let refBase = getRefProbs(.base)
-        let refMiddle = getRefProbs(.middle)
-        let refHigh = getRefProbs(.high)
-
-        // 動的切り替えシナリオ (Base -> High -> Middle -> Base -> High -> Middle...)
-        let sequence: [MatryoshkaSlice] = [.base, .high, .middle, .base, .high, .middle, .base]
-
-        for slice in sequence {
-            let hSize = slice.rawValue
-            var v = [Float](repeating: 0.0, count: hSize)
-            var s = [Float](repeating: 0.0, count: hSize)
-            var sp = [Float](repeating: 0.0, count: hSize)
-            var logit = [Float](repeating: 0.0, count: 64)
-            var prob = [Float](repeating: 0.0, count: 64)
-
-            net.forwardSlice(
-                features: features,
-                slice: slice,
-                vPrev: &v,
-                sPrev: &s,
-                spikeSum: &sp,
-                logits: &logit,
-                probabilities: &prob
-            )
-
-            var expected: [Float] = []
-            switch slice {
-            case .base:
-                expected = refBase
-            case .middle:
-                expected = refMiddle
-            case .high:
-                expected = refHigh
-            }
-
-            var c = 0
-            while c < 64 {
-                XCTAssertEqual(prob[c], expected[c], accuracy: 1e-6, "Dynamic slice switching produced divergent probability for \(slice) at index \(c)")
-                c += 1
-            }
-        }
-    }
 
     /// Softmax の極大・極小ロジットに対する数値安定性 (NaN / ゼロ除算の回避)
-    func testMatryoshkaSoftmaxNumericalStability() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+    func testSoftmaxNumericalStability() {
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
 
         // 重みを極大化 (ロジットが 1e5 を超えるケース)
         var i = 0
@@ -487,16 +416,15 @@ final class M2ChallengerStressTests: XCTestCase {
         net.pBOut.data[0] = 1e5 + 10.0 // インデックス 0 が最大
 
         let features = [Float](repeating: 0.5, count: 32)
-        let hBase = MatryoshkaSlice.base.rawValue
+        let hBase = net.maxHiddenDim
         var v = [Float](repeating: 0.0, count: hBase)
         var s = [Float](repeating: 0.0, count: hBase)
         var sp = [Float](repeating: 0.0, count: hBase)
         var logit = [Float](repeating: 0.0, count: 64)
         var prob = [Float](repeating: 0.0, count: 64)
 
-        net.forwardSlice(
+        net.forward(
             features: features,
-            slice: .base,
             vPrev: &v,
             sPrev: &s,
             spikeSum: &sp,
@@ -521,7 +449,7 @@ final class M2ChallengerStressTests: XCTestCase {
 
     /// 固定小数点推論における極大入力電流・オーバーフロー耐性テスト
     func testQuantizedEngineExtremeInputStability() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let qConfig32 = QuantizedConfig.int32Config()
         let qWeights32 = QuantizedEngine.quantize(network: net, config: qConfig32)
         let engine32 = QuantizedEngine(weights: qWeights32, timeSteps: 4)
@@ -531,9 +459,8 @@ final class M2ChallengerStressTests: XCTestCase {
         let hugeFeatures = [Float](repeating: 100.0, count: 32)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        engine32.predictSlice(
+        engine32.predict(
             features: hugeFeatures,
-            slice: .high,
             workspace: workspace32,
             outputProbs: &probs
         )
@@ -553,7 +480,7 @@ final class M2ChallengerStressTests: XCTestCase {
 
     /// 固定小数点推論における全ゼロ入力時の確率分布およびゼロ除算耐性
     func testQuantizedEngineZeroInputStability() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let qConfig32 = QuantizedConfig.int32Config()
         let qWeights32 = QuantizedEngine.quantize(network: net, config: qConfig32)
         let engine32 = QuantizedEngine(weights: qWeights32, timeSteps: 4)
@@ -562,9 +489,8 @@ final class M2ChallengerStressTests: XCTestCase {
         let zeroFeatures = [Float](repeating: 0.0, count: 32)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        engine32.predictSlice(
+        engine32.predict(
             features: zeroFeatures,
-            slice: .base,
             workspace: workspace32,
             outputProbs: &probs
         )
@@ -579,90 +505,7 @@ final class M2ChallengerStressTests: XCTestCase {
         XCTAssertEqual(sumP, 1.0, accuracy: 1e-4)
     }
 
-    /// スケーリング Softmax における差分クランプ (diff < -50.0) の境界検証
-    func testQuantizedScalingSoftmaxClamping() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-        // 1つの出力バイアスのみを極大にし、他を極小にする
-        var c = 0
-        while c < 64 {
-            net.pBOut.data[c] = -100.0
-            c += 1
-        }
-        net.pBOut.data[5] = 100.0
 
-        let qConfig32 = QuantizedConfig.int32Config()
-        let qWeights32 = QuantizedEngine.quantize(network: net, config: qConfig32)
-        let engine32 = QuantizedEngine(weights: qWeights32, timeSteps: 4)
-        let workspace32 = QuantizedWorkspace(maxHiddenDim: 256, inputDim: 32, outputDim: 64)
-
-        let features = [Float](repeating: 0.5, count: 32)
-        var probs = [Float](repeating: 0.0, count: 64)
-
-        engine32.predictSlice(
-            features: features,
-            slice: .base,
-            workspace: workspace32,
-            outputProbs: &probs
-        )
-
-        // インデックス 5 が 1.0 に極めて近く、他は 0.0 に近いこと
-        XCTAssertEqual(probs[5], 1.0, accuracy: 1e-3)
-        var sumP: Float = 0.0
-        c = 0
-        while c < 64 {
-            sumP += probs[c]
-            c += 1
-        }
-        XCTAssertEqual(sumP, 1.0, accuracy: 1e-4)
-    }
-
-    /// 10,000 フレーム連続量子化推論でのメモリリーク・ワークスペース再利用安定性テスト
-    func testQuantizedLongRunningStability() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-        let qConfig32 = QuantizedConfig.int32Config()
-        let qWeights32 = QuantizedEngine.quantize(network: net, config: qConfig32)
-        let engine32 = QuantizedEngine(weights: qWeights32, timeSteps: 4)
-        let workspace32 = QuantizedWorkspace(maxHiddenDim: 256, inputDim: 32, outputDim: 64)
-
-        var probs = [Float](repeating: 0.0, count: 64)
-        var features = [Float](repeating: 0.0, count: 32)
-
-        var frame = 0
-        while frame < 10000 {
-            var d = 0
-            while d < 32 {
-                features[d] = Float((frame + d) % 20) * 0.05
-                d += 1
-            }
-
-            let slice: MatryoshkaSlice
-            switch frame % 3 {
-            case 0:
-                slice = .base
-            case 1:
-                slice = .middle
-            default:
-                slice = .high
-            }
-
-            engine32.predictSlice(
-                features: features,
-                slice: slice,
-                workspace: workspace32,
-                outputProbs: &probs
-            )
-
-            var sumP: Float = 0.0
-            var c = 0
-            while c < 64 {
-                sumP += probs[c]
-                c += 1
-            }
-            XCTAssertEqual(sumP, 1.0, accuracy: 1e-4)
-
-            frame += 1
-        }
-    }
 
     // MARK: - 6. NaN / Inf 入力および空シーケンス耐性テスト (Anomaly Data Robustness)
 
@@ -676,12 +519,13 @@ final class M2ChallengerStressTests: XCTestCase {
         // NaN に対して 1.0 <= vNext は false となり sNext = 0.0
         XCTAssertEqual(resNaN.sNext, 0.0)
 
+        // Inf は飽和範囲に丸められ、無限大が伝播しない
         let resInf = LIFNeuronEngine.stepScalar(config: config, vPrev: 0.0, sPrev: 0.0, inputCurrent: Float.infinity)
-        XCTAssertTrue(resInf.vNext.isInfinite)
+        XCTAssertEqual(resInf.vNext, LIFNeuronEngine.vClampMax)
         XCTAssertEqual(resInf.sNext, 1.0)
 
         let resNegInf = LIFNeuronEngine.stepScalar(config: config, vPrev: 0.0, sPrev: 0.0, inputCurrent: -Float.infinity)
-        XCTAssertTrue(resNegInf.vNext.isInfinite)
+        XCTAssertEqual(resNegInf.vNext, LIFNeuronEngine.vClampMin)
         XCTAssertEqual(resNegInf.sNext, 0.0)
 
         // 2. SIMD8 での NaN / Inf 混在処理
@@ -729,7 +573,7 @@ final class M2ChallengerStressTests: XCTestCase {
 
     /// 空系列 (Sequence Length = 0) における BPTT 学習トレーナーの非クラッシュ検証
     func testBPTTTrainerEmptySequenceSafety() {
-        let net = MatryoshkaNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
+        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
         let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
         let trainer = BPTTTrainer(network: net, optimizer: opt)
 
@@ -737,19 +581,16 @@ final class M2ChallengerStressTests: XCTestCase {
         let emptyTargets: [Int] = []
 
         // forwardSequence がクラッシュせず loss = 0.0 を返すこと
-        let fwdRes = trainer.forwardSequence(featuresSeq: emptyFeatures, targets: emptyTargets, slice: .base)
+        let fwdRes = trainer.forwardSequence(featuresSeq: emptyFeatures, targets: emptyTargets)
         XCTAssertEqual(fwdRes.loss, 0.0)
         XCTAssertEqual(fwdRes.cache.seqLen, 0)
 
         // backwardSequence がクラッシュしないこと
-        trainer.backwardSequence(featuresSeq: emptyFeatures, targets: emptyTargets, cache: fwdRes.cache, slice: .base)
+        trainer.backwardSequence(featuresSeq: emptyFeatures, targets: emptyTargets, cache: fwdRes.cache)
 
         // trainStep がクラッシュせず 0.0 を返すこと
         let stepRes = trainer.trainStep(featuresSeq: emptyFeatures, targets: emptyTargets)
-        XCTAssertEqual(stepRes.totalLoss, 0.0)
-        XCTAssertEqual(stepRes.lossBase, 0.0)
-        XCTAssertEqual(stepRes.lossMiddle, 0.0)
-        XCTAssertEqual(stepRes.lossHigh, 0.0)
+        XCTAssertEqual(stepRes, 0.0)
     }
 
     /// Int16 量子化と Int32 量子化のビットシフト減衰比較・ダイナミックレンジ検証

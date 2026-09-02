@@ -110,9 +110,9 @@ print("\n==================================================")
 print("=== SNN Core Inference Throughput Benchmark ===")
 print("==================================================")
 
-let net = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-for slice in MatryoshkaSlice.allCases {
-    let hSize = slice.rawValue
+let net = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+do {
+    let hSize = net.maxHiddenDim
     var v = [Float](repeating: 0.0, count: hSize)
     var s = [Float](repeating: 0.0, count: hSize)
     var a = [Float](repeating: 0.0, count: hSize)
@@ -121,15 +121,14 @@ for slice in MatryoshkaSlice.allCases {
     var probs = [Float](repeating: 0.0, count: 64)
     let feat = [Float](repeating: 0.5, count: 64)
     // Hot Path ゼロアロケーション計測のため中間バッファは事前確保
-    let scratch = MatryoshkaScratch(maxHiddenDim: hSize)
+    let scratch = ForwardScratch(maxHiddenDim: hSize)
 
     let benchSteps = 10000
     let start = CFAbsoluteTimeGetCurrent()
     var step = 0
     while step < benchSteps {
-        net.forwardSlice(
+        net.forward(
             features: feat,
-            slice: slice,
             vPrev: &v,
             sPrev: &s,
             aPrev: &a,
@@ -143,7 +142,7 @@ for slice in MatryoshkaSlice.allCases {
     let elapsed = CFAbsoluteTimeGetCurrent() - start
     let throughput = Double(benchSteps) / elapsed
     let latency = (elapsed / Double(benchSteps)) * 1_000_000.0
-    print("[Slice: \(slice) (Hidden Dim: \(hSize))]")
+    print("[Hidden Dim: \(hSize)]")
     print("  Float32: Throughput = \(String(format: "%.1f", throughput)) steps/sec, Latency = \(String(format: "%.2f", latency)) µs/step")
 }
 

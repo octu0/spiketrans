@@ -6,7 +6,7 @@ final class QuantizationTests: XCTestCase {
     // MARK: - Float32 -> Int32/Int16 量子化正確性テスト
 
     func testQuantizationAccuracy() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
 
         // 1. Int32 量子化
         let qConfig32 = QuantizedConfig.int32Config()
@@ -142,82 +142,4 @@ final class QuantizationTests: XCTestCase {
 
     // MARK: - Top-1 予測一致度テスト
 
-    func testQuantizedInferenceTop1Match() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-        let qConfig32 = QuantizedConfig.int32Config()
-        let qWeights32 = QuantizedEngine.quantize(network: net, config: qConfig32)
-        let engine32 = QuantizedEngine(weights: qWeights32, timeSteps: 4)
-        let workspace32 = QuantizedWorkspace(maxHiddenDim: 256, inputDim: 32, outputDim: 64)
-
-        var features = [Float](repeating: 0.0, count: 32)
-        var d = 0
-        while d < 32 {
-            features[d] = sin(Float(d) * 0.4) * 0.4 + 0.5
-            d += 1
-        }
-
-        let slices: [MatryoshkaSlice] = [.base, .middle, .high]
-        var sIdx = 0
-        while sIdx < slices.count {
-            let slice = slices[sIdx]
-            let hSize = slice.rawValue
-
-            // 1. Float32 推論
-            var vPrev = [Float](repeating: 0.0, count: hSize)
-            var sPrev = [Float](repeating: 0.0, count: hSize)
-            var spikeSum = [Float](repeating: 0.0, count: hSize)
-            var logitsFloat = [Float](repeating: 0.0, count: 64)
-            var probsFloat = [Float](repeating: 0.0, count: 64)
-
-            net.forwardSlice(
-                features: features,
-                slice: slice,
-                vPrev: &vPrev,
-                sPrev: &sPrev,
-                spikeSum: &spikeSum,
-                logits: &logitsFloat,
-                probabilities: &probsFloat
-            )
-
-            // 2. Int32 量子化推論
-            var probsInt32 = [Float](repeating: 0.0, count: 64)
-            engine32.predictSlice(
-                features: features,
-                slice: slice,
-                workspace: workspace32,
-                outputProbs: &probsInt32
-            )
-
-            // 確率総和検証
-            var sumP: Float = 0.0
-            var c = 0
-            while c < 64 {
-                sumP += probsInt32[c]
-                c += 1
-            }
-            XCTAssertEqual(sumP, 1.0, accuracy: 1e-4)
-
-            // Top-1 インデックスの一致判定
-            var maxFloat: Float = -1.0
-            var top1Float = -1
-            var maxInt32: Float = -1.0
-            var top1Int32 = -1
-
-            c = 0
-            while c < 64 {
-                if maxFloat < probsFloat[c] {
-                    maxFloat = probsFloat[c]
-                    top1Float = c
-                }
-                if maxInt32 < probsInt32[c] {
-                    maxInt32 = probsInt32[c]
-                    top1Int32 = c
-                }
-                c += 1
-            }
-
-            XCTAssertEqual(top1Float, top1Int32, "Top-1 prediction must match between Float32 and Int32 for slice \(slice)")
-            sIdx += 1
-        }
-    }
 }

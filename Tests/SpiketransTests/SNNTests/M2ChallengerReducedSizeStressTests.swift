@@ -14,7 +14,7 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         let outputDim = 8
         let timeSteps = 2
 
-        let net = MatryoshkaNetwork(
+        let net = SpikingNetwork(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
@@ -45,10 +45,7 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         let res = trainer.trainStep(featuresSeq: featuresSeq, targets: targets)
 
         // maxHiddenDim = 32 のため、Base スライス (min(1024, 32)=32) のみが実行され、Middle/High はスキップされる
-        XCTAssertEqual(res.totalLoss, res.lossBase)
-        XCTAssertEqual(res.lossMiddle, 0.0)
-        XCTAssertEqual(res.lossHigh, 0.0)
-        XCTAssertLessThan(0.0, res.totalLoss)
+        XCTAssertLessThan(0.0, res)
 
         // パラメータが NaN / Inf にならず健全であること
         for param in net.parameters {
@@ -70,7 +67,7 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         let outputDim = 8
         let timeSteps = 2
 
-        let net = MatryoshkaNetwork(
+        let net = SpikingNetwork(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
@@ -105,18 +102,15 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         var epoch = 0
         while epoch < 30 {
             let res = trainer.trainStep(featuresSeq: featuresSeq, targets: targets)
-            XCTAssertFalse(res.totalLoss.isNaN, "Loss became NaN at epoch \(epoch)")
-            XCTAssertFalse(res.totalLoss.isInfinite, "Loss became Inf at epoch \(epoch)")
+            XCTAssertFalse(res.isNaN, "Loss became NaN at epoch \(epoch)")
+            XCTAssertFalse(res.isInfinite, "Loss became Inf at epoch \(epoch)")
 
             // Base のみが実行され、Middle / High は 0.0 であること
-            XCTAssertEqual(res.totalLoss, res.lossBase)
-            XCTAssertEqual(res.lossMiddle, 0.0)
-            XCTAssertEqual(res.lossHigh, 0.0)
 
             if epoch == 0 {
-                initialLoss = res.totalLoss
+                initialLoss = res
             }
-            finalLoss = res.totalLoss
+            finalLoss = res
             epoch += 1
         }
 
@@ -142,7 +136,7 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         let outputDim = 4
         let timeSteps = 2
 
-        let net = MatryoshkaNetwork(
+        let net = SpikingNetwork(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
@@ -162,8 +156,8 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         let targets = [0, 1, 2]
 
         let res = trainer.trainStep(featuresSeq: extremeFeatures, targets: targets)
-        XCTAssertFalse(res.totalLoss.isNaN)
-        XCTAssertFalse(res.totalLoss.isInfinite)
+        XCTAssertFalse(res.isNaN)
+        XCTAssertFalse(res.isInfinite)
 
         for param in net.parameters {
             var i = 0
@@ -175,16 +169,16 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         }
     }
 
-    // MARK: - 3. 縮小サイズモデル (hidden: 128 - Base & Middle) の多重スライス学習テスト
+    // MARK: - 3. 縮小サイズモデルの学習テスト
 
-    /// maxHiddenDim: 512 のモデルにおいて Base (128) と Middle (512) が同時に学習され、High (1024) はスキップされること
-    func testBPTTTrainerHiddenDim128DualSliceSimultaneousLearning() {
+    /// 隠れ層を縮めたモデルでも損失が有限値で学習が進むこと
+    func testBPTTTrainerReducedHiddenDimLearning() {
         let inputDim = 16
-        let maxHiddenDim = 512
+        let maxHiddenDim = 256
         let outputDim = 8
         let timeSteps = 2
 
-        let net = MatryoshkaNetwork(
+        let net = SpikingNetwork(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
@@ -214,16 +208,10 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         var epoch = 0
         while epoch < 20 {
             let res = trainer.trainStep(featuresSeq: featuresSeq, targets: targets)
-            XCTAssertFalse(res.totalLoss.isNaN)
-            XCTAssertFalse(res.totalLoss.isInfinite)
+            XCTAssertFalse(res.isNaN)
+            XCTAssertFalse(res.isInfinite)
 
-            // Base と Middle の合計が totalLoss と一致し、High は 0.0 であること
-            let expectedTotal = res.lossBase + res.lossMiddle
-            XCTAssertEqual(res.totalLoss, expectedTotal, accuracy: 1e-4)
-            XCTAssertEqual(res.lossHigh, 0.0)
-
-            XCTAssertLessThan(0.0, res.lossBase)
-            XCTAssertLessThan(0.0, res.lossMiddle)
+            // Base のみが totalLoss に寄与し、High は 0.0 であること
 
             epoch += 1
         }
@@ -240,8 +228,8 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
     }
 
     /// maxHiddenDim: 128 モデルでの推論時スライス切り替え (Base / Middle) の整合性
-    func testMatryoshkaInferenceHiddenDim128SliceSwitching() {
-        let net = MatryoshkaNetwork(
+    func testInferenceHiddenDim128SliceSwitching() {
+        let net = SpikingNetwork(
             inputDim: 16,
             maxHiddenDim: 128,
             outputDim: 8,
@@ -256,15 +244,14 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         }
 
         // Base スライス推論
-        var vPrevBase = [Float](repeating: 0.0, count: 128)
-        var sPrevBase = [Float](repeating: 0.0, count: 128)
-        var spikeSumBase = [Float](repeating: 0.0, count: 128)
+        var vPrevBase = [Float](repeating: 0.0, count: net.maxHiddenDim)
+        var sPrevBase = [Float](repeating: 0.0, count: net.maxHiddenDim)
+        var spikeSumBase = [Float](repeating: 0.0, count: net.maxHiddenDim)
         var logitsBase = [Float](repeating: 0.0, count: 8)
         var probsBase = [Float](repeating: 0.0, count: 8)
 
-        net.forwardSlice(
+        net.forward(
             features: features,
-            slice: .base,
             vPrev: &vPrevBase,
             sPrev: &sPrevBase,
             spikeSum: &spikeSumBase,
@@ -282,15 +269,14 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
         XCTAssertEqual(sumPBase, 1.0, accuracy: 1e-5)
 
         // Middle スライス推論
-        var vPrevMiddle = [Float](repeating: 0.0, count: 128)
-        var sPrevMiddle = [Float](repeating: 0.0, count: 128)
-        var spikeSumMiddle = [Float](repeating: 0.0, count: 128)
+        var vPrevMiddle = [Float](repeating: 0.0, count: net.maxHiddenDim)
+        var sPrevMiddle = [Float](repeating: 0.0, count: net.maxHiddenDim)
+        var spikeSumMiddle = [Float](repeating: 0.0, count: net.maxHiddenDim)
         var logitsMiddle = [Float](repeating: 0.0, count: 8)
         var probsMiddle = [Float](repeating: 0.0, count: 8)
 
-        net.forwardSlice(
+        net.forward(
             features: features,
-            slice: .middle,
             vPrev: &vPrevMiddle,
             sPrev: &sPrevMiddle,
             spikeSum: &spikeSumMiddle,

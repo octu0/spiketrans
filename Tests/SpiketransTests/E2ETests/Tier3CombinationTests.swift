@@ -45,7 +45,7 @@ final class Tier3CombinationTests: XCTestCase {
         let formantExtractor = FormantExtractor(sampleRate: Float(sampleRate))
         let filterbank = Filterbank(config: config)
 
-        let snn = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let snn = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
 
         let speech = synthesizeSpeech(sampleRate: sampleRate, durationSeconds: 0.1)
         let wavData = createWavData(samples: speech, sampleRate: sampleRate)
@@ -80,7 +80,7 @@ final class Tier3CombinationTests: XCTestCase {
 
             filterbank.extractFeatures(pcmPtr: framePtr, count: config.frameSize, workspace: workspace)
 
-            snn.forwardSlice(features: workspace.featureBuffer, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+            snn.forward(features: workspace.featureBuffer, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
 
             XCTAssertEqual(probs.count, 64)
             var sumP: Float = 0.0
@@ -93,31 +93,10 @@ final class Tier3CombinationTests: XCTestCase {
         }
     }
 
-    // MARK: - 2. Matryoshka スライス動的切替
-    func testComboMatryoshkaSliceSwitchingLive() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-        let features = [Float](repeating: 0.5, count: 32)
-        let slices: [MatryoshkaSlice] = [.base, .middle, .high, .base]
-
-        var sIdx = 0
-        while sIdx < slices.count {
-            let sl = slices[sIdx]
-            let hDim = sl.rawValue
-            var vPrev = [Float](repeating: 0.0, count: hDim)
-            var sPrev = [Float](repeating: 0.0, count: hDim)
-            var spikeSum = [Float](repeating: 0.0, count: hDim)
-            var logits = [Float](repeating: 0.0, count: 64)
-            var probs = [Float](repeating: 0.0, count: 64)
-
-            net.forwardSlice(features: features, slice: sl, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
-            XCTAssertFalse(probs[0].isNaN)
-            sIdx += 1
-        }
-    }
 
     // MARK: - 3. BPTT 学習モデル ↔ Int32 固定小数点推論
     func testComboBPTTTrainingToQuantizedInferenceInt32() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
         let config = QuantizedConfig.int32Config()
         let qWeights = QuantizedEngine.quantize(network: net, config: config)
         let engine = QuantizedEngine(weights: qWeights, timeSteps: 4)
@@ -142,8 +121,8 @@ final class Tier3CombinationTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forwardSlice(features: feat, slice: .base, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
-            engine.predictSlice(features: feat, slice: .base, workspace: workspace, outputProbs: &quantProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            engine.predict(features: feat, workspace: workspace, outputProbs: &quantProbs)
 
             var topFloat = 0
             var maxFloat: Float = -1.0
@@ -175,7 +154,7 @@ final class Tier3CombinationTests: XCTestCase {
 
     // MARK: - 4. BPTT 学習モデル ↔ Int16 固定小数点推論
     func testComboBPTTTrainingToQuantizedInferenceInt16() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
         let config = QuantizedConfig.int16Config()
         let qWeights = QuantizedEngine.quantize(network: net, config: config)
         let engine = QuantizedEngine(weights: qWeights, timeSteps: 4)
@@ -198,8 +177,8 @@ final class Tier3CombinationTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forwardSlice(features: feat, slice: .base, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
-            engine.predictSlice(features: feat, slice: .base, workspace: workspace, outputProbs: &quantProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            engine.predict(features: feat, workspace: workspace, outputProbs: &quantProbs)
 
             var topFloat = 0
             var maxFloat: Float = -1.0
@@ -232,8 +211,8 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 5. VAD セグメンテーション ↔ StreamingTranscriber
     func testComboVADSegmentationToStreamingTranscription() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let collector = ResultCollector<TranscriptionResult>()
@@ -258,9 +237,9 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 6. 音響 CTC 圧縮 ↔ 自己回帰言語 SNN デコーダ
     func testComboAcousticCTCCollapseToLanguageDecoder() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let acDecoder = AcousticDecoder(network: acNet, vocabulary: vocab, slice: .base)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acDecoder = AcousticDecoder(network: acNet, vocabulary: vocab)
         let lmDecoder = LanguageDecoder(lmNetwork: lmNet, vocabulary: vocab)
         let workspace = AcousticWorkspace(maxHiddenDim: 256, outputDim: vocab.size, inputDim: 64)
 
@@ -273,44 +252,15 @@ final class Tier3CombinationTests: XCTestCase {
             i += 1
         }
 
-        let result = lmDecoder.decodeBeamSearch(acousticProbs: acousticProbs, slice: .base)
+        let result = lmDecoder.decodeBeamSearch(acousticProbs: acousticProbs)
         XCTAssertFalse(result.score.isNaN)
     }
 
     // MARK: - 7. Base モデル単体切出 export ↔ import ↔ 推論一致
-    func testComboBaseWeightsExportImportInference() {
-        let net1 = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-        let exported = net1.exportBaseWeights()
-
-        let net2 = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-        net2.importBaseWeights(exported)
-
-        let feat = [Float](repeating: 0.4, count: 32)
-        var v1 = [Float](repeating: 0.0, count: 128)
-        var s1 = [Float](repeating: 0.0, count: 128)
-        var sum1 = [Float](repeating: 0.0, count: 128)
-        var log1 = [Float](repeating: 0.0, count: 64)
-        var p1 = [Float](repeating: 0.0, count: 64)
-
-        var v2 = [Float](repeating: 0.0, count: 128)
-        var s2 = [Float](repeating: 0.0, count: 128)
-        var sum2 = [Float](repeating: 0.0, count: 128)
-        var log2 = [Float](repeating: 0.0, count: 64)
-        var p2 = [Float](repeating: 0.0, count: 64)
-
-        net1.forwardSlice(features: feat, slice: .base, vPrev: &v1, sPrev: &s1, spikeSum: &sum1, logits: &log1, probabilities: &p1)
-        net2.forwardSlice(features: feat, slice: .base, vPrev: &v2, sPrev: &s2, spikeSum: &sum2, logits: &log2, probabilities: &p2)
-
-        var c = 0
-        while c < 64 {
-            XCTAssertEqual(p1[c], p2[c], accuracy: 1e-6)
-            c += 1
-        }
-    }
 
     // MARK: - 8. 3スライス同時時間逆伝播勾配累積 ↔ Adam オプティマイザ
     func testComboAdamOptimizerMultiSliceGradientAccumulation() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let config = AdamConfig(lr: 0.01)
         let adam = AdamOptimizer(config: config, parameters: net.parameters)
         let trainer = BPTTTrainer(network: net, optimizer: adam)
@@ -325,10 +275,7 @@ final class Tier3CombinationTests: XCTestCase {
         }
 
         let stepRes = trainer.trainStep(featuresSeq: seq, targets: targets)
-        XCTAssertLessThanOrEqual(0.0, stepRes.totalLoss)
-        XCTAssertLessThanOrEqual(0.0, stepRes.lossBase)
-        XCTAssertLessThanOrEqual(0.0, stepRes.lossMiddle)
-        XCTAssertLessThanOrEqual(0.0, stepRes.lossHigh)
+        XCTAssertLessThanOrEqual(0.0, stepRes)
     }
 
     // MARK: - 9. LPC 係数 ↔ Durand-Kerner ↔ フォルマント ↔ 32次元特徴量統合
@@ -392,8 +339,8 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 11. StreamingTranscriber 完全ライフサイクル
     func testComboStreamingTranscriberLifecycle() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let collector = ResultCollector<TranscriptionResult>()
@@ -422,7 +369,7 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 12. 音響スコアと言語スコアの重みバランス
     func testComboAcousticLanguageScoreBalance() {
         let vocab = TextVocabulary(characters: Array("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"))
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
 
         let configBalanced = LanguageDecoderConfig(beamWidth: 4, lmWeight: 0.3, wordBonus: 0.1)
         let decoderBalanced = LanguageDecoder(lmNetwork: lmNet, vocabulary: vocab, config: configBalanced)
@@ -432,7 +379,7 @@ final class Tier3CombinationTests: XCTestCase {
         probs[vocab.id(for: "い")] = 0.45
         let frame = AcousticFrameProbabilities(frameIndex: 0, topTokenId: vocab.id(for: "あ"), topProbability: 0.5, probabilities: probs)
 
-        let resGreedy = decoderBalanced.decodeGreedy(acousticProbs: [frame], slice: .base)
+        let resGreedy = decoderBalanced.decodeGreedy(acousticProbs: [frame])
         XCTAssertFalse(resGreedy.tokens.isEmpty)
     }
 
@@ -472,7 +419,7 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 15. 言語 SNN ビームサーチ ↔ Greedy デコード比較
     func testComboLanguageDecoderBeamSearchVsGreedy() {
         let vocab = TextVocabulary(characters: Array("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"))
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let config = LanguageDecoderConfig(beamWidth: 4, lmWeight: 0.3, wordBonus: 0.1)
         let decoder = LanguageDecoder(lmNetwork: lmNet, vocabulary: vocab, config: config)
 
@@ -486,8 +433,8 @@ final class Tier3CombinationTests: XCTestCase {
             i += 1
         }
 
-        let greedyRes = decoder.decodeGreedy(acousticProbs: frames, slice: .base)
-        let beamRes = decoder.decodeBeamSearch(acousticProbs: frames, slice: .base)
+        let greedyRes = decoder.decodeGreedy(acousticProbs: frames)
+        let beamRes = decoder.decodeBeamSearch(acousticProbs: frames)
 
         XCTAssertFalse(greedyRes.tokens.isEmpty)
         XCTAssertFalse(beamRes.tokens.isEmpty)

@@ -32,7 +32,6 @@ public struct TranscriptionResult: Sendable, Equatable {
 /// ストリーミングパイプライン設定パラメータ
 public struct StreamingTranscriberConfig: Sendable {
     public let dspConfig: DSPConfig
-    public let slice: MatryoshkaSlice
     public let useQuantization: Bool
     public let beamWidth: Int
     public let lmWeight: Float
@@ -40,14 +39,12 @@ public struct StreamingTranscriberConfig: Sendable {
 
     public init(
         dspConfig: DSPConfig = DSPConfig(),
-        slice: MatryoshkaSlice = .high,
         useQuantization: Bool = false,
         beamWidth: Int = 4,
         lmWeight: Float = 0.3,
         maxSegmentDurationSeconds: Float = 15.0
     ) {
         self.dspConfig = dspConfig
-        self.slice = slice
         self.useQuantization = useQuantization
         self.beamWidth = beamWidth
         self.lmWeight = lmWeight
@@ -100,8 +97,8 @@ public final class StreamingTranscriber: @unchecked Sendable {
 
     public init(
         config: StreamingTranscriberConfig = StreamingTranscriberConfig(),
-        acousticNetwork: MatryoshkaNetwork,
-        languageNetwork: MatryoshkaNetwork,
+        acousticNetwork: SpikingNetwork,
+        languageNetwork: SpikingNetwork,
         quantizedAcousticEngine: QuantizedEngine? = nil,
         textVocabulary: TextVocabulary = TextVocabulary(),
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
@@ -144,8 +141,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
             network: acousticNetwork,
             quantizedEngine: qEngine,
             vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary,
-            slice: config.slice
+            fallbackVocabulary: phonemeVocabulary
         )
         self.acousticWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticNetwork.maxHiddenDim,
@@ -287,7 +283,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
                         }
                         let greedy = languageDecoder.decodeGreedy(
                             acousticProbs: window,
-                            slice: .base,
                             unkThreshold: unkThreshold
                         )
                         let startSec = Float(segmentStartSample) / Float(config.dspConfig.sampleRate)
@@ -378,13 +373,11 @@ public final class StreamingTranscriber: @unchecked Sendable {
             if config.beamWidth <= 1 {
                 decodeRes = languageDecoder.decodeGreedy(
                     acousticProbs: segmentProbs,
-                    slice: config.slice,
                     unkThreshold: unkThreshold
                 )
             } else {
                 decodeRes = languageDecoder.decodeBeamSearch(
                     acousticProbs: segmentProbs,
-                    slice: config.slice,
                     unkThreshold: unkThreshold
                 )
             }

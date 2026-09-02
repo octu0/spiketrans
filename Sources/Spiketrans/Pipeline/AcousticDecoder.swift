@@ -10,10 +10,10 @@ public final class AcousticWorkspace: @unchecked Sendable {
     public var probabilities: [Float]
     public var quantizedWorkspace: QuantizedWorkspace?
     /// forwardSlice の中間バッファ (Hot Path ゼロアロケーション用)
-    public let scratch: MatryoshkaScratch
+    public let scratch: ForwardScratch
 
     public init(maxHiddenDim: Int = 4096, outputDim: Int = 523, inputDim: Int = 64) {
-        self.scratch = MatryoshkaScratch(maxHiddenDim: maxHiddenDim)
+        self.scratch = ForwardScratch(maxHiddenDim: maxHiddenDim)
         self.vPrev = [Float](repeating: 0.0, count: maxHiddenDim)
         self.sPrev = [Float](repeating: 0.0, count: maxHiddenDim)
         self.aPrev = [Float](repeating: 0.0, count: maxHiddenDim)
@@ -80,26 +80,23 @@ public struct AcousticFrameProbabilities: Sendable, Equatable {
 
 /// 第1段 音響 SNN デコーダ (64次元音響特徴量 -> 直接漢字かな文字事後確率分布)
 public final class AcousticDecoder: @unchecked Sendable {
-    public let network: MatryoshkaNetwork
+    public let network: SpikingNetwork
     public let quantizedEngine: QuantizedEngine?
     public let vocabulary: TextVocabulary
     public let fallbackVocabulary: PhonemeVocabulary
-    public let slice: MatryoshkaSlice
     public let silenceThreshold: Float
 
     public init(
-        network: MatryoshkaNetwork,
+        network: SpikingNetwork,
         quantizedEngine: QuantizedEngine? = nil,
         vocabulary: TextVocabulary = TextVocabulary(),
         fallbackVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        slice: MatryoshkaSlice = .high,
         silenceThreshold: Float = 0.5
     ) {
         self.network = network
         self.quantizedEngine = quantizedEngine
         self.vocabulary = vocabulary
         self.fallbackVocabulary = fallbackVocabulary
-        self.slice = slice
         self.silenceThreshold = silenceThreshold
     }
 
@@ -125,16 +122,14 @@ public final class AcousticDecoder: @unchecked Sendable {
                 workspace.quantizedWorkspace = newWs
                 qWs = newWs
             }
-            qEngine.predictSlice(
+            qEngine.predict(
                 features: features,
-                slice: slice,
                 workspace: qWs,
                 outputProbs: &workspace.probabilities
             )
         case .none:
-            network.forwardSlice(
+            network.forward(
                 features: features,
-                slice: slice,
                 vPrev: &workspace.vPrev,
                 sPrev: &workspace.sPrev,
                 aPrev: &workspace.aPrev,

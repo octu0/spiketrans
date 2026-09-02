@@ -52,7 +52,7 @@ public struct QuantizedWeights: Sendable, Equatable {
     public let wIn: [Int32]
     public let wRec: [Int32]
     public let bH: [Int32]
-    public let wOut: [Int32]
+    public let wOut: [Int32]        // 全スライスで共有
     public let bOut: [Int32]
 
     public init(
@@ -75,6 +75,7 @@ public struct QuantizedWeights: Sendable, Equatable {
         self.bH = bH
         self.wOut = wOut
         self.bOut = bOut
+
     }
 }
 
@@ -124,7 +125,7 @@ public final class QuantizedEngine: @unchecked Sendable {
 
     /// Float32 モデルから Int32 / Int16 量子化モデルを生成するコンバータ
     public static func quantize(
-        network: MatryoshkaNetwork,
+        network: SpikingNetwork,
         config: QuantizedConfig,
         minVal: Int64 = -2147483648,
         maxVal: Int64 = 2147483647
@@ -169,13 +170,12 @@ public final class QuantizedEngine: @unchecked Sendable {
     }
 
     /// 固定小数点推論（乗算フリー・スパース加算・ビットシフト減衰）
-    public func predictSlice(
+    public func predict(
         features: [Float],
-        slice: MatryoshkaSlice,
         workspace: QuantizedWorkspace,
         outputProbs: inout [Float]
     ) {
-        let hSize = min(slice.rawValue, weights.maxHiddenDim)
+        let hSize = weights.maxHiddenDim
         let scale = weights.config.scale
         let scaleBits = Int64(weights.config.scaleBits)
         let vThInt = weights.config.vThInt
@@ -247,6 +247,7 @@ public final class QuantizedEngine: @unchecked Sendable {
         }
 
         // 3. リードアウト層整数計算
+
         var maxLogit: Int64 = -1 << 60
         var c = 0
         while c < weights.outputDim {

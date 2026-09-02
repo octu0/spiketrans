@@ -24,34 +24,25 @@ public struct TrainingConfig: Sendable {
 public struct EpochResult: Sendable {
     public let epoch: Int
     public let totalLoss: Float
-    public let baseLoss: Float
-    public let middleLoss: Float
-    public let highLoss: Float
 
     public init(
         epoch: Int,
-        totalLoss: Float,
-        baseLoss: Float,
-        middleLoss: Float,
-        highLoss: Float
+        totalLoss: Float
     ) {
         self.epoch = epoch
         self.totalLoss = totalLoss
-        self.baseLoss = baseLoss
-        self.middleLoss = middleLoss
-        self.highLoss = highLoss
     }
 }
 
 /// 第1段 音響 SNN (Acoustic SNN) 学習オーケストレータ
 public final class AcousticTrainer: @unchecked Sendable {
-    public let network: MatryoshkaNetwork
+    public let network: SpikingNetwork
     public let optimizer: AdamOptimizer
     public let bpttTrainer: BPTTTrainer
     public let config: TrainingConfig
 
     public init(
-        network: MatryoshkaNetwork,
+        network: SpikingNetwork,
         config: TrainingConfig = TrainingConfig()
     ) {
         self.network = network
@@ -180,9 +171,6 @@ public final class AcousticTrainer: @unchecked Sendable {
     /// データセットに対する 1 エポックの学習を実行 (並列ワーカー数指定対応)
     public func trainEpoch(dataset: SpeechDataset, epoch: Int = 1, numWorkers: Int = 1) -> EpochResult {
         var sumTotalLoss: Float = 0.0
-        var sumBaseLoss: Float = 0.0
-        var sumMiddleLoss: Float = 0.0
-        var sumHighLoss: Float = 0.0
         var validSampleCount = 0
 
         let totalSamples = dataset.count
@@ -190,14 +178,11 @@ public final class AcousticTrainer: @unchecked Sendable {
 
         final class BatchBuffer: @unchecked Sendable {
             var grads: [NetworkGradients]
-            var losses: [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)]
+            var losses: [Float]
             var valid: [Bool]
             init(count: Int, template: NetworkGradients) {
                 self.grads = [NetworkGradients](repeating: template, count: count)
-                self.losses = [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)](
-                    repeating: (0.0, 0.0, 0.0, 0.0),
-                    count: count
-                )
+                self.losses = [Float](repeating: 0.0, count: count)
                 self.valid = [Bool](repeating: false, count: count)
             }
         }
@@ -274,10 +259,7 @@ public final class AcousticTrainer: @unchecked Sendable {
                     if buffer.valid[i] {
                         combinedGrads.accumulate(from: buffer.grads[i])
                         let l = buffer.losses[i]
-                        sumTotalLoss += l.totalLoss
-                        sumBaseLoss += l.lossBase
-                        sumMiddleLoss += l.lossMiddle
-                        sumHighLoss += l.lossHigh
+                        sumTotalLoss += l
                         validInBatch += 1
                     }
                     i += 1
@@ -294,24 +276,15 @@ public final class AcousticTrainer: @unchecked Sendable {
         }
 
         var avgTotal: Float = 0.0
-        var avgBase: Float = 0.0
-        var avgMiddle: Float = 0.0
-        var avgHigh: Float = 0.0
 
         if 0 < validSampleCount {
             let invCount = 1.0 / Float(validSampleCount)
             avgTotal = sumTotalLoss * invCount
-            avgBase = sumBaseLoss * invCount
-            avgMiddle = sumMiddleLoss * invCount
-            avgHigh = sumHighLoss * invCount
         }
 
         return EpochResult(
             epoch: epoch,
-            totalLoss: avgTotal,
-            baseLoss: avgBase,
-            middleLoss: avgMiddle,
-            highLoss: avgHigh
+            totalLoss: sumTotalLoss / Float(max(1, validSampleCount))
         )
     }
 
@@ -335,9 +308,6 @@ public final class AcousticTrainer: @unchecked Sendable {
         numWorkers: Int = 1
     ) -> EpochResult {
         var sumTotalLoss: Float = 0.0
-        var sumBaseLoss: Float = 0.0
-        var sumMiddleLoss: Float = 0.0
-        var sumHighLoss: Float = 0.0
         var validSampleCount = 0
 
         let totalSamples = dataset.count
@@ -346,14 +316,11 @@ public final class AcousticTrainer: @unchecked Sendable {
 
         final class BatchBuffer: @unchecked Sendable {
             var grads: [NetworkGradients]
-            var losses: [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)]
+            var losses: [Float]
             var valid: [Bool]
             init(count: Int, template: NetworkGradients) {
                 self.grads = [NetworkGradients](repeating: template, count: count)
-                self.losses = [(totalLoss: Float, lossBase: Float, lossMiddle: Float, lossHigh: Float)](
-                    repeating: (0.0, 0.0, 0.0, 0.0),
-                    count: count
-                )
+                self.losses = [Float](repeating: 0.0, count: count)
                 self.valid = [Bool](repeating: false, count: count)
             }
         }
@@ -393,10 +360,7 @@ public final class AcousticTrainer: @unchecked Sendable {
                 if buffer.valid[i] {
                     combinedGrads.accumulate(from: buffer.grads[i])
                     let l = buffer.losses[i]
-                    sumTotalLoss += l.totalLoss
-                    sumBaseLoss += l.lossBase
-                    sumMiddleLoss += l.lossMiddle
-                    sumHighLoss += l.lossHigh
+                        sumTotalLoss += l
                     validInBatch += 1
                 }
                 i += 1
@@ -411,24 +375,15 @@ public final class AcousticTrainer: @unchecked Sendable {
         }
 
         var avgTotal: Float = 0.0
-        var avgBase: Float = 0.0
-        var avgMiddle: Float = 0.0
-        var avgHigh: Float = 0.0
 
         if 0 < validSampleCount {
             let invCount = 1.0 / Float(validSampleCount)
             avgTotal = sumTotalLoss * invCount
-            avgBase = sumBaseLoss * invCount
-            avgMiddle = sumMiddleLoss * invCount
-            avgHigh = sumHighLoss * invCount
         }
 
         return EpochResult(
             epoch: epoch,
-            totalLoss: avgTotal,
-            baseLoss: avgBase,
-            middleLoss: avgMiddle,
-            highLoss: avgHigh
+            totalLoss: sumTotalLoss / Float(max(1, validSampleCount))
         )
     }
 }

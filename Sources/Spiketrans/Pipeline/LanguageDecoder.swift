@@ -51,13 +51,13 @@ public struct LanguageDecoderConfig: Sendable {
 
 /// 第2段 自己回帰言語 SNN デコーダ
 public final class LanguageDecoder: @unchecked Sendable {
-    public let lmNetwork: MatryoshkaNetwork
+    public let lmNetwork: SpikingNetwork
     public let vocabulary: TextVocabulary
     public let fallbackVocabulary: PhonemeVocabulary
     public let config: LanguageDecoderConfig
 
     public init(
-        lmNetwork: MatryoshkaNetwork,
+        lmNetwork: SpikingNetwork,
         vocabulary: TextVocabulary = TextVocabulary(),
         fallbackVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         config: LanguageDecoderConfig = LanguageDecoderConfig()
@@ -84,14 +84,13 @@ public final class LanguageDecoder: @unchecked Sendable {
     /// 貪欲法 (Greedy) による音響+言語結合デコード (直接漢字かな + 未知語フォールバック)
     public func decodeGreedy(
         acousticProbs: [AcousticFrameProbabilities],
-        slice: MatryoshkaSlice = .base,
         unkThreshold: Float = 0.25
     ) -> (tokens: [Int], text: String, score: Float) {
         if acousticProbs.isEmpty {
             return ([], "", 0.0)
         }
 
-        let hSize = min(slice.rawValue, lmNetwork.maxHiddenDim)
+        let hSize = lmNetwork.maxHiddenDim
         let outDim = lmNetwork.outputDim
         var vLM = [Float](repeating: 0.0, count: hSize)
         var sLM = [Float](repeating: 0.0, count: hSize)
@@ -100,7 +99,7 @@ public final class LanguageDecoder: @unchecked Sendable {
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
 
-        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
+        let scratchLM = ForwardScratch(maxHiddenDim: hSize)
 
         var prevToken = TextVocabulary.sosId
         var accumulatedScore: Float = 0.0
@@ -119,9 +118,8 @@ public final class LanguageDecoder: @unchecked Sendable {
             // 1. 先行トークン埋め込みによる言語 SNN 推論
             let tokenFeatures = buildTokenFeature(tokenId: prevToken)
 
-            lmNetwork.forwardSlice(
+            lmNetwork.forward(
                 features: tokenFeatures,
-                slice: slice,
                 vPrev: &vLM,
                 sPrev: &sLM,
                 aPrev: &aLM,
@@ -203,14 +201,13 @@ public final class LanguageDecoder: @unchecked Sendable {
     /// ビーム探索 (Beam Search) による音響+言語結合デコード
     public func decodeBeamSearch(
         acousticProbs: [AcousticFrameProbabilities],
-        slice: MatryoshkaSlice = .base,
         unkThreshold: Float = 0.25
     ) -> (tokens: [Int], text: String, score: Float) {
         if acousticProbs.isEmpty {
             return ([], "", 0.0)
         }
 
-        let hSize = min(slice.rawValue, lmNetwork.maxHiddenDim)
+        let hSize = lmNetwork.maxHiddenDim
         let outDim = lmNetwork.outputDim
         var beams: [BeamHypothesis] = [
             BeamHypothesis(
@@ -226,7 +223,7 @@ public final class LanguageDecoder: @unchecked Sendable {
         var spikeSumLM = [Float](repeating: 0.0, count: hSize)
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
-        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
+        let scratchLM = ForwardScratch(maxHiddenDim: hSize)
 
         var fIdx = 0
         while fIdx < acousticProbs.count {
@@ -255,9 +252,8 @@ public final class LanguageDecoder: @unchecked Sendable {
                 }
                 let tokenFeatures = buildTokenFeature(tokenId: prevTok)
 
-                lmNetwork.forwardSlice(
+                lmNetwork.forward(
                     features: tokenFeatures,
-                    slice: slice,
                     vPrev: &vLM,
                     sPrev: &sLM,
                     aPrev: &aLM,
@@ -367,8 +363,7 @@ public final class LanguageDecoder: @unchecked Sendable {
     /// 音響 SNN の推定したかな文字列から直接漢字かな混じり文を自己回帰復元
     public func decodeKanaToKanji(
         kanaText: String,
-        kanaVocabulary: TextVocabulary,
-        slice: MatryoshkaSlice = .high
+        kanaVocabulary: TextVocabulary
     ) -> String {
         if kanaText.isEmpty {
             return ""
@@ -379,7 +374,7 @@ public final class LanguageDecoder: @unchecked Sendable {
             return ""
         }
 
-        let hSize = min(slice.rawValue, lmNetwork.maxHiddenDim)
+        let hSize = lmNetwork.maxHiddenDim
         let outDim = lmNetwork.outputDim
         var vLM = [Float](repeating: 0.0, count: hSize)
         var sLM = [Float](repeating: 0.0, count: hSize)
@@ -388,7 +383,7 @@ public final class LanguageDecoder: @unchecked Sendable {
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
 
-        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
+        let scratchLM = ForwardScratch(maxHiddenDim: hSize)
 
         var outputTokens: [Int] = []
         var kIdx = 0
@@ -396,9 +391,8 @@ public final class LanguageDecoder: @unchecked Sendable {
             let kId = kanaIds[kIdx]
             let feat = buildTokenFeature(tokenId: kId)
 
-            lmNetwork.forwardSlice(
+            lmNetwork.forward(
                 features: feat,
-                slice: slice,
                 vPrev: &vLM,
                 sPrev: &sLM,
                 aPrev: &aLM,
@@ -436,8 +430,7 @@ public final class LanguageDecoder: @unchecked Sendable {
     /// 言語 SNN の予測を局所的な手掛かりとして加算できる。
     public func predictKanjiPerKana(
         kanaText: String,
-        kanaVocabulary: TextVocabulary,
-        slice: MatryoshkaSlice = .high
+        kanaVocabulary: TextVocabulary
     ) -> [Character?] {
         let kanaChars = Array(kanaText)
         if kanaChars.isEmpty {
@@ -446,7 +439,7 @@ public final class LanguageDecoder: @unchecked Sendable {
 
         var hints = [Character?](repeating: nil, count: kanaChars.count)
 
-        let hSize = min(slice.rawValue, lmNetwork.maxHiddenDim)
+        let hSize = lmNetwork.maxHiddenDim
         let outDim = lmNetwork.outputDim
         var vLM = [Float](repeating: 0.0, count: hSize)
         var sLM = [Float](repeating: 0.0, count: hSize)
@@ -454,7 +447,7 @@ public final class LanguageDecoder: @unchecked Sendable {
         var spikeSumLM = [Float](repeating: 0.0, count: hSize)
         var logitsLM = [Float](repeating: 0.0, count: outDim)
         var probsLM = [Float](repeating: 0.0, count: outDim)
-        let scratchLM = MatryoshkaScratch(maxHiddenDim: hSize)
+        let scratchLM = ForwardScratch(maxHiddenDim: hSize)
 
         var kIdx = 0
         while kIdx < kanaChars.count {
@@ -464,9 +457,8 @@ public final class LanguageDecoder: @unchecked Sendable {
                 kId = ids[0]
             }
 
-            lmNetwork.forwardSlice(
+            lmNetwork.forward(
                 features: buildTokenFeature(tokenId: kId),
-                slice: slice,
                 vPrev: &vLM,
                 sPrev: &sLM,
                 aPrev: &aLM,

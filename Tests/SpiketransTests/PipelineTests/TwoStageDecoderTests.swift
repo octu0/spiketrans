@@ -84,7 +84,7 @@ final class TwoStageDecoderTests: XCTestCase {
 
     func testAcousticDecoderCollapseIdenticalTokens() {
         let textVocab = TextVocabulary(characters: Array("からす"))
-        let net = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: textVocab.size)
+        let net = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: textVocab.size)
         let decoder = AcousticDecoder(network: net, vocabulary: textVocab)
 
         let kId = textVocab.id(for: "か")
@@ -134,13 +134,13 @@ final class TwoStageDecoderTests: XCTestCase {
 
     func testAcousticDecoderQuantizedVsFloat32() {
         let textVocab = TextVocabulary(characters: Array("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"))
-        let net = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: textVocab.size, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: textVocab.size, timeSteps: 4)
         let qConfig = QuantizedConfig.int32Config()
         let qWeights = QuantizedEngine.quantize(network: net, config: qConfig)
         let qEngine = QuantizedEngine(weights: qWeights, timeSteps: 4)
 
-        let floatDecoder = AcousticDecoder(network: net, vocabulary: textVocab, slice: .base)
-        let quantDecoder = AcousticDecoder(network: net, quantizedEngine: qEngine, vocabulary: textVocab, slice: .base)
+        let floatDecoder = AcousticDecoder(network: net, vocabulary: textVocab)
+        let quantDecoder = AcousticDecoder(network: net, quantizedEngine: qEngine, vocabulary: textVocab)
 
         let floatWs = AcousticWorkspace(maxHiddenDim: 256, outputDim: textVocab.size, inputDim: 64)
         let quantWs = AcousticWorkspace(maxHiddenDim: 256, outputDim: textVocab.size, inputDim: 64)
@@ -178,7 +178,7 @@ final class TwoStageDecoderTests: XCTestCase {
 
     func testLanguageDecoderGreedyDecoding() {
         let vocab = TextVocabulary(characters: Array("からす"))
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let langDecoder = LanguageDecoder(lmNetwork: lmNet, vocabulary: vocab)
 
         let kId = vocab.id(for: "か")
@@ -202,7 +202,7 @@ final class TwoStageDecoderTests: XCTestCase {
             i += 1
         }
 
-        let result = langDecoder.decodeGreedy(acousticProbs: acousticProbs, slice: .base)
+        let result = langDecoder.decodeGreedy(acousticProbs: acousticProbs)
         XCTAssertFalse(result.tokens.isEmpty)
         XCTAssertFalse(result.text.isEmpty)
         XCTAssertEqual(result.text, "からす")
@@ -212,7 +212,7 @@ final class TwoStageDecoderTests: XCTestCase {
 
     func testLanguageDecoderBeamSearchDecoding() {
         let vocab = TextVocabulary(characters: Array("にほん"))
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let config = LanguageDecoderConfig(beamWidth: 4, lmWeight: 0.3, wordBonus: 0.1)
         let langDecoder = LanguageDecoder(lmNetwork: lmNet, vocabulary: vocab, config: config)
 
@@ -237,48 +237,11 @@ final class TwoStageDecoderTests: XCTestCase {
             i += 1
         }
 
-        let beamResult = langDecoder.decodeBeamSearch(acousticProbs: acousticProbs, slice: .base)
+        let beamResult = langDecoder.decodeBeamSearch(acousticProbs: acousticProbs)
         XCTAssertFalse(beamResult.tokens.isEmpty)
         XCTAssertEqual(beamResult.text, "にほん")
     }
 
-    // MARK: - 8. マトリョーシカスライス動的切り替えテスト
+    // MARK: - 8. スライス動的切り替えテスト
 
-    func testMatryoshkaSliceSwitchingInPipeline() {
-        let vocab = TextVocabulary()
-        let net = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-
-        let slices: [MatryoshkaSlice] = [.base, .middle, .high]
-        var sIdx = 0
-        while sIdx < slices.count {
-            let slice = slices[sIdx]
-            let acousticDecoder = AcousticDecoder(network: net, vocabulary: vocab, slice: slice)
-            let langDecoder = LanguageDecoder(lmNetwork: net, vocabulary: vocab)
-            let workspace = AcousticWorkspace(maxHiddenDim: 256, outputDim: vocab.size, inputDim: 64)
-
-            var featuresSeq: [[Float]] = []
-            var f = 0
-            while f < 10 {
-                var feats = [Float](repeating: 0.0, count: 64)
-                var d = 0
-                while d < 64 {
-                    feats[d] = Float((f + d) % 5) * 0.2
-                    d += 1
-                }
-                featuresSeq.append(feats)
-                f += 1
-            }
-
-            let acProbs = acousticDecoder.decodeSequence(featuresSeq: featuresSeq, workspace: workspace)
-            XCTAssertEqual(acProbs.count, 10)
-
-            let greedy = langDecoder.decodeGreedy(acousticProbs: acProbs, slice: slice)
-            let beam = langDecoder.decodeBeamSearch(acousticProbs: acProbs, slice: slice)
-
-            XCTAssertFalse(greedy.tokens.isEmpty && greedy.text.isEmpty != true)
-            XCTAssertFalse(beam.tokens.isEmpty && beam.text.isEmpty != true)
-
-            sIdx += 1
-        }
-    }
 }

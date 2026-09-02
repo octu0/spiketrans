@@ -80,8 +80,8 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 1. ガウスホワイトノイズ重畳検証 (SNR 20dB, 10dB, 0dB, -5dB)
     func testAdversarialGaussianNoiseSNR() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let sampleRate = 16000
@@ -122,8 +122,8 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 2. ピンクノイズ重畳検証 (1/f 低周波妨害)
     func testAdversarialPinkNoise() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let sampleRate = 16000
@@ -144,7 +144,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
     // MARK: - 3. Float32 vs Int32 Top-1 100% 一致検証
     func testAdversarialFloat32VsInt32Top1Match() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
         let config32 = QuantizedConfig.int32Config()
         let qWeights32 = QuantizedEngine.quantize(network: net, config: config32)
         let engine32 = QuantizedEngine(weights: qWeights32, timeSteps: 4)
@@ -169,8 +169,8 @@ final class Tier5AdversarialTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forwardSlice(features: feat, slice: .base, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
-            engine32.predictSlice(features: feat, slice: .base, workspace: workspace32, outputProbs: &quantProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            engine32.predict(features: feat, workspace: workspace32, outputProbs: &quantProbs)
 
             var topF = 0
             var maxF: Float = -1.0
@@ -202,7 +202,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
     // MARK: - 4. Float32 vs Int16 Top-1 一致率検証
     func testAdversarialFloat32VsInt16Top1Match() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
         let config16 = QuantizedConfig.int16Config()
         let qWeights16 = QuantizedEngine.quantize(network: net, config: config16)
         let engine16 = QuantizedEngine(weights: qWeights16, timeSteps: 4)
@@ -225,8 +225,8 @@ final class Tier5AdversarialTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forwardSlice(features: feat, slice: .base, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
-            engine16.predictSlice(features: feat, slice: .base, workspace: workspace16, outputProbs: &quantProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            engine16.predict(features: feat, workspace: workspace16, outputProbs: &quantProbs)
 
             var topF = 0
             var maxF: Float = -1.0
@@ -258,7 +258,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
     // MARK: - 5. SNN スパース性 (発火率 ≤ 30%) & 乗算フリー効率検証
     func testAdversarialSNNSparsityAndMultFree() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
         let features = [Float](repeating: 0.3, count: 32)
         var vPrev = [Float](repeating: 0.0, count: 256)
         var sPrev = [Float](repeating: 0.0, count: 256)
@@ -271,7 +271,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
         var step = 0
         while step < 100 {
-            net.forwardSlice(features: features, slice: .high, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+            net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
             var i = 0
             while i < 256 {
                 totalSpikes += spikeSum[i]
@@ -289,9 +289,9 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 6. ホットパス ゼロアロケーション & RSS フォレンジック検証
     func testAdversarialZeroAllocHotPathRSSForensics() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let config = StreamingTranscriberConfig(slice: .base, beamWidth: 1)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let config = StreamingTranscriberConfig(beamWidth: 1)
         let transcriber = StreamingTranscriber(config: config, acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
         let chunk = [Float](repeating: 0.1, count: 160)
@@ -317,7 +317,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
     // MARK: - 7. 極小 / 極大入力に対する数値安定性
     func testAdversarialExtremeFloatStability() {
-        let net = MatryoshkaNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
+        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
         var vPrev = [Float](repeating: 0.0, count: 64)
         var sPrev = [Float](repeating: 0.0, count: 64)
         var spikeSum = [Float](repeating: 0.0, count: 64)
@@ -326,12 +326,12 @@ final class Tier5AdversarialTests: XCTestCase {
 
         // Micro input (1e-35)
         let microFeat = [Float](repeating: 1e-35, count: 32)
-        net.forwardSlice(features: microFeat, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: microFeat, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertFalse(probs[0].isNaN)
 
         // Huge input (1e30)
         let hugeFeat = [Float](repeating: 1e30, count: 32)
-        net.forwardSlice(features: hugeFeat, slice: .base, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: hugeFeat, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertFalse(probs[0].isNaN)
     }
 
@@ -375,8 +375,8 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 10. メモリ安全性 / 高速連続ライフサイクル
     func testAdversarialMemorySafetyDoubleFree() {
         let vocab = TextVocabulary()
-        let acNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let lmNet = MatryoshkaNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
 
         var i = 0
         while i < 50 {
