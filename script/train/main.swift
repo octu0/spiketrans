@@ -758,6 +758,21 @@ print("\n==================================================")
 print("=== 4. 全 \(rawPairs.count) サンプル 音響直接デコード CER 評価 ===")
 print("==================================================")
 
+/// 句読点を除去した文字列 (句読点の寄与を分離して測るため)
+@Sendable
+func stripPunctuation(_ text: String) -> String {
+    var out = ""
+    for c in text {
+        switch c {
+        case "、", "。", "，", "．", "・":
+            break
+        default:
+            out.append(c)
+        }
+    }
+    return out
+}
+
 @Sendable
 func levenshteinDistance(_ s1: String, _ s2: String) -> Int {
     let a1 = Array(s1)
@@ -811,6 +826,12 @@ struct EvalResult {
     let targetKana: String
     let predKana: String
     let kanaCer: Float
+    // 正解かなをそのまま第2段に入れた結果。第2段単体の実力を切り分けるための指標
+    let goldKanaKanji: String
+    let goldKanaKanjiCer: Float
+    // 句読点を除いた比較 (句読点が CER にどれだけ寄与しているかの切り分け)
+    let goldKanaKanjiCerNoPunct: Float
+    let goldExactNoPunct: Bool
 }
 
 struct GroupSummary {
@@ -822,6 +843,11 @@ struct GroupSummary {
     // 第1段 音響 SNN のかな出力に対する CER (音素発火精度の指標)
     let meanKanaCer: Float
     let medianKanaCer: Float
+    // 正解かなを第2段に入れたときの漢字 CER (第2段単体の実力)
+    let meanGoldKanjiCer: Float
+    let goldExactRate: Float
+    let meanGoldKanjiCerNoPunct: Float
+    let goldExactRateNoPunct: Float
 }
 
 func computeSummary(_ results: [EvalResult]) -> GroupSummary {
@@ -829,13 +855,19 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
         return GroupSummary(
             count: 0, exactCount: 0, exactRate: 0.0,
             meanCer: 0.0, medianCer: 0.0,
-            meanKanaCer: 0.0, medianKanaCer: 0.0
+            meanKanaCer: 0.0, medianKanaCer: 0.0,
+            meanGoldKanjiCer: 0.0, goldExactRate: 0.0,
+            meanGoldKanjiCerNoPunct: 0.0, goldExactRateNoPunct: 0.0
         )
     }
     let n = results.count
     var exact = 0
     var sumCer: Float = 0.0
     var sumKanaCer: Float = 0.0
+    var sumGoldCer: Float = 0.0
+    var goldExact = 0
+    var sumGoldCerNoPunct: Float = 0.0
+    var goldExactNoPunct = 0
     var cers: [Float] = []
     var kanaCers: [Float] = []
     cers.reserveCapacity(n)
@@ -849,6 +881,14 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
         cers.append(r.cer)
         sumKanaCer += r.kanaCer
         kanaCers.append(r.kanaCer)
+        sumGoldCer += r.goldKanaKanjiCer
+        if r.goldKanaKanji == r.targetText {
+            goldExact += 1
+        }
+        sumGoldCerNoPunct += r.goldKanaKanjiCerNoPunct
+        if r.goldExactNoPunct {
+            goldExactNoPunct += 1
+        }
     }
     cers.sort()
     kanaCers.sort()
@@ -859,12 +899,16 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
         meanCer: (sumCer / Float(n)) * 100.0,
         medianCer: cers[n / 2] * 100.0,
         meanKanaCer: (sumKanaCer / Float(n)) * 100.0,
-        medianKanaCer: kanaCers[n / 2] * 100.0
+        medianKanaCer: kanaCers[n / 2] * 100.0,
+        meanGoldKanjiCer: (sumGoldCer / Float(n)) * 100.0,
+        goldExactRate: Float(goldExact) * 100.0 / Float(n),
+        meanGoldKanjiCerNoPunct: (sumGoldCerNoPunct / Float(n)) * 100.0,
+        goldExactRateNoPunct: Float(goldExactNoPunct) * 100.0 / Float(n)
     )
 }
 
 let parser = WavParser()
-let dummyEval = EvalResult(index: 0, fileId: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0)
+let dummyEval = EvalResult(index: 0, fileId: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0, goldKanaKanji: "", goldKanaKanjiCer: 1.0, goldKanaKanjiCerNoPunct: 1.0, goldExactNoPunct: false)
 
 final class BatchEvalBuffer: @unchecked Sendable {
     var results: [EvalResult]
@@ -922,6 +966,17 @@ DispatchQueue.concurrentPerform(iterations: evalPairs.count) { idx in
         let kanaDist = levenshteinDistance(targetKana, res.kana)
         let kanaCer = Float(kanaDist) / Float(max(1, targetKana.count))
 
+        // 第2段単体の実力: 正解かなを入力したときの漢字復元
+        let goldDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
+        let goldKanji = goldDecoder.decode(kanaText: targetKana)
+        let goldDist = levenshteinDistance(pair.text, goldKanji)
+        let goldCer = Float(goldDist) / Float(max(1, pair.text.count))
+
+        let targetNoPunct = stripPunctuation(pair.text)
+        let goldNoPunct = stripPunctuation(goldKanji)
+        let goldDistNoPunct = levenshteinDistance(targetNoPunct, goldNoPunct)
+        let goldCerNoPunct = Float(goldDistNoPunct) / Float(max(1, targetNoPunct.count))
+
         return EvalResult(
             index: idx + 1,
             fileId: pair.fileId,
@@ -933,7 +988,11 @@ DispatchQueue.concurrentPerform(iterations: evalPairs.count) { idx in
             isTrain: isTrain,
             targetKana: targetKana,
             predKana: res.kana,
-            kanaCer: kanaCer
+            kanaCer: kanaCer,
+            goldKanaKanji: goldKanji,
+            goldKanaKanjiCer: goldCer,
+            goldKanaKanjiCerNoPunct: goldCerNoPunct,
+            goldExactNoPunct: targetNoPunct == goldNoPunct
         )
     }
 
@@ -964,6 +1023,9 @@ func printSliceSummary(
     print("\n[\(label)]")
     print("  • 学習セット (\(train.count)件):   Exact率: \(String(format: "%.1f", train.exactRate))% (\(train.exactCount)/\(train.count)), 漢字CER: \(String(format: "%.2f", train.meanCer))% (中央値 \(String(format: "%.2f", train.medianCer))%), かなCER: \(String(format: "%.2f", train.meanKanaCer))% (中央値 \(String(format: "%.2f", train.medianKanaCer))%)")
     print("  • 未学習セット (\(unseen.count)件): Exact率: \(String(format: "%.1f", unseen.exactRate))% (\(unseen.exactCount)/\(unseen.count)), 漢字CER: \(String(format: "%.2f", unseen.meanCer))% (中央値 \(String(format: "%.2f", unseen.medianCer))%), かなCER: \(String(format: "%.2f", unseen.meanKanaCer))% (中央値 \(String(format: "%.2f", unseen.medianKanaCer))%)")
+    print("  ── 第2段単体 (正解かな入力時の漢字CER) ──")
+    print("     句読点あり  学習: \(String(format: "%.2f", train.meanGoldKanjiCer))% (完全一致 \(String(format: "%.1f", train.goldExactRate))%) / 未学習: \(String(format: "%.2f", unseen.meanGoldKanjiCer))% (完全一致 \(String(format: "%.1f", unseen.goldExactRate))%)")
+    print("     句読点除外  学習: \(String(format: "%.2f", train.meanGoldKanjiCerNoPunct))% (完全一致 \(String(format: "%.1f", train.goldExactRateNoPunct))%) / 未学習: \(String(format: "%.2f", unseen.meanGoldKanjiCerNoPunct))% (完全一致 \(String(format: "%.1f", unseen.goldExactRateNoPunct))%)")
 }
 
 // ==================================================
@@ -1175,6 +1237,40 @@ if 0 < rawPairs.count {
         print("  音響 SNN のみ: \(String(format: "%.2f", acousticMs)) ms/発話 (\(totalFrames) フレーム処理)")
         print("  かな文字起こし全体 (SNN + CTC ビーム): \(String(format: "%.2f", fullMs)) ms/発話")
         print("  RTF: \(String(format: "%.4f", rtf)) (実時間の \(String(format: "%.0f", speedup)) 倍速)")
+    }
+}
+
+// ==================================================
+// === 第2段 Viterbi の選択内訳 (正解かな入力) ===
+// ==================================================
+// 正解かなを入れても誤る発話について、どの区間でどの語がどの経路・何点で
+// 選ばれたかを出す。配点のどこが誤選択を招いているかを特定するため。
+do {
+    // 正解かな入力時の CER が高い順に数件を選ぶ
+    let worstGold = trainResults
+        .filter { 0.0 < $0.goldKanaKanjiCerNoPunct }
+        .sorted { b, a in a.goldKanaKanjiCerNoPunct < b.goldKanaKanjiCerNoPunct }
+    let sampleCount = min(3, worstGold.count)
+
+    print("\n==================================================")
+    print("=== [第2段 診断] 正解かな入力時の Viterbi 選択内訳 (誤り上位 \(sampleCount) 件) ===")
+    print("==================================================")
+
+    var d = 0
+    while d < sampleCount {
+        let r = worstGold[d]
+        let diagDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
+        let produced = diagDecoder.decode(kanaText: r.targetKana)
+
+        print("\n[\(r.fileId)] 句読点除外 CER: \(String(format: "%.1f", r.goldKanaKanjiCerNoPunct * 100.0))%")
+        print("  正解かな: \"\(r.targetKana)\"")
+        print("  正解漢字: \"\(r.targetText)\"")
+        print("  第2段出力: \"\(produced)\"")
+        print("  選択内訳:")
+        for seg in diagDecoder.lastTrace {
+            print("    \(seg.kanaRange) → \(seg.emitted)  [\(seg.kind)] \(String(format: "%+.1f", seg.stepScore))")
+        }
+        d += 1
     }
 }
 

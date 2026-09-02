@@ -275,13 +275,6 @@ public final class AcousticTrainer: @unchecked Sendable {
             pass += 1
         }
 
-        var avgTotal: Float = 0.0
-
-        if 0 < validSampleCount {
-            let invCount = 1.0 / Float(validSampleCount)
-            avgTotal = sumTotalLoss * invCount
-        }
-
         return EpochResult(
             epoch: epoch,
             totalLoss: sumTotalLoss / Float(max(1, validSampleCount))
@@ -372,13 +365,6 @@ public final class AcousticTrainer: @unchecked Sendable {
             }
 
             bStart = bEnd
-        }
-
-        var avgTotal: Float = 0.0
-
-        if 0 < validSampleCount {
-            let invCount = 1.0 / Float(validSampleCount)
-            avgTotal = sumTotalLoss * invCount
         }
 
         return EpochResult(

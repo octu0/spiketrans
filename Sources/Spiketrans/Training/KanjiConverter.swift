@@ -9,9 +9,24 @@ public struct KanjiConverter: Sendable {
     }
 
     /// 漢字混じり文をクリーンなひらがな発音文字列に変換 (ひらがな・長音・促音・読点・句点のみ抽出)
-    public func convertToHiragana(_ text: String) -> String {
+    /// 形態素単位の表層と読みの組
+    public struct Token: Sendable {
+        public let surface: String
+        public let reading: String
+
+        public init(surface: String, reading: String) {
+            self.surface = surface
+            self.reading = reading
+        }
+    }
+
+    /// テキストを形態素に分割し、表層と読みを同時に取得する。
+    ///
+    /// 読みは形態素解析器が文脈から決めたものを使う。漢字単体から読みを引く
+    /// 静的な対応表では「人」が「ひと」「にん」「じん」のどれになるか決められない。
+    public func tokenize(_ text: String) -> [Token] {
         if text.isEmpty {
-            return ""
+            return []
         }
 
         let loc = Locale(identifier: "ja_JP") as CFLocale
@@ -24,37 +39,59 @@ public struct KanjiConverter: Sendable {
             loc
         )
 
-        var rawHira = ""
+        var tokens: [Token] = []
         while CFStringTokenizerAdvanceToNextToken(tokenizer) != [] {
             let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
-            let sub = nsText.substring(with: NSRange(location: range.location, length: range.length))
-            if let attr = CFStringTokenizerCopyCurrentTokenAttribute(tokenizer, kCFStringTokenizerAttributeLatinTranscription) {
+            let surface = nsText.substring(with: NSRange(location: range.location, length: range.length))
+
+            var reading = ""
+            switch CFStringTokenizerCopyCurrentTokenAttribute(tokenizer, kCFStringTokenizerAttributeLatinTranscription) {
+            case .some(let attr):
                 let latin = attr as! NSString
                 let ms = NSMutableString(string: latin)
                 CFStringTransform(ms as CFMutableString, nil, kCFStringTransformLatinHiragana, false)
-                let hira = normalizeKana(ms as String)
-                rawHira.append(hira)
-            } else {
-                let hira = normalizeKana(sub)
-                rawHira.append(hira)
+                reading = normalizeKana(ms as String)
+            case .none:
+                reading = normalizeKana(surface)
             }
+
+            tokens.append(Token(surface: surface, reading: kanaOnly(reading)))
         }
 
-        // ひらがな・長音・促音・読点・句点のみを抽出 (数字やラテン記号の完全除去)
-        var cleanResult = ""
-        for c in rawHira {
+        return tokens
+    }
+
+    /// ひらがなと長音のみを残す。
+    ///
+    /// 句読点は発音として音声に存在しないため、音響 SNN の教師には含めない。
+    /// 句読点は第2段で語の連接統計から復元する。
+    public func kanaOnly(_ text: String) -> String {
+        var result = ""
+        for c in text {
             let val = c.unicodeScalars.first?.value ?? 0
             switch true {
             case 0x3041 <= val && val <= 0x3096:
-                cleanResult.append(c) // ひらがな
-            case c == "ー", c == "、", c == "。":
-                cleanResult.append(c)
+                result.append(c)
+            case c == "ー":
+                result.append(c)
             default:
                 break
             }
         }
+        return result
+    }
 
-        return cleanResult
+    public func convertToHiragana(_ text: String) -> String {
+        if text.isEmpty {
+            return ""
+        }
+
+        var rawHira = ""
+        for token in tokenize(text) {
+            rawHira.append(token.reading)
+        }
+
+        return kanaOnly(rawHira)
     }
 
     /// カタカナをひらがなに正規化
