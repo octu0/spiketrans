@@ -35,6 +35,8 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
     private var bigramCounts: [String: [String: Int]] = [:]
     /// 語彙数 (平滑化の分母に使う)
     private var vocabularySize: Int = 0
+    /// 読みの長さごとのインデックス。ファジー検索で走査対象を絞るために持つ
+    private var readingsByLength: [Int: [String]] = [:]
     /// 語の直後に読点が続く確率。句読点は音響側に存在しないため連接統計から復元する
     public private(set) var commaAfterRate: [String: Float] = [:]
     /// 文末に付く句読点とその出現率
@@ -75,6 +77,9 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
             list.append(entry)
         }
 
+        if entriesByReading[reading] == nil {
+            readingsByLength[reading.count, default: []].append(reading)
+        }
         entriesByReading[reading] = list
         readingTotals[reading, default: 0] += entry.frequency
         surfaceTotals[entry.surface, default: 0] += entry.frequency
@@ -216,26 +221,60 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
     }
 
 
-    /// 音素調音距離テーブルによるファジー検索 (Phonetic Distance <= maxPhoneticDist)
+    /// 音素調音距離によるファジー検索
+    ///
+    /// 挿入・削除のコストは 1 文字 0.8 なので、許容距離が 0.8 未満なら
+    /// 候補は読み長が一致するものだけに限られる。その場合は対角比較で
+    /// 距離を求められ、コスト超過時点で打ち切れる。
     public func lookupFuzzyPhonetic(reading: String, maxPhoneticDist: Float = 1.25) -> [(entry: KanaKanjiEntry, dist: Float)] {
         var results: [(entry: KanaKanjiEntry, dist: Float)] = []
-        let rLen = reading.count
+        let queryChars = Array(reading)
+        let rLen = queryChars.count
 
-        for (candReading, candEntries) in entriesByReading {
-            let diff = abs(candReading.count - rLen)
-            if 3 < diff {
+        // 走査対象の読み長の範囲。1 文字の挿入/削除で 0.8 かかるため
+        // 許容距離から到達可能な長さ差を求める
+        let maxLengthDiff = Int(maxPhoneticDist / 0.8)
+        var length = rLen - maxLengthDiff
+        while length <= rLen + maxLengthDiff {
+            if length <= 0 {
+                length += 1
                 continue
             }
-
-            let dist = phoneticDistance(reading, candReading)
-            if dist <= maxPhoneticDist {
-                for e in candEntries {
-                    results.append((entry: e, dist: dist))
+            for candReading in readingsByLength[length] ?? [] {
+                var dist: Float = .infinity
+                if length == rLen {
+                    dist = diagonalDistance(queryChars, Array(candReading), limit: maxPhoneticDist)
+                } else {
+                    dist = phoneticDistance(reading, candReading)
+                }
+                if dist <= maxPhoneticDist {
+                    for e in entriesByReading[candReading] ?? [] {
+                        results.append((entry: e, dist: dist))
+                    }
                 }
             }
+            length += 1
         }
 
         return results
+    }
+
+    /// 同じ長さの読み同士を対角整列で比較する。累積コストが limit を超えたら打ち切る。
+    ///
+    /// 挿入・削除が 0.8 なので、limit が 1.6 未満なら対角以外の整列は成立しない。
+    private func diagonalDistance(_ a: [Character], _ b: [Character], limit: Float) -> Float {
+        var total: Float = 0.0
+        var i = 0
+        while i < a.count {
+            if a[i] != b[i] {
+                total += charSubstitutionCost(a[i], b[i])
+                if limit < total {
+                    return .infinity
+                }
+            }
+            i += 1
+        }
+        return total
     }
 
     /// 音素・調音位置類似度に基づく連続編集距離

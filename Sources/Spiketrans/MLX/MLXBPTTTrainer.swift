@@ -188,58 +188,10 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         return trainBatch(featuresBatch: [features], targetsBatch: [targets])
     }
 
-    /// ロジット系列 (フラット [B, T, V]) の 1 サンプル分を対数確率に変換
-    private func logSoftmaxSample(
-        flatLogits: [Float],
-        batchIndex: Int,
-        frameCount: Int,
-        maxT: Int,
-        vocabSize: Int
-    ) -> [[Float]] {
-        var logProbs = [[Float]](
-            repeating: [Float](repeating: 0.0, count: vocabSize),
-            count: frameCount
-        )
-
-        var t = 0
-        while t < frameCount {
-            let base = ((batchIndex * maxT) + t) * vocabSize
-
-            var maxLogit = -Float.greatestFiniteMagnitude
-            var v = 0
-            while v < vocabSize {
-                let x = flatLogits[base + v]
-                if maxLogit < x {
-                    maxLogit = x
-                }
-                v += 1
-            }
-
-            var sumExp: Float = 0.0
-            v = 0
-            while v < vocabSize {
-                sumExp += exp(flatLogits[base + v] - maxLogit)
-                v += 1
-            }
-            let logSumExp = maxLogit + log(sumExp)
-
-            v = 0
-            while v < vocabSize {
-                logProbs[t][v] = flatLogits[base + v] - logSumExp
-                v += 1
-            }
-            t += 1
-        }
-
-        return logProbs
-    }
-
     /// CTC ミニバッチ学習ステップ (GPU)
     ///
-    /// CTC の前向き後ろ向きは Pure Swift の `CTCLossCalculator` で計算し、得られた
-    /// dL/dLogit を `sum(logits * stopGradient(grad))` というサロゲート損失として MLX に注入する。
-    /// このサロゲートのロジットに関する勾配は CTC の真の勾配に一致するため、以降の
-    /// 自動微分でネットワーク全体に正しく逆伝播される。
+    /// CTC の前向き再帰を MLX 演算で構成しているため、フォワードは 1 回で済み、
+    /// ロジットを CPU へ取り出す必要もない。
     ///
     /// - Parameter targetsBatch: フレームに整列していないラベル列 (かな ID 列)。
     public func trainBatchCTC(
@@ -252,28 +204,34 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             return 0.0
         }
 
+        // ラベルが空のサンプルは CTC を定義できないので除外する
+        var validFeatures: [[[Float]]] = []
+        var validTargets: [[Int]] = []
+        var frameCounts: [Int] = []
         var maxT = 0
-        var frameCounts = [Int](repeating: 0, count: bSize)
         var b = 0
         while b < bSize {
-            let c = featuresBatch[b].count
-            frameCounts[b] = c
-            if maxT < c {
-                maxT = c
+            let frames = featuresBatch[b].count
+            if 0 < frames && targetsBatch[b].isEmpty != true {
+                validFeatures.append(featuresBatch[b])
+                validTargets.append(targetsBatch[b])
+                frameCounts.append(frames)
+                if maxT < frames {
+                    maxT = frames
+                }
             }
             b += 1
         }
-        if maxT == 0 {
+        if validFeatures.isEmpty || maxT == 0 {
             return 0.0
         }
 
+        let validCount = validFeatures.count
         let inDim = network.inputDim
-        let vocabSize = network.outputDim
-        var flatFeat = [Float](repeating: 0.0, count: bSize * maxT * inDim)
-
+        var flatFeat = [Float](repeating: 0.0, count: validCount * maxT * inDim)
         b = 0
-        while b < bSize {
-            let fSeq = featuresBatch[b]
+        while b < validCount {
+            let fSeq = validFeatures[b]
             var t = 0
             while t < fSeq.count {
                 let fVec = fSeq[t]
@@ -288,114 +246,23 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             b += 1
         }
 
-        let featArray = MLXArray(flatFeat, [bSize, maxT, inDim])
+        let featArray = MLXArray(flatFeat, [validCount, maxT, inDim])
+        let extTargets = MLXCTCLoss.ExtendedTargets(
+            targetsBatch: validTargets,
+            frameCounts: frameCounts,
+            blankId: blankId
+        )
 
-        // 1. 勾配を取らないフォワードでロジットを求め、CPU 側で CTC の損失と勾配を計算する
-        let probe = logitsBatch(network: network, features: featArray)
-        eval(probe)
-        let flatLogits = probe.asArray(Float.self)
-
-        // CTC の前向き後ろ向きは CPU 律速のためサンプル単位で並列化する。
-        // 各タスクは勾配プレーンの互いに素な区間だけを書くのでロックは不要。
-        let planeSize = bSize * maxT * vocabSize
-
-        final class CTCBuffer: @unchecked Sendable {
-            let plane: UnsafeMutablePointer<Float>
-            let planeSize: Int
-            var losses: [Float]
-            var valid: [Bool]
-
-            init(planeSize: Int, taskCount: Int) {
-                self.planeSize = planeSize
-                let p = UnsafeMutablePointer<Float>.allocate(capacity: planeSize)
-                p.initialize(repeating: 0.0, count: planeSize)
-                self.plane = p
-                self.losses = [Float](repeating: 0.0, count: taskCount)
-                self.valid = [Bool](repeating: false, count: taskCount)
-            }
-
-            func planeArray() -> [Float] {
-                return Array(UnsafeBufferPointer(start: plane, count: planeSize))
-            }
-
-            deinit {
-                plane.deinitialize(count: planeSize)
-                plane.deallocate()
-            }
-        }
-
-        let buffer = CTCBuffer(planeSize: planeSize, taskCount: bSize)
-        let capturedFrameCounts = frameCounts
-        let capturedTargets = targetsBatch
-        let capturedMaxT = maxT
-        let capturedVocab = vocabSize
-
-        DispatchQueue.concurrentPerform(iterations: bSize) { bIdx in
-            let frameCount = capturedFrameCounts[bIdx]
-            let labels = capturedTargets[bIdx]
-            if frameCount <= 0 || labels.isEmpty {
-                return
-            }
-
-            let logProbs = self.logSoftmaxSample(
-                flatLogits: flatLogits,
-                batchIndex: bIdx,
-                frameCount: frameCount,
-                maxT: capturedMaxT,
-                vocabSize: capturedVocab
-            )
-            let ctcCalc = CTCLossCalculator(blankId: blankId)
-            let res = ctcCalc.computeLossAndGradients(logProbs: logProbs, targets: labels)
-
-            buffer.losses[bIdx] = res.loss
-            buffer.valid[bIdx] = true
-
-            if res.gradients.count == frameCount {
-                let dst = buffer.plane
-                var t = 0
-                while t < frameCount {
-                    let row = res.gradients[t]
-                    let offset = ((bIdx * capturedMaxT) + t) * capturedVocab
-                    var v = 0
-                    while v < capturedVocab {
-                        dst[offset + v] = row[v]
-                        v += 1
-                    }
-                    t += 1
-                }
-            }
-        }
-
-        var lossSum: Float = 0.0
-        var validCount: Float = 0.0
-        var idx = 0
-        while idx < bSize {
-            if buffer.valid[idx] {
-                lossSum += buffer.losses[idx]
-                validCount += 1.0
-            }
-            idx += 1
-        }
-
-        if validCount == 0.0 {
-            return 0.0
-        }
-
-        let invValid = 1.0 / validCount
-        let gradArray = MLXArray(buffer.planeArray(), [bSize, maxT, vocabSize]) * invValid
-        eval(gradArray)
-
-        // 2. サロゲート損失で自動微分し、ネットワーク重みを更新する
         let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
             let logits = self.logitsBatch(network: model, features: arrays[0])
-            return [sum(logits * gradArray)]
+            return [MLXCTCLoss.loss(logits: logits, targets: extTargets)]
         }
 
-        let (_, grads) = lg(network, [featArray])
+        let (lossValues, grads) = lg(network, [featArray])
         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
         optimizer.update(model: network, gradients: clippedGrads)
-        eval(network)
+        eval(network, lossValues)
 
-        return lossSum * invValid
+        return lossValues[0].item(Float.self)
     }
 }
