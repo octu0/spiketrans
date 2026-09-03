@@ -1,5 +1,8 @@
 import Foundation
 
+/// 句読点として扱う文字。第2段の各所で共有する
+let punctuationCharacters: Set<Character> = ["、", "。", "，", "．"]
+
 /// 形態素・語彙エントリ
 public struct KanaKanjiEntry: Sendable {
     public let reading: String       // ひらがな読み (例: "とつぜん", "ぱにくって")
@@ -20,11 +23,8 @@ public struct KanaKanjiEntry: Sendable {
 /// スコアは対数確率で表す。表層の出現回数から P(表層 | 読み) を、
 /// 語の連接回数から P(表層 | 直前の表層) を推定する。
 public final class KanaKanjiDictionary: @unchecked Sendable {
-    /// 句読点として扱う文字
-    static let punctuation: Set<Character> = ["、", "。", "，", "．"]
-
-    /// Bigram の加算平滑化パラメータ
-    private let bigramSmoothing: Float = 0.1
+    /// Bigram と Unigram の補間係数 (1.0 で Bigram のみ)
+    private let bigramInterpolation: Float = 0.7
 
     private var entriesByReading: [String: [KanaKanjiEntry]] = [:]
     /// 読みごとの総出現回数
@@ -35,8 +35,14 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
     private var bigramCounts: [String: [String: Int]] = [:]
     /// 語彙数 (平滑化の分母に使う)
     private var vocabularySize: Int = 0
-    /// 読みの長さごとのインデックス。ファジー検索で走査対象を絞るために持つ
+    /// 読みの長さごとのインデックス
     private var readingsByLength: [Int: [String]] = [:]
+    /// 1 文字をワイルドカードにしたキーから読みを引くインデックス。
+    /// 許容距離が 0.8 未満なら候補は「同じ長さで 1 文字だけ異なる読み」に限られるため、
+    /// 辞書を走査せず定数個のハッシュ参照で候補を絞れる。
+    private var oneSubstitutionIndex: [String: [String]] = [:]
+    /// 全トークンの出現回数
+    private var totalTokens: Int = 0
     /// 語の直後に読点が続く確率。句読点は音響側に存在しないため連接統計から復元する
     public private(set) var commaAfterRate: [String: Float] = [:]
     /// 文末に付く句読点とその出現率
@@ -79,10 +85,14 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
 
         if entriesByReading[reading] == nil {
             readingsByLength[reading.count, default: []].append(reading)
+            for key in Self.wildcardKeys(for: reading) {
+                oneSubstitutionIndex[key, default: []].append(reading)
+            }
         }
         entriesByReading[reading] = list
         readingTotals[reading, default: 0] += entry.frequency
         surfaceTotals[entry.surface, default: 0] += entry.frequency
+        totalTokens += entry.frequency
     }
 
     /// 語の連接を記録
@@ -92,33 +102,70 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
         bigramCounts[from] = map
     }
 
-    /// log P(表層 | 読み)
-    public func logEmission(reading: String, surface: String) -> Float {
-        let total = readingTotals[reading] ?? 0
-        if total <= 0 {
+    /// 1 文字をワイルドカードに置き換えたキー列
+    static func wildcardKeys(for reading: String) -> [String] {
+        let chars = Array(reading)
+        var keys: [String] = []
+        keys.reserveCapacity(chars.count)
+        var i = 0
+        while i < chars.count {
+            var key = ""
+            var j = 0
+            while j < chars.count {
+                if j == i {
+                    key.append("*")
+                } else {
+                    key.append(chars[j])
+                }
+                j += 1
+            }
+            keys.append(key)
+            i += 1
+        }
+        return keys
+    }
+
+    /// log P(読み | 表層)
+    ///
+    /// 語がその読みで現れる割合。表層が決まれば読みはほぼ一意なので通常 0 に近い。
+    public func logReadingGivenSurface(reading: String, surface: String) -> Float {
+        let surfaceTotal = surfaceTotals[surface] ?? 0
+        if surfaceTotal <= 0 {
             return -.infinity
         }
-        var surfaceCount = 0
+        var pairCount = 0
         for e in entriesByReading[reading] ?? [] {
             if e.surface == surface {
-                surfaceCount = e.frequency
+                pairCount = e.frequency
                 break
             }
         }
-        if surfaceCount <= 0 {
+        if pairCount <= 0 {
             return -.infinity
         }
-        return log(Float(surfaceCount) / Float(total))
+        return log(Float(pairCount) / Float(surfaceTotal))
     }
 
-    /// log P(表層 | 直前の表層)。加算平滑化のため未観測の連接でも有限値を返す
+    /// log P(表層 | 直前の表層)
+    ///
+    /// Bigram と Unigram の補間平滑化。未観測の連接でも Unigram に退避するため、
+    /// 加算平滑化のように全ての未観測連接が同じ値に張り付くことがない。
     public func logBigram(from: String, to: String) -> Float {
-        let v = Float(max(1, vocabularySize))
+        let total = Float(max(1, totalTokens))
+        let unigram = Float(surfaceTotals[to] ?? 0) / total
+
         let prevTotal = Float(surfaceTotals[from] ?? 0)
-        let pairCount = Float(bigramCounts[from]?[to] ?? 0)
-        let numerator = pairCount + bigramSmoothing
-        let denominator = prevTotal + (bigramSmoothing * v)
-        return log(numerator / denominator)
+        var bigram: Float = 0.0
+        if 0 < prevTotal {
+            bigram = Float(bigramCounts[from]?[to] ?? 0) / prevTotal
+        }
+
+        let mixed = (bigramInterpolation * bigram) + ((1.0 - bigramInterpolation) * unigram)
+        if mixed <= 0.0 {
+            // 辞書に存在しない語への遷移
+            return log(1.0 / (total * total))
+        }
+        return log(mixed)
     }
 
     /// 読み完全一致の候補を取得
@@ -144,7 +191,7 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
             if trimmed.isEmpty != true {
                 sentenceCount += 1
                 if let last = trimmed.last {
-                    if Self.punctuation.contains(last) {
+                    if punctuationCharacters.contains(last) {
                         finalPunctCounts[last, default: 0] += 1
                     }
                 }
@@ -161,7 +208,7 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
                 // 句読点トークンは読みを持たない。直前の語との連接として記録する
                 if surface.count == 1 {
                     if let ch = surface.first {
-                        if Self.punctuation.contains(ch) {
+                        if punctuationCharacters.contains(ch) {
                             switch lastContentWord {
                             case .some(let w):
                                 if ch == "、" {
@@ -231,8 +278,29 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
         let queryChars = Array(reading)
         let rLen = queryChars.count
 
-        // 走査対象の読み長の範囲。1 文字の挿入/削除で 0.8 かかるため
-        // 許容距離から到達可能な長さ差を求める
+        // 挿入・削除は 1 文字 0.8 かかるため、許容距離が 0.8 未満なら
+        // 候補は「同じ長さで 1 文字だけ異なる読み」に限られる。
+        // その場合はワイルドカード索引で候補を直接引ける。
+        if maxPhoneticDist < 0.8 {
+            var seen = Set<String>()
+            for key in Self.wildcardKeys(for: reading) {
+                for candReading in oneSubstitutionIndex[key] ?? [] {
+                    if candReading == reading || seen.contains(candReading) {
+                        continue
+                    }
+                    seen.insert(candReading)
+                    let dist = diagonalDistance(queryChars, Array(candReading), limit: maxPhoneticDist)
+                    if dist <= maxPhoneticDist {
+                        for e in entriesByReading[candReading] ?? [] {
+                            results.append((entry: e, dist: dist))
+                        }
+                    }
+                }
+            }
+            return results
+        }
+
+        // 許容距離が大きい場合は長さ範囲を絞って編集距離で評価する
         let maxLengthDiff = Int(maxPhoneticDist / 0.8)
         var length = rLen - maxLengthDiff
         while length <= rLen + maxLengthDiff {
@@ -241,12 +309,7 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
                 continue
             }
             for candReading in readingsByLength[length] ?? [] {
-                var dist: Float = .infinity
-                if length == rLen {
-                    dist = diagonalDistance(queryChars, Array(candReading), limit: maxPhoneticDist)
-                } else {
-                    dist = phoneticDistance(reading, candReading)
-                }
+                let dist = phoneticDistance(reading, candReading)
                 if dist <= maxPhoneticDist {
                     for e in entriesByReading[candReading] ?? [] {
                         results.append((entry: e, dist: dist))
@@ -362,6 +425,22 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
 
 /// 第2段 堅牢なかな漢字ビーム探索統合デコーダ (音素調音距離 ＆ Bigram 連接確率大域最適化)
 public final class KanaKanjiDecoder: @unchecked Sendable {
+    /// 辞書引きの最大読み長
+    private static let maxWordLength = 12
+    /// ファジー一致を許す最小読み長
+    private static let minFuzzyLength = 3
+    /// ファジー一致で許容する最大調音距離
+    private static let maxFuzzyDistance: Float = 0.6
+    /// 調音距離 1 あたりのコスト。
+    /// かなの取り違えが起きる確率を対数で表す。完全一致を明確に優先させる。
+    private static let fuzzyDistanceCost: Float = -12.0
+    /// 辞書に無いかなを 1 文字そのまま通すときの対数確率
+    private static let unknownCharLogProb: Float = -12.0
+    /// Viterbi のビーム幅。
+    /// スコアが直前の語に依存するため位置ごとに 1 状態では厳密解にならない。
+    /// 複数状態を保持することで、直前の語が異なる有望な経路を残す。
+    private static let defaultBeamWidth = 5
+
     public let dictionary: KanaKanjiDictionary
     public let languageDecoder: LanguageDecoder?
     /// 言語 SNN に入力するかな側の語彙 (languageDecoder 併用時に必須)
@@ -375,6 +454,9 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
     public let commaThreshold: Float
     /// 文末句読点を付ける出現率の閾値
     public let sentenceFinalThreshold: Float
+
+    /// 直近の decode で選ばれた区間の内訳 (診断用)
+    public private(set) var lastTrace: [TraceSegment] = []
 
     public init(
         dictionary: KanaKanjiDictionary,
@@ -476,69 +558,53 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
         }
     }
 
-    /// 音響 SNN の出力かな文字列から Viterbi DP 大域最適化により漢字かな混じり文を復元
-    public func decode(kanaText: String) -> String {
-        if kanaText.isEmpty {
-            return ""
-        }
+    /// K-best 候補とそのスコア
+    public struct Candidate: Sendable {
+        public let text: String
+        public let score: Float
+    }
 
+    /// 上位 K 件の候補を返す。
+    ///
+    /// 言語モデルによる再スコアリングの入力に使う。各位置で上位 K 状態を保持する
+    /// ビーム付き Viterbi で、K = 1 なら通常の Viterbi と一致する。
+    public func decodeNBest(kanaText: String, beamWidth: Int) -> [Candidate] {
+        if kanaText.isEmpty {
+            return []
+        }
+        let k = max(1, beamWidth)
         let chars = Array(kanaText)
         let n = chars.count
 
-        // 第2段 言語 SNN による、かな 1 文字ごとの漢字予測 (DP の区間スコアに加算)
-        var lmHints: [Character?] = []
-        switch languageDecoder {
-        case .some(let lmDecoder):
-            switch kanaVocabulary {
-            case .some(let kanaVocab):
-                if 0.0 < languageBonus {
-                    lmHints = lmDecoder.predictKanjiPerKana(
-                        kanaText: kanaText,
-                        kanaVocabulary: kanaVocab
-                    )
-                }
-            case .none:
-                break
-            }
-        case .none:
-            break
-        }
-
-        struct DPState {
+        struct BeamState {
             var score: Float
             var text: String
             var lastWord: String
-            // トレース用: この状態に至った直前位置・出力・経路種別・区間スコア
-            var prevIndex: Int
-            var emitted: String
-            var kind: String
-            var stepScore: Float
+            var trace: [TraceSegment]
         }
 
-        var dp = [DPState](
-            repeating: DPState(
-                score: -.infinity, text: "", lastWord: "",
-                prevIndex: -1, emitted: "", kind: "", stepScore: 0.0
-            ),
-            count: n + 1
-        )
-        dp[0] = DPState(
-            score: 0.0, text: "", lastWord: "",
-            prevIndex: -1, emitted: "", kind: "start", stepScore: 0.0
-        )
+        var beams = [[BeamState]](repeating: [], count: n + 1)
+        beams[0] = [BeamState(score: 0.0, text: "", lastWord: "", trace: [])]
+
+        /// 候補を追加し、上位 K 件だけ残す
+        func push(_ index: Int, _ state: BeamState) {
+            var list = beams[index]
+            list.append(state)
+            list.sort { b, a in a.score < b.score }
+            if k < list.count {
+                list.removeLast(list.count - k)
+            }
+            beams[index] = list
+        }
 
         var i = 0
         while i < n {
-            if dp[i].score.isInfinite {
+            if beams[i].isEmpty {
                 i += 1
                 continue
             }
+            let currentStates = beams[i]
 
-            let curScore = dp[i].score
-            let curText = dp[i].text
-            let curLastWord = dp[i].lastWord
-
-            // 1. 辞書引きによる語の遷移。助詞も辞書に載っているため特別扱いはしない
             let maxL = min(Self.maxWordLength, n - i)
             var l = maxL
             while 1 <= l {
@@ -546,60 +612,49 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
                 let exactEntries = dictionary.lookupExact(reading: subStr)
 
                 for entry in exactEntries {
-                    let emissionLogProb = dictionary.logEmission(reading: subStr, surface: entry.surface)
+                    let emissionLogProb = dictionary.logReadingGivenSurface(reading: subStr, surface: entry.surface)
                     if emissionLogProb.isFinite != true {
                         continue
                     }
-                    let bigramLogProb = dictionary.logBigram(from: curLastWord, to: entry.surface)
-                    let lmScore = languageBonus * languageAgreement(
-                        surface: entry.surface,
-                        hints: lmHints,
-                        start: i,
-                        end: i + l
-                    )
-                    let nextScore = curScore + emissionLogProb + (bigramWeight * bigramLogProb) + lmScore
-
-                    if dp[i + l].score < nextScore {
-                        let emitted = entry.surface + commaSuffix(after: entry.surface)
-                        dp[i + l] = DPState(
-                            score: nextScore, text: curText + emitted, lastWord: entry.surface,
-                            prevIndex: i, emitted: emitted, kind: "完全一致",
-                            stepScore: nextScore - curScore
-                        )
+                    let emitted = entry.surface + commaSuffix(after: entry.surface)
+                    for st in currentStates {
+                        let bigramLogProb = dictionary.logBigram(from: st.lastWord, to: entry.surface)
+                        let stepScore = emissionLogProb + (bigramWeight * bigramLogProb)
+                        push(i + l, BeamState(
+                            score: st.score + stepScore,
+                            text: st.text + emitted,
+                            lastWord: entry.surface,
+                            trace: st.trace + [TraceSegment(
+                                kanaRange: subStr, emitted: emitted,
+                                kind: "完全一致", stepScore: stepScore
+                            )]
+                        ))
                     }
                 }
 
-                // 2. 完全一致が無い区間のみ、音素調音距離によるファジー一致を許す。
-                //    第1段のかな誤りを吸収するための経路で、距離に比例したコストを課す。
                 if Self.minFuzzyLength <= l && exactEntries.isEmpty {
                     let fuzzyList = dictionary.lookupFuzzyPhonetic(reading: subStr, maxPhoneticDist: Self.maxFuzzyDistance)
                     for item in fuzzyList {
                         let entry = item.entry
-                        let emissionLogProb = dictionary.logEmission(reading: entry.reading, surface: entry.surface)
+                        let emissionLogProb = dictionary.logReadingGivenSurface(reading: entry.reading, surface: entry.surface)
                         if emissionLogProb.isFinite != true {
                             continue
                         }
-                        let bigramLogProb = dictionary.logBigram(from: curLastWord, to: entry.surface)
-                        let lmScore = languageBonus * languageAgreement(
-                            surface: entry.surface,
-                            hints: lmHints,
-                            start: i,
-                            end: i + l
-                        )
-                        let nextScore = curScore
-                            + emissionLogProb
-                            + (bigramWeight * bigramLogProb)
-                            + (Self.fuzzyDistanceCost * item.dist)
-                            + lmScore
-
-                        if dp[i + l].score < nextScore {
-                            let emitted = entry.surface + commaSuffix(after: entry.surface)
-                            dp[i + l] = DPState(
-                                score: nextScore, text: curText + emitted, lastWord: entry.surface,
-                                prevIndex: i, emitted: emitted,
-                                kind: "ファジー(距離 \(String(format: "%.2f", item.dist)))",
-                                stepScore: nextScore - curScore
-                            )
+                        let emitted = entry.surface + commaSuffix(after: entry.surface)
+                        let fuzzyCost = Self.fuzzyDistanceCost * item.dist
+                        for st in currentStates {
+                            let bigramLogProb = dictionary.logBigram(from: st.lastWord, to: entry.surface)
+                            let stepScore = emissionLogProb + (bigramWeight * bigramLogProb) + fuzzyCost
+                            push(i + l, BeamState(
+                                score: st.score + stepScore,
+                                text: st.text + emitted,
+                                lastWord: entry.surface,
+                                trace: st.trace + [TraceSegment(
+                                    kanaRange: subStr, emitted: emitted,
+                                    kind: "ファジー(距離 \(String(format: "%.2f", item.dist)))",
+                                    stepScore: stepScore
+                                )]
+                            ))
                         }
                     }
                 }
@@ -607,62 +662,48 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
                 l -= 1
             }
 
-            // 3. 辞書に無いかなは 1 文字そのまま通す。語を 1 つ使うより高コストにする
             let singleChar = String(chars[i])
-            let passScore = curScore + Self.unknownCharLogProb
-            if dp[i + 1].score < passScore {
-                dp[i + 1] = DPState(
-                    score: passScore, text: curText + singleChar, lastWord: singleChar,
-                    prevIndex: i, emitted: singleChar, kind: "1文字スルー",
-                    stepScore: Self.unknownCharLogProb
-                )
+            for st in currentStates {
+                push(i + 1, BeamState(
+                    score: st.score + Self.unknownCharLogProb,
+                    text: st.text + singleChar,
+                    lastWord: singleChar,
+                    trace: st.trace + [TraceSegment(
+                        kanaRange: singleChar, emitted: singleChar,
+                        kind: "1文字スルー", stepScore: Self.unknownCharLogProb
+                    )]
+                ))
             }
 
             i += 1
         }
 
-        // 選択経路を復元
-        var trace: [TraceSegment] = []
-        var walk = n
-        while 0 < walk {
-            let st = dp[walk]
-            if st.prevIndex < 0 {
-                break
-            }
-            trace.append(TraceSegment(
-                kanaRange: String(chars[st.prevIndex..<walk]),
-                emitted: st.emitted,
-                kind: st.kind,
-                stepScore: st.stepScore
-            ))
-            walk = st.prevIndex
+        let suffix = sentenceFinalSuffix()
+        if let best = beams[n].first {
+            lastTrace = best.trace
         }
-        lastTrace = trace.reversed()
-
-        var restored = dp[n].text
-        // 文末の句読点が重複しないように整える
-        if let last = restored.last {
-            if Self.punctuationChars.contains(last) {
-                restored.removeLast()
+        return beams[n].map { st in
+            var restored = st.text
+            if let last = restored.last {
+                if punctuationCharacters.contains(last) {
+                    restored.removeLast()
+                }
             }
+            return Candidate(text: restored + suffix, score: st.score)
         }
-        return restored + sentenceFinalSuffix()
     }
 
-    /// 句読点として扱う文字
-    private static let punctuationChars: Set<Character> = ["、", "。", "，", "．"]
-
-    /// 辞書引きの最大読み長
-    private static let maxWordLength = 12
-    /// ファジー一致を許す最小読み長
-    private static let minFuzzyLength = 3
-    /// ファジー一致で許容する最大調音距離
-    private static let maxFuzzyDistance: Float = 0.6
-    /// 調音距離 1 あたりのコスト (対数確率に加算する負の値)
-    private static let fuzzyDistanceCost: Float = -4.0
-    /// 辞書に無いかなを 1 文字そのまま通すときの対数確率
-    private static let unknownCharLogProb: Float = -12.0
-
-    /// 直近の decode で選ばれた区間の内訳 (診断用)
-    public private(set) var lastTrace: [TraceSegment] = []
+    /// 音響 SNN の出力かな文字列から漢字かな混じり文を復元する
+    ///
+    /// スコアが直前の語に依存するため、位置ごとに 1 状態だけ残す Viterbi では
+    /// 厳密解にならない。ビーム付き探索の最良候補を返す。
+    public func decode(kanaText: String) -> String {
+        let candidates = decodeNBest(kanaText: kanaText, beamWidth: Self.defaultBeamWidth)
+        switch candidates.first {
+        case .some(let best):
+            return best.text
+        case .none:
+            return ""
+        }
+    }
 }

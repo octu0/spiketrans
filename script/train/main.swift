@@ -42,14 +42,14 @@ enum Defaults {
     static let sliceWeightHigh: Float = 1.0
 
     /// LIF 設定。ALIF (gamma > 0) は損失・CER とも悪化したため無効。
-    static let lifConfig = LIFConfig(beta: 0.92, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
+    static let lifConfig = LIFConfig(beta: 0.80, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
 
     /// High の事後確率を Base/Middle へ蒸留する重み。
     /// 読み出し行列を共有したまま、High が獲得したアライメントを小スライスへ伝える。
     static let distillWeight: Float = 1.0
 
     /// N エポックごとの重み書き出し
-    static let checkpointEvery = 100
+    static let checkpointEvery = 10
 
     /// ミニバッチサイズ
     static let batchSize = 16
@@ -59,8 +59,19 @@ enum Defaults {
     static let languageBonus: Float = 0.0
 }
 
+/// 並列評価の既定ワーカー数は P コア数。静的分割で E コアを混ぜると
+/// 遅いワーカーが末尾まで残り、全体が P コアのみより遅くなる
+func performanceCoreCount() -> Int {
+    var count: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    if sysctlbyname("hw.perflevel0.logicalcpu", &count, &size, nil, 0) == 0 && 0 < count {
+        return Int(count)
+    }
+    return ProcessInfo.processInfo.activeProcessorCount
+}
+
 // 1. コマンドライン引数の解析
-var numWorkers = ProcessInfo.processInfo.activeProcessorCount
+var numWorkers = performanceCoreCount()
 var epochs = 20
 var maxTrainSamples: Int? = nil
 var datasetPath = ""
@@ -267,7 +278,7 @@ let trainConfig = TrainingConfig(
 let acousticInputDim = Defaults.acousticInputDim
 print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
 
-let acousticLIFConfig = Defaults.lifConfig
+print("第1段 LIF: beta = \(Defaults.lifConfig.beta)")
 
 let trainer = Trainer(
     acousticNetwork: SpikingNetwork(
@@ -275,7 +286,7 @@ let trainer = Trainer(
         maxHiddenDim: Defaults.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
         timeSteps: 4,
-        lifConfig: acousticLIFConfig
+        lifConfig: Defaults.lifConfig
     ),
     languageNetwork: SpikingNetwork(
         inputDim: 128,
@@ -926,79 +937,86 @@ let evalPairs = rawPairs
 let evalKanjiConverter = KanjiConverter()
 let evalFrameStack = Defaults.frameStack
 
-print("全 \(rawPairs.count) 件の WAV 読み込み・マルチスレッド並列推論実行中...")
-DispatchQueue.concurrentPerform(iterations: evalPairs.count) { idx in
-    let pair = evalPairs[idx]
-    let wavPath = (wavDir as NSString).appendingPathComponent("\(pair.fileId).wav")
-    if FileManager.default.fileExists(atPath: wavPath) != true {
-        return
+let evalWorkers = max(1, numWorkers)
+print("全 \(rawPairs.count) 件の WAV 読み込み・並列推論実行中 (\(evalWorkers) ワーカー)...")
+let evalStartTime = Date()
+DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
+    // 第2段デコーダはワーカー内で使い回し、発話ごとの再確保を避ける
+    let goldDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
+    func processUtterance(_ idx: Int) {
+        let pair = evalPairs[idx]
+        let wavPath = (wavDir as NSString).appendingPathComponent("\(pair.fileId).wav")
+        if FileManager.default.fileExists(atPath: wavPath) != true {
+            return
+        }
+        guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
+              let wavData = try? parser.parse(bytes: [UInt8](fileData)) else {
+            return
+        }
+
+        let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
+        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: evalFrameStack)
+        let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
+        let isTrain = idx < evalLimit
+
+        // 正解のかな読み (第1段の評価基準)
+        let targetKana = evalKanjiConverter.convertToHiragana(pair.text)
+
+        func evaluateUtterance() -> EvalResult {
+            let res = trainer.transcribeTwoStage(
+                featuresSeq: features,
+                kanjiVocabulary: textVocabulary,
+                dictionary: kanaKanjiDict,
+                minDurationFrames: 3,
+                minConfidence: 0.05,
+                boundaries: boundaries,
+                useCTC: true,
+                languageBonus: evalLanguageBonus
+            )
+            let dist = levenshteinDistance(pair.text, res.kanji)
+            let cer = Float(dist) / Float(max(1, pair.text.count))
+            let kanaDist = levenshteinDistance(targetKana, res.kana)
+            let kanaCer = Float(kanaDist) / Float(max(1, targetKana.count))
+
+            // 第2段単体の実力: 正解かなを入力したときの漢字復元
+            let goldKanji = goldDecoder.decode(kanaText: targetKana)
+            let goldDist = levenshteinDistance(pair.text, goldKanji)
+            let goldCer = Float(goldDist) / Float(max(1, pair.text.count))
+
+            let targetNoPunct = stripPunctuation(pair.text)
+            let goldNoPunct = stripPunctuation(goldKanji)
+            let goldDistNoPunct = levenshteinDistance(targetNoPunct, goldNoPunct)
+            let goldCerNoPunct = Float(goldDistNoPunct) / Float(max(1, targetNoPunct.count))
+
+            return EvalResult(
+                index: idx + 1,
+                fileId: pair.fileId,
+                targetText: pair.text,
+                predText: res.kanji,
+                editDistance: dist,
+                cer: cer,
+                isExact: pair.text == res.kanji,
+                isTrain: isTrain,
+                targetKana: targetKana,
+                predKana: res.kana,
+                kanaCer: kanaCer,
+                goldKanaKanji: goldKanji,
+                goldKanaKanjiCer: goldCer,
+                goldKanaKanjiCerNoPunct: goldCerNoPunct,
+                goldExactNoPunct: targetNoPunct == goldNoPunct
+            )
+        }
+
+        evalBuffer.results[idx] = evaluateUtterance()
+        evalBuffer.valid[idx] = true
     }
-    guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
-          let wavData = try? parser.parse(bytes: [UInt8](fileData)) else {
-        return
+    var idx = worker
+    while idx < evalPairs.count {
+        processUtterance(idx)
+        idx += evalWorkers
     }
-
-    let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
-    let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: evalFrameStack)
-    let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
-    let isTrain = idx < evalLimit
-
-    // 正解のかな読み (第1段の評価基準)
-    let targetKana = evalKanjiConverter.convertToHiragana(pair.text)
-
-    // 3 スライスすべてを評価する。
-    // Base(128) は「多少の誤字は許容するが文字起こしとして成立する」ことが要件、
-    // Middle(512) はその中間、High(1024) は最高精度が目的のため、
-    // どのスライスで音素が正しく発火し始めるかを比較できるようにする。
-    func evaluateUtterance() -> EvalResult {
-        let res = trainer.transcribeTwoStage(
-            featuresSeq: features,
-            kanjiVocabulary: textVocabulary,
-            dictionary: kanaKanjiDict,
-            minDurationFrames: 3,
-            minConfidence: 0.05,
-            boundaries: boundaries,
-            useCTC: true,
-            languageBonus: evalLanguageBonus
-        )
-        let dist = levenshteinDistance(pair.text, res.kanji)
-        let cer = Float(dist) / Float(max(1, pair.text.count))
-        let kanaDist = levenshteinDistance(targetKana, res.kana)
-        let kanaCer = Float(kanaDist) / Float(max(1, targetKana.count))
-
-        // 第2段単体の実力: 正解かなを入力したときの漢字復元
-        let goldDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
-        let goldKanji = goldDecoder.decode(kanaText: targetKana)
-        let goldDist = levenshteinDistance(pair.text, goldKanji)
-        let goldCer = Float(goldDist) / Float(max(1, pair.text.count))
-
-        let targetNoPunct = stripPunctuation(pair.text)
-        let goldNoPunct = stripPunctuation(goldKanji)
-        let goldDistNoPunct = levenshteinDistance(targetNoPunct, goldNoPunct)
-        let goldCerNoPunct = Float(goldDistNoPunct) / Float(max(1, targetNoPunct.count))
-
-        return EvalResult(
-            index: idx + 1,
-            fileId: pair.fileId,
-            targetText: pair.text,
-            predText: res.kanji,
-            editDistance: dist,
-            cer: cer,
-            isExact: pair.text == res.kanji,
-            isTrain: isTrain,
-            targetKana: targetKana,
-            predKana: res.kana,
-            kanaCer: kanaCer,
-            goldKanaKanji: goldKanji,
-            goldKanaKanjiCer: goldCer,
-            goldKanaKanjiCerNoPunct: goldCerNoPunct,
-            goldExactNoPunct: targetNoPunct == goldNoPunct
-        )
-    }
-
-    evalBuffer.results[idx] = evaluateUtterance()
-    evalBuffer.valid[idx] = true
 }
+print(String(format: "評価所要時間: %.1f 秒 (%d ワーカー)", Date().timeIntervalSince(evalStartTime), evalWorkers))
 
 var allEval: [EvalResult] = []
 var evIdx = 0

@@ -18,6 +18,10 @@ let package = Package(
         .executable(
             name: "benchmark",
             targets: ["benchmark"]
+        ),
+        .executable(
+            name: "stage2",
+            targets: ["stage2"]
         )
     ],
     dependencies: [
@@ -47,6 +51,14 @@ let package = Package(
             dependencies: ["Spiketrans"],
             path: "script/benchmark",
             exclude: ["run.sh"]
+        ),
+        .executableTarget(
+            name: "stage2",
+            dependencies: [
+                "Spiketrans",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
+            path: "script/stage2"
         ),
         .testTarget(
             name: "SpiketransTests",
