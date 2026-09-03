@@ -80,6 +80,8 @@ var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
 var betaArg: Float = Defaults.lifConfig.beta
 var betaFastArg: Float = Defaults.lifConfig.betaFast
+var extraCorpusPath = ""
+var blankPenaltyArg: Float = 0.35
 let reportPath = "/dev/stdout"
 
 var argIdx = 1
@@ -87,6 +89,18 @@ let args = CommandLine.arguments
 while argIdx < args.count {
     let arg = args[argIdx]
     switch arg {
+    case "--extra-corpus":
+        if (argIdx + 1) < args.count {
+            extraCorpusPath = args[argIdx + 1]
+            argIdx += 1
+        }
+    case "--blank-penalty":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                blankPenaltyArg = max(0.0, min(1.0, val))
+            }
+            argIdx += 1
+        }
     case "--beta":
         if (argIdx + 1) < args.count {
             if let val = Float(args[argIdx + 1]) {
@@ -227,10 +241,24 @@ let textVocabulary = TextVocabulary(corpus: trainTextLines)
 let kanaKanjiDict = KanaKanjiDictionary()
 kanaKanjiDict.buildFromCorpus(rawTexts: trainTextLines)
 
+if extraCorpusPath.isEmpty != true {
+    if let extraContent = try? String(contentsOfFile: extraCorpusPath, encoding: .utf8) {
+        var extraLines: [String] = []
+        for line in extraContent.components(separatedBy: .newlines) {
+            let tr = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if tr.isEmpty != true {
+                extraLines.append(tr)
+            }
+        }
+        kanaKanjiDict.buildFromCorpus(rawTexts: extraLines)
+        print("追加コーパス読込 (第2段辞書統合): \(extraCorpusPath) (\(extraLines.count) 行)")
+    }
+}
+
 print("コーパス総行数: \(textLines.count) 件 (うち学習セット: \(trainTextLines.count) 件)")
 print("第1段 音響 SNN (かな・音素) 語彙数: \(phoneticVocabulary.size) 文字 (学習セットのみ)")
 print("第2段 言語 SNN (漢字かな混じり) 語彙数: \(textVocabulary.size) 文字 (学習セットのみ)")
-print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語 (学習セットのみ)")
+print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語")
 
 // 3. WAV ファイルを読み込んでデータセット構築
 print("\n--- 1. WAV ファイル読み込みとかな・漢字データセット構築 (最大 \(sampleLimit) 件) ---")
@@ -767,7 +795,8 @@ if 0 < dataset.count {
             minDurationFrames: 3,
             minConfidence: 0.05,
             boundaries: bList,
-            useCTC: true
+            useCTC: true,
+            blankPenalty: blankPenaltyArg
         )
         let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
 
@@ -960,6 +989,7 @@ final class BatchEvalBuffer: @unchecked Sendable {
 
 let evalBuffer = BatchEvalBuffer(count: rawPairs.count, dummy: dummyEval)
 let evalLanguageBonus = Defaults.languageBonus
+let evalBlankPenalty = blankPenaltyArg
 let evalLimit = sampleLimit
 let evalPairs = rawPairs
 let evalKanjiConverter = KanjiConverter()
@@ -999,7 +1029,8 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
                 minConfidence: 0.05,
                 boundaries: boundaries,
                 useCTC: true,
-                languageBonus: evalLanguageBonus
+                languageBonus: evalLanguageBonus,
+                blankPenalty: evalBlankPenalty
             )
             let dist = levenshteinDistance(pair.text, res.kanji)
             let cer = Float(dist) / Float(max(1, pair.text.count))

@@ -360,9 +360,13 @@ extension Trainer {
     /// フォワードには Event-driven 疎スパイク推論 (`AcousticDecoder`) を用いる。
     /// BPTT 用の密なフォワードと違い発話ごとの巨大キャッシュを確保せず、
     /// 学習側と同じ sliceNorm を適用するためスライス間のスケールも一致する。
+    /// フォワードには Event-driven 疎スパイク推論 (`AcousticDecoder`) を用いる。
+    /// BPTT 用の密なフォワードと違い発話ごとの巨大キャッシュを確保せず、
+    /// 学習側と同じ sliceNorm を適用するためスライス間のスケールも一致する。
     public func transcribeAcousticCTC(
         featuresSeq: [[Float]],
-        beamWidth: Int = 16
+        beamWidth: Int = 16,
+        blankPenalty: Float = 0.0
     ) -> String {
         if featuresSeq.isEmpty {
             return ""
@@ -372,7 +376,8 @@ extension Trainer {
         let acDecoder = AcousticDecoder(
             network: network,
             vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary
+            fallbackVocabulary: phonemeVocabulary,
+            blankPenalty: blankPenalty
         )
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
@@ -386,6 +391,7 @@ extension Trainer {
         )
 
         let outDim = network.outputDim
+        let discount = max(0.01, 1.0 - blankPenalty)
         var logProbs = [[Float]](
             repeating: [Float](repeating: 0.0, count: outDim),
             count: frameProbs.count
@@ -395,7 +401,11 @@ extension Trainer {
             let probs = frameProbs[f].probabilities
             var c = 0
             while c < outDim {
-                logProbs[f][c] = log(max(1e-30, probs[c]))
+                var p = probs[c]
+                if c == 0 && 0.0 < blankPenalty {
+                    p *= discount
+                }
+                logProbs[f][c] = log(max(1e-30, p))
                 c += 1
             }
             f += 1
@@ -418,11 +428,12 @@ extension Trainer {
         minConfidence: Float = 0.05,
         boundaries: [Int]? = nil,
         useCTC: Bool = false,
-        languageBonus: Float = 4.0
+        languageBonus: Float = 4.0,
+        blankPenalty: Float = 0.0
     ) -> (kana: String, kanji: String) {
         let kanaText: String
         if useCTC {
-            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, beamWidth: 16)
+            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, beamWidth: 16, blankPenalty: blankPenalty)
         } else {
             kanaText = transcribeAcousticDirect(
                 featuresSeq: featuresSeq,

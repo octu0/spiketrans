@@ -85,19 +85,22 @@ public final class AcousticDecoder: @unchecked Sendable {
     public let vocabulary: TextVocabulary
     public let fallbackVocabulary: PhonemeVocabulary
     public let silenceThreshold: Float
+    public let blankPenalty: Float
 
     public init(
         network: SpikingNetwork,
         quantizedEngine: QuantizedEngine? = nil,
         vocabulary: TextVocabulary = TextVocabulary(),
         fallbackVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        silenceThreshold: Float = 0.5
+        silenceThreshold: Float = 0.5,
+        blankPenalty: Float = 0.0
     ) {
         self.network = network
         self.quantizedEngine = quantizedEngine
         self.vocabulary = vocabulary
         self.fallbackVocabulary = fallbackVocabulary
         self.silenceThreshold = silenceThreshold
+        self.blankPenalty = blankPenalty
     }
 
     /// 1フレームの音響特徴量から音素事後確率分布を推定
@@ -140,13 +143,17 @@ public final class AcousticDecoder: @unchecked Sendable {
             )
         }
 
-        // Argmax & Top Probability の探索
+        // Argmax & Top Probability の探索 (Blank Penalty による未発火・脱落の抑制)
         var bestId = 0
         var maxP: Float = -1.0
         var c = 0
         let outDim = network.outputDim
+        let discount = max(0.01, 1.0 - blankPenalty)
         while c < outDim {
-            let p = workspace.probabilities[c]
+            var p = workspace.probabilities[c]
+            if c == 0 && 0.0 < blankPenalty {
+                p *= discount
+            }
             if maxP < p {
                 maxP = p
                 bestId = c
