@@ -82,6 +82,7 @@ var betaArg: Float = Defaults.lifConfig.beta
 var betaFastArg: Float = Defaults.lifConfig.betaFast
 var extraCorpusPath = ""
 var blankPenaltyArg: Float = 0.35
+var bpttWindowArg: Int = Defaults.bpttWindow
 let reportPath = "/dev/stdout"
 
 var argIdx = 1
@@ -89,6 +90,13 @@ let args = CommandLine.arguments
 while argIdx < args.count {
     let arg = args[argIdx]
     switch arg {
+    case "--bptt-window":
+        if (argIdx + 1) < args.count {
+            if let val = Int(args[argIdx + 1]) {
+                bpttWindowArg = max(1, val)
+            }
+            argIdx += 1
+        }
     case "--extra-corpus":
         if (argIdx + 1) < args.count {
             extraCorpusPath = args[argIdx + 1]
@@ -384,13 +392,13 @@ case .none:
         let mlxTrainer = MLXBPTTTrainer(
             network: mlxNet,
             config: trainConfig,
-            bpttWindow: Defaults.bpttWindow,
+            bpttWindow: bpttWindowArg,
             sliceWeightBase: Defaults.sliceWeightBase,
             sliceWeightHigh: Defaults.sliceWeightHigh,
-        distillWeight: Defaults.distillWeight
-    )
-    print("  スライス損失重み (Base/High): \(Defaults.sliceWeightBase) / \(Defaults.sliceWeightHigh)")
-    print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
+            distillWeight: Defaults.distillWeight
+        )
+        print("  スライス損失重み (Base/High): \(Defaults.sliceWeightBase) / \(Defaults.sliceWeightHigh)")
+        print("  切り詰め BPTT 窓幅: \(bpttWindowArg) フレーム")
     print("  High → Base/Middle 蒸留重み: \(Defaults.distillWeight)")
     let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 4)
     print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
@@ -889,6 +897,8 @@ struct EvalResult {
     let editDistance: Int
     let cer: Float
     let isExact: Bool
+    let cerNoPunct: Float
+    let isExactNoPunct: Bool
     let isTrain: Bool
     // 第1段 (音響 SNN) のかな出力。音素が正しく発火しているかの切り分け用
     let targetKana: String
@@ -908,6 +918,10 @@ struct GroupSummary {
     let exactRate: Float
     let meanCer: Float
     let medianCer: Float
+    let exactCountNoPunct: Int
+    let exactRateNoPunct: Float
+    let meanCerNoPunct: Float
+    let medianCerNoPunct: Float
     // 第1段 音響 SNN のかな出力に対する CER (音素発火精度の指標)
     let meanKanaCer: Float
     let medianKanaCer: Float
@@ -923,6 +937,8 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
         return GroupSummary(
             count: 0, exactCount: 0, exactRate: 0.0,
             meanCer: 0.0, medianCer: 0.0,
+            exactCountNoPunct: 0, exactRateNoPunct: 0.0,
+            meanCerNoPunct: 0.0, medianCerNoPunct: 0.0,
             meanKanaCer: 0.0, medianKanaCer: 0.0,
             meanGoldKanjiCer: 0.0, goldExactRate: 0.0,
             meanGoldKanjiCerNoPunct: 0.0, goldExactRateNoPunct: 0.0
@@ -930,23 +946,32 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
     }
     let n = results.count
     var exact = 0
+    var exactNoPunct = 0
     var sumCer: Float = 0.0
+    var sumCerNoPunct: Float = 0.0
     var sumKanaCer: Float = 0.0
     var sumGoldCer: Float = 0.0
     var goldExact = 0
     var sumGoldCerNoPunct: Float = 0.0
     var goldExactNoPunct = 0
     var cers: [Float] = []
+    var cersNoPunct: [Float] = []
     var kanaCers: [Float] = []
     cers.reserveCapacity(n)
+    cersNoPunct.reserveCapacity(n)
     kanaCers.reserveCapacity(n)
 
     for r in results {
         if r.isExact {
             exact += 1
         }
+        if r.isExactNoPunct {
+            exactNoPunct += 1
+        }
         sumCer += r.cer
         cers.append(r.cer)
+        sumCerNoPunct += r.cerNoPunct
+        cersNoPunct.append(r.cerNoPunct)
         sumKanaCer += r.kanaCer
         kanaCers.append(r.kanaCer)
         sumGoldCer += r.goldKanaKanjiCer
@@ -959,6 +984,7 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
         }
     }
     cers.sort()
+    cersNoPunct.sort()
     kanaCers.sort()
     return GroupSummary(
         count: n,
@@ -966,6 +992,10 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
         exactRate: Float(exact) * 100.0 / Float(n),
         meanCer: (sumCer / Float(n)) * 100.0,
         medianCer: cers[n / 2] * 100.0,
+        exactCountNoPunct: exactNoPunct,
+        exactRateNoPunct: Float(exactNoPunct) * 100.0 / Float(n),
+        meanCerNoPunct: (sumCerNoPunct / Float(n)) * 100.0,
+        medianCerNoPunct: cersNoPunct[n / 2] * 100.0,
         meanKanaCer: (sumKanaCer / Float(n)) * 100.0,
         medianKanaCer: kanaCers[n / 2] * 100.0,
         meanGoldKanjiCer: (sumGoldCer / Float(n)) * 100.0,
@@ -976,7 +1006,7 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
 }
 
 let parser = WavParser()
-let dummyEval = EvalResult(index: 0, fileId: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0, goldKanaKanji: "", goldKanaKanjiCer: 1.0, goldKanaKanjiCerNoPunct: 1.0, goldExactNoPunct: false)
+let dummyEval = EvalResult(index: 0, fileId: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, cerNoPunct: 1.0, isExactNoPunct: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0, goldKanaKanji: "", goldKanaKanjiCer: 1.0, goldKanaKanjiCerNoPunct: 1.0, goldExactNoPunct: false)
 
 final class BatchEvalBuffer: @unchecked Sendable {
     var results: [EvalResult]
@@ -1037,12 +1067,17 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
             let kanaDist = levenshteinDistance(targetKana, res.kana)
             let kanaCer = Float(kanaDist) / Float(max(1, targetKana.count))
 
+            // 句読点を除外した推論漢字の CER (純粋な語彙・文脈復元精度)
+            let targetNoPunct = stripPunctuation(pair.text)
+            let predNoPunct = stripPunctuation(res.kanji)
+            let distNoPunct = levenshteinDistance(targetNoPunct, predNoPunct)
+            let cerNoPunct = Float(distNoPunct) / Float(max(1, targetNoPunct.count))
+
             // 第2段単体の実力: 正解かなを入力したときの漢字復元
             let goldKanji = goldDecoder.decode(kanaText: targetKana)
             let goldDist = levenshteinDistance(pair.text, goldKanji)
             let goldCer = Float(goldDist) / Float(max(1, pair.text.count))
 
-            let targetNoPunct = stripPunctuation(pair.text)
             let goldNoPunct = stripPunctuation(goldKanji)
             let goldDistNoPunct = levenshteinDistance(targetNoPunct, goldNoPunct)
             let goldCerNoPunct = Float(goldDistNoPunct) / Float(max(1, targetNoPunct.count))
@@ -1055,6 +1090,8 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
                 editDistance: dist,
                 cer: cer,
                 isExact: pair.text == res.kanji,
+                cerNoPunct: cerNoPunct,
+                isExactNoPunct: targetNoPunct == predNoPunct,
                 isTrain: isTrain,
                 targetKana: targetKana,
                 predKana: res.kana,
@@ -1098,8 +1135,8 @@ func printSliceSummary(
     unseen: GroupSummary
 ) {
     print("\n[\(label)]")
-    print("  • 学習セット (\(train.count)件):   Exact率: \(String(format: "%.1f", train.exactRate))% (\(train.exactCount)/\(train.count)), 漢字CER: \(String(format: "%.2f", train.meanCer))% (中央値 \(String(format: "%.2f", train.medianCer))%), かなCER: \(String(format: "%.2f", train.meanKanaCer))% (中央値 \(String(format: "%.2f", train.medianKanaCer))%)")
-    print("  • 未学習セット (\(unseen.count)件): Exact率: \(String(format: "%.1f", unseen.exactRate))% (\(unseen.exactCount)/\(unseen.count)), 漢字CER: \(String(format: "%.2f", unseen.meanCer))% (中央値 \(String(format: "%.2f", unseen.medianCer))%), かなCER: \(String(format: "%.2f", unseen.meanKanaCer))% (中央値 \(String(format: "%.2f", unseen.medianKanaCer))%)")
+    print("  • 学習セット (\(train.count)件):   Exact率: \(String(format: "%.1f", train.exactRate))% (\(train.exactCount)/\(train.count)) [句読点除外 \(String(format: "%.1f", train.exactRateNoPunct))% (\(train.exactCountNoPunct)/\(train.count))], 漢字CER: \(String(format: "%.2f", train.meanCer))% (句読点除外 \(String(format: "%.2f", train.meanCerNoPunct))%, 中央値 \(String(format: "%.2f", train.medianCerNoPunct))%), かなCER: \(String(format: "%.2f", train.meanKanaCer))% (中央値 \(String(format: "%.2f", train.medianKanaCer))%)")
+    print("  • 未学習セット (\(unseen.count)件): Exact率: \(String(format: "%.1f", unseen.exactRate))% (\(unseen.exactCount)/\(unseen.count)) [句読点除外 \(String(format: "%.1f", unseen.exactRateNoPunct))% (\(unseen.exactCountNoPunct)/\(unseen.count))], 漢字CER: \(String(format: "%.2f", unseen.meanCer))% (句読点除外 \(String(format: "%.2f", unseen.meanCerNoPunct))%, 中央値 \(String(format: "%.2f", unseen.medianCerNoPunct))%), かなCER: \(String(format: "%.2f", unseen.meanKanaCer))% (中央値 \(String(format: "%.2f", unseen.medianKanaCer))%)")
     print("  ── 第2段単体 (正解かな入力時の漢字CER) ──")
     print("     句読点あり  学習: \(String(format: "%.2f", train.meanGoldKanjiCer))% (完全一致 \(String(format: "%.1f", train.goldExactRate))%) / 未学習: \(String(format: "%.2f", unseen.meanGoldKanjiCer))% (完全一致 \(String(format: "%.1f", unseen.goldExactRate))%)")
     print("     句読点除外  学習: \(String(format: "%.2f", train.meanGoldKanjiCerNoPunct))% (完全一致 \(String(format: "%.1f", train.goldExactRateNoPunct))%) / 未学習: \(String(format: "%.2f", unseen.meanGoldKanjiCerNoPunct))% (完全一致 \(String(format: "%.1f", unseen.goldExactRateNoPunct))%)")

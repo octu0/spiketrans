@@ -429,11 +429,10 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
     private static let maxWordLength = 12
     /// ファジー一致を許す最小読み長
     private static let minFuzzyLength = 3
-    /// ファジー一致で許容する最大調音距離
-    private static let maxFuzzyDistance: Float = 0.6
-    /// 調音距離 1 あたりのコスト。
-    /// かなの取り違えが起きる確率を対数で表す。完全一致を明確に優先させる。
-    private static let fuzzyDistanceCost: Float = -12.0
+    /// ファジー一致で許容する最大調音距離 (1.1 で ±1 文字の脱落・挿入や濁音ブレを許容)
+    private static let maxFuzzyDistance: Float = 1.1
+    /// 調音距離 1 あたりのコスト (1文字スルー -12.0 より適度に優遇し単語復元を促進)
+    private static let fuzzyDistanceCost: Float = -4.5
     /// 辞書に無いかなを 1 文字そのまま通すときの対数確率
     private static let unknownCharLogProb: Float = -12.0
     /// Viterbi のビーム幅。
