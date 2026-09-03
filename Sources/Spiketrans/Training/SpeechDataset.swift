@@ -277,13 +277,29 @@ public final class SpeechDataset: @unchecked Sendable {
         )
         var o = 0
         while o < outCount {
+            // Embed-Max: stackフレーム間での各次元の局所ピーク (高周波過渡変化) を算出
+            var maxFeat = [Float](repeating: -Float.greatestFiniteMagnitude, count: frameDim)
             var k = 0
+            while k < stack {
+                let src = featuresSeq[(o * stack) + k]
+                var d = 0
+                while d < frameDim {
+                    if maxFeat[d] < src[d] {
+                        maxFeat[d] = src[d]
+                    }
+                    d += 1
+                }
+                k += 1
+            }
+
+            // 原特徴量に残差として高周波ピークを重畳 (α = 0.5)
+            k = 0
             while k < stack {
                 let src = featuresSeq[(o * stack) + k]
                 let offset = k * frameDim
                 var d = 0
                 while d < frameDim {
-                    out[o][offset + d] = src[d]
+                    out[o][offset + d] = src[d] + (0.5 * maxFeat[d])
                     d += 1
                 }
                 k += 1

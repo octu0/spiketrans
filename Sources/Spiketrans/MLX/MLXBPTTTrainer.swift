@@ -56,7 +56,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
         let tSteps = network.timeSteps
-        let beta = network.lifConfig.beta
+        let betaArray = network.betaArray
         let vTh = network.lifConfig.vTh
         let alpha = network.lifConfig.alpha
         let rho = network.lifConfig.rho
@@ -88,7 +88,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             var step = 0
             while step < tSteps {
                 let rec = matmul(s, network.wRec)
-                let vDecayed = (v * beta) * (1.0 - s)
+                let vDecayed = (v * betaArray) * (1.0 - s)
                 v = clip(vDecayed + current_t + rec, min: -20.0, max: 20.0)
 
                 // 適応型発火閾値 (ALIF: 生物の神経順応)

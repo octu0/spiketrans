@@ -1,13 +1,14 @@
 import Foundation
 
 /// LIF (Leaky Integrate-and-Fire) ニューロン設定パラメータ
-public struct LIFConfig: Sendable, Equatable {
+public struct LIFConfig: Sendable, Equatable, Codable {
     public let beta: Float      // 膜電位減衰率 (0.0 < beta < 1.0)
     public let vTh: Float       // 基本発火閾値 (通常 1.0)
     public let vReset: Float    // リセット電位 (通常 0.0)
     public let alpha: Float     // Surrogate Gradient 鋭さパラメータ (通常 2.0)
     public let rho: Float       // 適応閾値減衰率 (通常 0.85)
     public let gamma: Float     // 発火時閾値上昇幅 (0.0 で標準固定閾値, >0.0 で適応型 ALIF)
+    public let betaFast: Float  // 高周波特化ニューロン用減衰率 (0.0 で単一 beta)
 
     public init(
         beta: Float = 0.8,
@@ -15,7 +16,8 @@ public struct LIFConfig: Sendable, Equatable {
         vReset: Float = 0.0,
         alpha: Float = 2.0,
         rho: Float = 0.85,
-        gamma: Float = 0.0
+        gamma: Float = 0.0,
+        betaFast: Float = 0.0
     ) {
         self.beta = beta
         self.vTh = vTh
@@ -23,6 +25,22 @@ public struct LIFConfig: Sendable, Equatable {
         self.alpha = alpha
         self.rho = rho
         self.gamma = gamma
+        self.betaFast = betaFast
+    }
+
+    /// 各ニューロンごとの減衰率ベクトルを生成 (betaFast > 0 の場合は前半が高周波用)
+    public func betaVector(count: Int) -> [Float] {
+        if betaFast <= 0.0 {
+            return [Float](repeating: beta, count: count)
+        }
+        var vec = [Float](repeating: beta, count: count)
+        let half = count / 2
+        var i = 0
+        while i < half {
+            vec[i] = betaFast
+            i += 1
+        }
+        return vec
     }
 }
 
@@ -86,16 +104,17 @@ public enum LIFNeuronEngine {
         return (vNext: vNext, sNext: sNext)
     }
 
-    /// 1 ニューロンの適応型発火閾値 (ALIF) スカラー更新ステップ
+    /// 1 ニューロンの適応型発火閾値 (ALIF) スカラー更新ステップ (多重時定数対応)
     @inline(__always)
     public static func stepScalarAdaptive(
         config: LIFConfig,
+        beta: Float,
         vPrev: Float,
         sPrev: Float,
         aPrev: Float,
         inputCurrent: Float
     ) -> (vNext: Float, sNext: Float, aNext: Float) {
-        let vDecayed = config.beta * vPrev * (1.0 - sPrev)
+        let vDecayed = beta * vPrev * (1.0 - sPrev)
         let vNext = clampMembrane(vDecayed + inputCurrent)
         let aNext = (config.rho * aPrev) + (config.gamma * sPrev)
         let dynVTh = config.vTh + aNext
@@ -104,6 +123,25 @@ public enum LIFNeuronEngine {
             sNext = 1.0
         }
         return (vNext: vNext, sNext: sNext, aNext: aNext)
+    }
+
+    /// 1 ニューロンの適応型発火閾値 (ALIF) スカラー更新ステップ (単一 beta 互換)
+    @inline(__always)
+    public static func stepScalarAdaptive(
+        config: LIFConfig,
+        vPrev: Float,
+        sPrev: Float,
+        aPrev: Float,
+        inputCurrent: Float
+    ) -> (vNext: Float, sNext: Float, aNext: Float) {
+        return stepScalarAdaptive(
+            config: config,
+            beta: config.beta,
+            vPrev: vPrev,
+            sPrev: sPrev,
+            aPrev: aPrev,
+            inputCurrent: inputCurrent
+        )
     }
 
     /// SIMD8 による 8 ニューロン一括更新ステップ

@@ -41,8 +41,8 @@ enum Defaults {
     static let sliceWeightBase: Float = 0.5
     static let sliceWeightHigh: Float = 1.0
 
-    /// LIF 設定。ALIF (gamma > 0) は損失・CER とも悪化したため無効。
-    static let lifConfig = LIFConfig(beta: 0.80, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
+    /// LIF 設定。Multi-Scale beta (betaFast > 0 で前半が高周波特化、後半が低周波文脈保持)
+    static let lifConfig = LIFConfig(beta: 0.85, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0, betaFast: 0.35)
 
     /// High の事後確率を Base/Middle へ蒸留する重み。
     /// 読み出し行列を共有したまま、High が獲得したアライメントを小スライスへ伝える。
@@ -78,6 +78,8 @@ var datasetPath = ""
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
+var betaArg: Float = Defaults.lifConfig.beta
+var betaFastArg: Float = Defaults.lifConfig.betaFast
 let reportPath = "/dev/stdout"
 
 var argIdx = 1
@@ -85,6 +87,20 @@ let args = CommandLine.arguments
 while argIdx < args.count {
     let arg = args[argIdx]
     switch arg {
+    case "--beta":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                betaArg = val
+            }
+            argIdx += 1
+        }
+    case "--beta-fast":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                betaFastArg = val
+            }
+            argIdx += 1
+        }
     case "-p", "--parallel":
         if (argIdx + 1) < args.count {
             if let val = Int(args[argIdx + 1]) {
@@ -278,7 +294,16 @@ let trainConfig = TrainingConfig(
 let acousticInputDim = Defaults.acousticInputDim
 print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
 
-print("第1段 LIF: beta = \(Defaults.lifConfig.beta)")
+let activeLifConfig = LIFConfig(
+    beta: betaArg,
+    vTh: 1.0,
+    vReset: 0.0,
+    alpha: 2.0,
+    rho: 0.85,
+    gamma: 0.0,
+    betaFast: betaFastArg
+)
+print("第1段 LIF: beta = \(activeLifConfig.beta), betaFast = \(activeLifConfig.betaFast)")
 
 let trainer = Trainer(
     acousticNetwork: SpikingNetwork(
@@ -286,7 +311,7 @@ let trainer = Trainer(
         maxHiddenDim: Defaults.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
         timeSteps: 4,
-        lifConfig: Defaults.lifConfig
+        lifConfig: activeLifConfig
     ),
     languageNetwork: SpikingNetwork(
         inputDim: 128,
@@ -299,7 +324,8 @@ let trainer = Trainer(
     config: trainConfig
 )
 
-if let impPath = importWeightsPath {
+switch importWeightsPath {
+case .some(let impPath):
     print("\n[重み読込] 外部ファイルからモデル重みをインポート中: \(impPath)")
     let impURL = URL(fileURLWithPath: impPath)
     if let wData = try? SpikingNetworkWeights.load(from: impURL) {
@@ -308,30 +334,31 @@ if let impPath = importWeightsPath {
     } else {
         print("  ✕ 重みファイルの読み込みに失敗しました。通常学習を実行します。")
     }
-} else if useGPU {
-    print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(Defaults.batchSize))...")
+case .none:
+    if useGPU {
+        print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(Defaults.batchSize))...")
 
-    // 教師はフレームに整列していないかな ID 列。アライメントは CTC が周辺化する。
-    // 発話フレームを文字数で等分する近似アライメント + 交差エントロピーでは、
-    // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
-    print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
-    let allTargets: [[Int]] = (0..<dataset.count).map { idx in
-        return phoneticVocabulary.textToIds(dataset[idx].hiraganaText)
-    }
+        // 教師はフレームに整列していないかな ID 列。アライメントは CTC が周辺化する。
+        // 発話フレームを文字数で等分する近似アライメント + 交差エントロピーでは、
+        // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
+        print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
+        let allTargets: [[Int]] = (0..<dataset.count).map { idx in
+            return phoneticVocabulary.textToIds(dataset[idx].hiraganaText)
+        }
 
-    let mlxNet = MLXSpikingNetwork(
-        inputDim: acousticInputDim,
-        maxHiddenDim: Defaults.maxHiddenDim,
-        outputDim: phoneticVocabulary.size,
-        timeSteps: 4,
-        lifConfig: trainer.acousticTrainer.network.lifConfig
-    )
-    let mlxTrainer = MLXBPTTTrainer(
-        network: mlxNet,
-        config: trainConfig,
-        bpttWindow: Defaults.bpttWindow,
-        sliceWeightBase: Defaults.sliceWeightBase,
-        sliceWeightHigh: Defaults.sliceWeightHigh,
+        let mlxNet = MLXSpikingNetwork(
+            inputDim: acousticInputDim,
+            maxHiddenDim: Defaults.maxHiddenDim,
+            outputDim: phoneticVocabulary.size,
+            timeSteps: 4,
+            lifConfig: activeLifConfig
+        )
+        let mlxTrainer = MLXBPTTTrainer(
+            network: mlxNet,
+            config: trainConfig,
+            bpttWindow: Defaults.bpttWindow,
+            sliceWeightBase: Defaults.sliceWeightBase,
+            sliceWeightHigh: Defaults.sliceWeightHigh,
         distillWeight: Defaults.distillWeight
     )
     print("  スライス損失重み (Base/High): \(Defaults.sliceWeightBase) / \(Defaults.sliceWeightHigh)")
@@ -453,6 +480,7 @@ if let impPath = importWeightsPath {
     }
     let trainElapsed = CFAbsoluteTimeGetCurrent() - trainStartTime
     print("\nCPU 学習完了 (総所要時間: \(String(format: "%.3f", trainElapsed)) 秒)")
+    }
 }
 
 // 4.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド 8並列)

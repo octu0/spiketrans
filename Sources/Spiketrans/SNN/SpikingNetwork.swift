@@ -8,6 +8,8 @@ public final class SpikingNetwork: @unchecked Sendable {
     public let timeSteps: Int
     /// LIF / ALIF 設定 (重みインポート時に保存済みの値へ追従するため var)
     public private(set) var lifConfig: LIFConfig
+    /// ニューロンごとの膜電位減衰率ベクトル (多重時定数対応)
+    public private(set) var betaVector: [Float]
 
     public let pWIn: Parameter
     public let pWRec: Parameter
@@ -27,6 +29,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         self.outputDim = outputDim
         self.timeSteps = timeSteps
         self.lifConfig = lifConfig
+        self.betaVector = lifConfig.betaVector(count: maxHiddenDim)
 
         // Direct Input Current に最適化した重み初期化
         let scaleIn = sqrt(2.0 / Float(inputDim))
@@ -88,6 +91,7 @@ public final class SpikingNetwork: @unchecked Sendable {
     public func importWeights(from weightsData: SpikingNetworkWeights) {
         // 学習時と推論時で発火ダイナミクスがずれないよう ALIF パラメータごと引き継ぐ
         self.lifConfig = weightsData.lifConfig
+        self.betaVector = self.lifConfig.betaVector(count: maxHiddenDim)
         if weightsData.wIn.count == pWIn.data.count {
             pWIn.data = weightsData.wIn
         }
@@ -172,9 +176,10 @@ public final class SpikingNetwork: @unchecked Sendable {
                     a += 1
                 }
 
-                // ALIF 適応型ステップ
+                // ALIF 適応型ステップ (多重時定数対応)
                 let stepRes = LIFNeuronEngine.stepScalarAdaptive(
                     config: lifConfig,
+                    beta: betaVector[n],
                     vPrev: vPrev[n],
                     sPrev: sPrev[n],
                     aPrev: aPrev[n],

@@ -8,7 +8,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     public let maxHiddenDim: Int
     public let outputDim: Int
     public let timeSteps: Int
-    public let lifConfig: LIFConfig
+    public private(set) var lifConfig: LIFConfig
+    public private(set) var betaArray: MLXArray    // [1, maxHiddenDim]
 
     public var wIn: MLXArray       // [inputDim, maxHiddenDim]
     public var wRec: MLXArray      // [maxHiddenDim, maxHiddenDim]
@@ -29,6 +30,9 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         self.timeSteps = timeSteps
         self.lifConfig = lifConfig
 
+        let betaVec = lifConfig.betaVector(count: maxHiddenDim)
+        self.betaArray = MLXArray(betaVec, [1, maxHiddenDim])
+
         let scaleIn = sqrt(2.0 / Float(inputDim))
         let scaleRec = 0.1 / sqrt(Float(maxHiddenDim))
         let scaleOut = sqrt(2.0 / Float(maxHiddenDim))
@@ -44,6 +48,10 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
 
     /// Pure Swift の SpikingNetworkWeights から重みをインポート
     public func importWeights(from data: SpikingNetworkWeights) {
+        self.lifConfig = data.lifConfig
+        let betaVec = self.lifConfig.betaVector(count: maxHiddenDim)
+        self.betaArray = MLXArray(betaVec, [1, maxHiddenDim])
+
         // wIn: Pure Swift は [maxHiddenDim, inputDim] なので転置して [inputDim, maxHiddenDim] に変換
         let wInArr = MLXArray(data.wIn, [data.maxHiddenDim, data.inputDim]).transposed()
         let wRecArr = MLXArray(data.wRec, [data.maxHiddenDim, data.maxHiddenDim]).transposed()
@@ -57,7 +65,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         self.bH = bHArr
         self.wOut = wOutArr
         self.bOut = bOutArr
-        eval(self.wIn, self.wRec, self.bH, self.wOut, self.bOut)
+        eval(self.wIn, self.wRec, self.bH, self.wOut, self.bOut, self.betaArray)
     }
 
     /// Pure Swift の SpikingNetworkWeights へ重みをエクスポート

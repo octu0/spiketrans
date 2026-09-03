@@ -15,6 +15,7 @@ var nbest = 0              // 0 で N-best 評価なし
 var lmWeightsPath = ""     // 言語モデル重みのパス。無ければ学習して保存する
 var lmEpochs = 60
 var lmWeight: Float = 0.5  // 再スコアリングにおける言語モデルの重み
+var extraCorpusPath = ""   // 追加・汎用コーパステキストのパス
 
 var argIdx = 1
 let args = CommandLine.arguments
@@ -31,6 +32,11 @@ while argIdx < args.count {
             if let v = Int(args[argIdx + 1]) {
                 dictSamples = max(0, v)
             }
+            argIdx += 1
+        }
+    case "--extra-corpus":
+        if (argIdx + 1) < args.count {
+            extraCorpusPath = args[argIdx + 1]
             argIdx += 1
         }
     case "--nbest":
@@ -111,6 +117,20 @@ let dictTexts = Array(texts.prefix(dictLimit))
 let converter = KanjiConverter()
 let dictionary = KanaKanjiDictionary()
 dictionary.buildFromCorpus(rawTexts: dictTexts, converter: converter)
+
+var extraTexts: [String] = []
+if extraCorpusPath.isEmpty != true {
+    if let extraContent = try? String(contentsOfFile: extraCorpusPath, encoding: .utf8) {
+        for line in extraContent.components(separatedBy: .newlines) {
+            let tr = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if tr.isEmpty != true {
+                extraTexts.append(tr)
+            }
+        }
+        dictionary.buildFromCorpus(rawTexts: extraTexts, converter: converter)
+        print("追加コーパス読込: \(extraCorpusPath) (\(extraTexts.count) 行)")
+    }
+}
 
 print("データセット: \(datasetPath)")
 print("総行数: \(texts.count) 行 / 辞書構築: \(dictTexts.count) 行")
@@ -281,7 +301,8 @@ if 0 < nbest {
 
 // 言語モデルによる N-best 再スコアリング
 if lmWeightsPath.isEmpty != true && 0 < nbest {
-    let kanjiVocabulary = TextVocabulary(corpus: dictTexts)
+    let allLmTexts = dictTexts + extraTexts
+    let kanjiVocabulary = TextVocabulary(corpus: allLmTexts)
     let lm = CharLanguageModel.make(vocabulary: kanjiVocabulary)
     let weightsURL = URL(fileURLWithPath: lmWeightsPath)
 
@@ -308,7 +329,7 @@ if lmWeightsPath.isEmpty != true && 0 < nbest {
         let scheduler = CosineLRScheduler(lrMax: 0.003, lrMin: 0.0005, totalEpochs: lmEpochs, warmupEpochs: 3)
 
         var pairs: [(features: [[Float]], targets: [Int])] = []
-        for t in dictTexts {
+        for t in allLmTexts {
             let pair = CharLanguageModel.makeTrainingPair(text: t, vocabulary: kanjiVocabulary)
             if pair.features.isEmpty != true {
                 pairs.append(pair)
@@ -359,14 +380,40 @@ if lmWeightsPath.isEmpty != true && 0 < nbest {
     print("==================================================")
 
     let rsStart = Date()
-    var sumBase: Float = 0.0
-    var sumRescored: Float = 0.0
-    var exactBase = 0
-    var exactRescored = 0
-    var count = 0
+
+    struct RescoreStats {
+        var sumBase: Float = 0.0
+        var sumRescored: Float = 0.0
+        var exactBase: Int = 0
+        var exactRescored: Int = 0
+        var count: Int = 0
+
+        mutating func update(target: String, basePred: String, rescoredPred: String) {
+            let baseCer = Float(levenshtein(target, basePred)) / Float(max(1, target.count))
+            let rescoredCer = Float(levenshtein(target, rescoredPred)) / Float(max(1, target.count))
+            sumBase += baseCer
+            sumRescored += rescoredCer
+            if baseCer == 0.0 { exactBase += 1 }
+            if rescoredCer == 0.0 { exactRescored += 1 }
+            count += 1
+        }
+
+        func report(label: String) {
+            if count <= 0 {
+                return
+            }
+            let nf = Float(count)
+            print("[\(label)] \(count) 件")
+            print("  再スコアリング前  CER: \(String(format: "%.2f", sumBase / nf * 100.0))%  完全一致: \(String(format: "%.1f", Float(exactBase) / nf * 100.0))%")
+            print("  再スコアリング後  CER: \(String(format: "%.2f", sumRescored / nf * 100.0))%  完全一致: \(String(format: "%.1f", Float(exactRescored) / nf * 100.0))%")
+        }
+    }
+
+    var statsTrain = RescoreStats()
+    var statsUnseen = RescoreStats()
 
     var ri = 0
-    while ri < dictLimit {
+    while ri < texts.count {
         let target = stripPunctuation(texts[ri])
         let kana = converter.convertToHiragana(texts[ri])
         let cands = decoder.decodeNBest(kanaText: kana, beamWidth: nbest)
@@ -389,19 +436,20 @@ if lmWeightsPath.isEmpty != true && 0 < nbest {
 
         let basePred = stripPunctuation(cands[0].text)
         let rescoredPred = stripPunctuation(cands[bestIdx].text)
-        let baseCer = Float(levenshtein(target, basePred)) / Float(max(1, target.count))
-        let rescoredCer = Float(levenshtein(target, rescoredPred)) / Float(max(1, target.count))
-        sumBase += baseCer
-        sumRescored += rescoredCer
-        if baseCer == 0.0 { exactBase += 1 }
-        if rescoredCer == 0.0 { exactRescored += 1 }
-        count += 1
+
+        if ri < dictLimit {
+            statsTrain.update(target: target, basePred: basePred, rescoredPred: rescoredPred)
+        } else {
+            statsUnseen.update(target: target, basePred: basePred, rescoredPred: rescoredPred)
+        }
+
         ri += 1
     }
 
-    let nf = Float(max(1, count))
-    print("  再スコアリング前  CER: \(String(format: "%.2f", sumBase / nf * 100.0))%  完全一致: \(String(format: "%.1f", Float(exactBase) / nf * 100.0))%")
-    print("  再スコアリング後  CER: \(String(format: "%.2f", sumRescored / nf * 100.0))%  完全一致: \(String(format: "%.1f", Float(exactRescored) / nf * 100.0))%")
+    statsTrain.report(label: "辞書構築に使った行")
+    if dictLimit < texts.count {
+        statsUnseen.report(label: "辞書構築に使っていない行")
+    }
     print("  処理時間: \(String(format: "%.1f", Date().timeIntervalSince(rsStart))) 秒")
 }
 
