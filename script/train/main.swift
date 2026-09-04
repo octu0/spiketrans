@@ -222,39 +222,19 @@ print("第1段 音響 SNN (かな・音素) 語彙数: \(phoneticVocabulary.size
 print("第2段 言語 SNN (漢字かな混じり) 語彙数: \(textVocabulary.size) 文字 (学習セットのみ)")
 print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語 (学習セットのみ)")
 
-// 3. WAV ファイルを読み込んでデータセット構築
-print("\n--- 1. WAV ファイル読み込みとかな・漢字データセット構築 (最大 \(sampleLimit) 件) ---")
+// 3. 遅延データセット構築 (メタデータのみ保持し、特徴量はバッチ生成時に WAV から作る)
+print("\n--- 1. かな・漢字データセット構築 (最大 \(sampleLimit) 件、遅延読み込み) ---")
 let startTime = CFAbsoluteTimeGetCurrent()
 
-var wavPairs: [(wavBytes: [UInt8], text: String)] = []
-var count = 0
-
-for pair in rawPairs {
-    if sampleLimit <= count {
-        break
-    }
-
-    let wavPath = pair.path
-    if FileManager.default.fileExists(atPath: wavPath) {
-        if let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)) {
-            let bytes = [UInt8](fileData)
-            wavPairs.append((wavBytes: bytes, text: pair.text))
-            count += 1
-        }
-    }
+let manifestPairs: [(path: String, text: String)] = rawPairs.prefix(sampleLimit).map { pair in
+    return (path: pair.path, text: pair.text)
 }
-
-let dataset: SpeechDataset
-do {
-    dataset = try SpeechDataset.fromWavPairs(
-        pairs: wavPairs,
-        textVocabulary: textVocabulary,
-        frameStack: Defaults.frameStack
-    )
-} catch {
-    print("データセット作成失敗: \(error)")
-    exit(1)
-}
+let dataset = SpeechDataset.lazyFromManifest(
+    pairs: manifestPairs,
+    textVocabulary: textVocabulary,
+    frameStack: Defaults.frameStack,
+    workers: numWorkers
+)
 
 let loadElapsed = CFAbsoluteTimeGetCurrent() - startTime
 print("データセット構築完了: \(dataset.count) サンプル (所要時間: \(String(format: "%.3f", loadElapsed)) 秒)")
@@ -338,7 +318,7 @@ if epochs == 0 {
     // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
     print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
     let allTargets: [[Int]] = (0..<dataset.count).map { idx in
-        return phoneticVocabulary.textToIds(dataset[idx].hiraganaText)
+        return phoneticVocabulary.textToIds(dataset.hiraganaText(at: idx))
     }
 
     let mlxNet = MLXSpikingNetwork(
@@ -382,7 +362,7 @@ if epochs == 0 {
     var infeasibleCount = 0
     var di = 0
     while di < dataset.count {
-        let frames = dataset[di].acousticFeatures.count
+        let frames = dataset.frameCount(at: di)
         if ctcMinimumFrames(allTargets[di]) <= frames {
             feasibleIndices.append(di)
         } else {
@@ -397,7 +377,7 @@ if epochs == 0 {
     // 長さ順にバッチを組む。バッチ内の最長フレーム数までパディングされるため、
     // 長さの近いサンプルをまとめると無駄な逐次ステップが減る。
     let lengthSortedIndices = feasibleIndices.sorted { a, b in
-        return dataset[a].acousticFeatures.count < dataset[b].acousticFeatures.count
+        return dataset.frameCount(at: a) < dataset.frameCount(at: b)
     }
     var paddedFrameTotal = 0
     var unsortedFrameTotal = 0
@@ -408,8 +388,8 @@ if epochs == 0 {
         var plainMax = 0
         var pi = probeStart
         while pi < probeEnd {
-            sortedMax = max(sortedMax, dataset[lengthSortedIndices[pi]].acousticFeatures.count)
-            plainMax = max(plainMax, dataset[feasibleIndices[pi]].acousticFeatures.count)
+            sortedMax = max(sortedMax, dataset.frameCount(at: lengthSortedIndices[pi]))
+            plainMax = max(plainMax, dataset.frameCount(at: feasibleIndices[pi]))
             pi += 1
         }
         paddedFrameTotal += sortedMax
@@ -417,6 +397,44 @@ if epochs == 0 {
         probeStart = probeEnd
     }
     print("  長さ順バッチング: 逐次フレーム総数 \(unsortedFrameTotal) → \(paddedFrameTotal)")
+
+    // バッチの構成 (どのサンプルをどのバッチに入れるか) は全エポック共通
+    var batchGroups: [[Int]] = []
+    var gStart = 0
+    while gStart < lengthSortedIndices.count {
+        let gEnd = min(gStart + batchSize, lengthSortedIndices.count)
+        batchGroups.append(Array(lengthSortedIndices[gStart..<gEnd]))
+        gStart = gEnd
+    }
+
+    // バッチの特徴量を WAV から並列生成する (遅延読み込みの実体)
+    final class FeatureBatchBuffer: @unchecked Sendable {
+        var items: [[[Float]]]
+        init(count: Int) {
+            self.items = [[[Float]]](repeating: [], count: count)
+        }
+    }
+    func buildBatchFeatures(_ indices: [Int]) -> [[[Float]]] {
+        let buffer = FeatureBatchBuffer(count: indices.count)
+        let workerCount = max(1, min(numWorkers, indices.count))
+        DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
+            var i = worker
+            while i < indices.count {
+                let meta = dataset.metaSamples[indices[i]]
+                buffer.items[i] = SpeechDataset.loadFeatures(
+                    path: meta.path,
+                    frameStack: Defaults.frameStack
+                ).features
+                i += workerCount
+            }
+        }
+        return buffer.items
+    }
+
+    // GPU がバッチを学習している間に、次バッチの特徴量を CPU で先読みする
+    final class PrefetchBox: @unchecked Sendable {
+        var value: [[[Float]]] = []
+    }
 
     var ep = 1
     while ep <= epochs {
@@ -427,27 +445,39 @@ if epochs == 0 {
         var epLossSum: Float = 0.0
         var batchCount = 0
 
-        var bStart = 0
-        while bStart < lengthSortedIndices.count {
-            let bEnd = min(bStart + batchSize, lengthSortedIndices.count)
-            var fBatch: [[[Float]]] = []
+        var currentFeatures: [[[Float]]] = []
+        if 0 < batchGroups.count {
+            currentFeatures = buildBatchFeatures(batchGroups[0])
+        }
+        var bIdx = 0
+        while bIdx < batchGroups.count {
+            let prefetchBox = PrefetchBox()
+            let prefetchGroup = DispatchGroup()
+            if (bIdx + 1) < batchGroups.count {
+                let nextIndices = batchGroups[bIdx + 1]
+                prefetchGroup.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    prefetchBox.value = buildBatchFeatures(nextIndices)
+                    prefetchGroup.leave()
+                }
+            }
+
             var tBatch: [[Int]] = []
-            var idx = bStart
-            while idx < bEnd {
-                let sampleIdx = lengthSortedIndices[idx]
-                fBatch.append(dataset[sampleIdx].acousticFeatures)
+            for sampleIdx in batchGroups[bIdx] {
                 tBatch.append(allTargets[sampleIdx])
-                idx += 1
             }
 
             let res = mlxTrainer.trainBatchCTC(
-                featuresBatch: fBatch,
+                featuresBatch: currentFeatures,
                 targetsBatch: tBatch,
                 blankId: TextVocabulary.padId
             )
             epLossSum += res
             batchCount += 1
-            bStart = bEnd
+
+            prefetchGroup.wait()
+            currentFeatures = prefetchBox.value
+            bIdx += 1
         }
 
         let avgLoss = epLossSum / Float(max(1, batchCount))

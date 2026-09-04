@@ -27,19 +27,136 @@ public struct AudioTextSample: Sendable {
 }
 
 /// 音声・漢字テキスト学習用データセット (音素・かな音響学習 & 言語SNN統合)
+///
+/// 2 つのモードを持つ。
+/// - 即時モード: 全サンプルの特徴量を保持する (テスト・小規模データ用)
+/// - 遅延モード: メタデータだけ保持し、アクセス時に WAV から特徴量を生成する。
+///   メモリ消費がデータ量と切り離されるため、大規模コーパスはこちらを使う
 public final class SpeechDataset: @unchecked Sendable {
+    /// 遅延モードの 1 発話ぶんのメタデータ
+    public struct SampleMeta: Sendable {
+        public let path: String
+        public let rawText: String
+        public let hiraganaText: String
+        public let textIds: [Int]
+        public let phonemeIds: [Int]
+        public let frameCount: Int
+    }
+
     public let samples: [AudioTextSample]
+    public let metaSamples: [SampleMeta]
+    public let lazyFrameStack: Int
+    private let isLazy: Bool
 
     public init(samples: [AudioTextSample]) {
         self.samples = samples
+        self.metaSamples = []
+        self.lazyFrameStack = 1
+        self.isLazy = false
+    }
+
+    public init(metaSamples: [SampleMeta], frameStack: Int) {
+        self.samples = []
+        self.metaSamples = metaSamples
+        self.lazyFrameStack = frameStack
+        self.isLazy = true
     }
 
     public var count: Int {
+        if isLazy {
+            return metaSamples.count
+        }
         return samples.count
     }
 
+    /// 特徴量を生成せずにフレーム数を返す (長さソート・CTC 整合判定用)
+    public func frameCount(at index: Int) -> Int {
+        if isLazy {
+            return metaSamples[index].frameCount
+        }
+        return samples[index].acousticFeatures.count
+    }
+
+    /// 特徴量を生成せずにかな読みを返す (CTC 教師列の構築用)
+    public func hiraganaText(at index: Int) -> String {
+        if isLazy {
+            return metaSamples[index].hiraganaText
+        }
+        return samples[index].hiraganaText
+    }
+
+    /// 遅延モードでは呼び出しごとに WAV を読み特徴量を生成する。
+    /// 返り値を保持しない限りメモリには残らない
     public subscript(index: Int) -> AudioTextSample {
-        return samples[index]
+        if isLazy != true {
+            return samples[index]
+        }
+        let meta = metaSamples[index]
+        let (pcm16k, features) = Self.loadFeatures(path: meta.path, frameStack: lazyFrameStack)
+        return AudioTextSample(
+            audioPCM: pcm16k,
+            rawText: meta.rawText,
+            hiraganaText: meta.hiraganaText,
+            textIds: meta.textIds,
+            phonemeIds: meta.phonemeIds,
+            acousticFeatures: features
+        )
+    }
+
+    /// WAV ファイルを読み込んで 16kHz PCM と音響特徴量を生成する
+    public static func loadFeatures(path: String, frameStack: Int) -> (pcm: [Float], features: [[Float]]) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let wav = try? WavParser().parse(bytes: [UInt8](data)) else {
+            return ([], [])
+        }
+        let pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
+        return (pcm16k, extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack))
+    }
+
+    /// マニフェストのペアから遅延データセットを構築する。
+    /// 並列に全 WAV を一度読んでフレーム数を確定し、特徴量は破棄する
+    public static func lazyFromManifest(
+        pairs: [(path: String, text: String)],
+        textVocabulary: TextVocabulary,
+        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
+        frameStack: Int = 1,
+        workers: Int = 8
+    ) -> SpeechDataset {
+        final class MetaBuffer: @unchecked Sendable {
+            var items: [SampleMeta?]
+            init(count: Int) {
+                self.items = [SampleMeta?](repeating: nil, count: count)
+            }
+        }
+        let buffer = MetaBuffer(count: pairs.count)
+        let workerCount = max(1, workers)
+        DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
+            let converter = KanjiConverter(vocabulary: phonemeVocabulary)
+            var i = worker
+            while i < pairs.count {
+                let pair = pairs[i]
+                let (_, features) = loadFeatures(path: pair.path, frameStack: frameStack)
+                if 0 < features.count {
+                    buffer.items[i] = SampleMeta(
+                        path: pair.path,
+                        rawText: pair.text,
+                        hiraganaText: converter.convertToHiragana(pair.text),
+                        textIds: textVocabulary.textToIds(pair.text),
+                        phonemeIds: converter.toPhonemeTokenIds(pair.text),
+                        frameCount: features.count
+                    )
+                }
+                i += workerCount
+            }
+        }
+        var metas: [SampleMeta] = []
+        metas.reserveCapacity(pairs.count)
+        for item in buffer.items {
+            if let meta = item {
+                metas.append(meta)
+            }
+        }
+        return SpeechDataset(metaSamples: metas, frameStack: frameStack)
     }
 
     /// テキスト中の全発音から音素トークン ID 列を抽出
