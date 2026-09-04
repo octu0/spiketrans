@@ -8,6 +8,12 @@ public struct FFT: Sendable {
     private let bitReversedIndices: [Int]
     private let twiddleReal: [Float]
     private let twiddleImag: [Float]
+    /// ステージごとの回転因子を連続に並べ直したもの。
+    /// 元の twiddle は j * step の飛び飛び参照になり SIMD 化できないため、
+    /// ステージ s の j 番目を stageTwiddleOffsets[s] + j で連続に引けるようにする
+    private let stageTwiddleReal: [Float]
+    private let stageTwiddleImag: [Float]
+    private let stageTwiddleOffsets: [Int]
     
     public init(size: Int = 512) {
         self.size = size
@@ -53,6 +59,28 @@ public struct FFT: Sendable {
         }
         self.twiddleReal = twReal
         self.twiddleImag = twImag
+
+        // 3. ステージ別の連続回転因子テーブル
+        var stageReal: [Float] = []
+        var stageImag: [Float] = []
+        var offsets = [Int](repeating: 0, count: m + 1)
+        var stage = 1
+        while stage <= m {
+            offsets[stage] = stageReal.count
+            let len = 1 << stage
+            let halfLen = len >> 1
+            let step = size / len
+            var j = 0
+            while j < halfLen {
+                stageReal.append(twReal[j * step])
+                stageImag.append(twImag[j * step])
+                j += 1
+            }
+            stage += 1
+        }
+        self.stageTwiddleReal = stageReal
+        self.stageTwiddleImag = stageImag
+        self.stageTwiddleOffsets = offsets
     }
     
     /// In-place 順方向 FFT
@@ -77,42 +105,96 @@ public struct FFT: Sendable {
             i += 1
         }
         
-        // 2. Cooley-Tukey Butterfly 演算
-        var s = 1
-        while s <= log2Size {
-            let len = 1 << s
-            let halfLen = len >> 1
-            let step = size / len
-            
-            var j = 0
-            while j < halfLen {
-                let wIdx = j * step
-                let wr = twiddleReal[wIdx]
-                let wi = twiddleImag[wIdx]
-                
-                var k = 0
-                while k < size {
-                    let idx1 = k + j
-                    let idx2 = idx1 + halfLen
-                    
-                    let ur = real[idx1]
-                    let ui = imag[idx1]
-                    let vr = real[idx2]
-                    let vi = imag[idx2]
-                    
-                    let tr = (wr * vr) - (wi * vi)
-                    let ti = (wr * vi) + (wi * vr)
-                    
-                    real[idx1] = ur + tr
-                    imag[idx1] = ui + ti
-                    real[idx2] = ur - tr
-                    imag[idx2] = ui - ti
-                    
-                    k += len
+        // 2. Cooley-Tukey Butterfly 演算。
+        //    ブロック (k) を外側・要素 (j) を内側にすると real[k+j] が連続アクセスになり
+        //    SIMD8 で 8 バタフライを一括処理できる。バタフライ同士は独立なので
+        //    ループ順序を変えても各演算式は不変で、結果はビット一致する
+        stageTwiddleReal.withUnsafeBufferPointer { stwrBuf in
+            stageTwiddleImag.withUnsafeBufferPointer { stwiBuf in
+                let stwr = stwrBuf.baseAddress!
+                let stwi = stwiBuf.baseAddress!
+                var s = 1
+                while s <= log2Size {
+                    let len = 1 << s
+                    let halfLen = len >> 1
+                    let twOffset = stageTwiddleOffsets[s]
+                    let simdLimit = halfLen - (halfLen % 8)
+
+                    var k = 0
+                    while k < size {
+                        var j = 0
+                        while j < simdLimit {
+                            let i1 = k + j
+                            let i2 = i1 + halfLen
+                            let tw = twOffset + j
+
+                            let wr = SIMD8<Float>(
+                                stwr[tw+0], stwr[tw+1], stwr[tw+2], stwr[tw+3],
+                                stwr[tw+4], stwr[tw+5], stwr[tw+6], stwr[tw+7]
+                            )
+                            let wi = SIMD8<Float>(
+                                stwi[tw+0], stwi[tw+1], stwi[tw+2], stwi[tw+3],
+                                stwi[tw+4], stwi[tw+5], stwi[tw+6], stwi[tw+7]
+                            )
+                            let ur = SIMD8<Float>(
+                                real[i1+0], real[i1+1], real[i1+2], real[i1+3],
+                                real[i1+4], real[i1+5], real[i1+6], real[i1+7]
+                            )
+                            let ui = SIMD8<Float>(
+                                imag[i1+0], imag[i1+1], imag[i1+2], imag[i1+3],
+                                imag[i1+4], imag[i1+5], imag[i1+6], imag[i1+7]
+                            )
+                            let vr = SIMD8<Float>(
+                                real[i2+0], real[i2+1], real[i2+2], real[i2+3],
+                                real[i2+4], real[i2+5], real[i2+6], real[i2+7]
+                            )
+                            let vi = SIMD8<Float>(
+                                imag[i2+0], imag[i2+1], imag[i2+2], imag[i2+3],
+                                imag[i2+4], imag[i2+5], imag[i2+6], imag[i2+7]
+                            )
+
+                            let tr = (wr * vr) - (wi * vi)
+                            let ti = (wr * vi) + (wi * vr)
+                            let r1 = ur + tr
+                            let m1 = ui + ti
+                            let r2 = ur - tr
+                            let m2 = ui - ti
+
+                            var lane = 0
+                            while lane < 8 {
+                                real[i1+lane] = r1[lane]
+                                imag[i1+lane] = m1[lane]
+                                real[i2+lane] = r2[lane]
+                                imag[i2+lane] = m2[lane]
+                                lane += 1
+                            }
+                            j += 8
+                        }
+                        while j < halfLen {
+                            let idx1 = k + j
+                            let idx2 = idx1 + halfLen
+                            let wr = stwr[twOffset + j]
+                            let wi = stwi[twOffset + j]
+
+                            let ur = real[idx1]
+                            let ui = imag[idx1]
+                            let vr = real[idx2]
+                            let vi = imag[idx2]
+
+                            let tr = (wr * vr) - (wi * vi)
+                            let ti = (wr * vi) + (wi * vr)
+
+                            real[idx1] = ur + tr
+                            imag[idx1] = ui + ti
+                            real[idx2] = ur - tr
+                            imag[idx2] = ui - ti
+                            j += 1
+                        }
+                        k += len
+                    }
+                    s += 1
                 }
-                j += 1
             }
-            s += 1
         }
     }
     

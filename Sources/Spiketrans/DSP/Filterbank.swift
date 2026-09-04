@@ -8,8 +8,13 @@ public struct Filterbank: Sendable {
     private let durandKerner: DurandKernerSolver
     private let formantExtractor: FormantExtractor
     
-    // 事前計算された Mel フィルタバンクの中心周波数と重みテーブル
-    private let melWeights: [[(bin: Int, weight: Float)]]
+    // Mel フィルタバンクの重みテーブル (SoA)。
+    // 各チャネルが担当する FFT ビンは連続範囲になるため、開始ビンと重み列だけ持てば足りる。
+    // タプルの配列の配列 (AoS) と違いポインタ追跡がなく、積算を SIMD 化できる
+    private let melBinStart: [Int]
+    private let melBinCount: [Int]
+    private let melWeightOffset: [Int]
+    private let melWeightsFlat: [Float]
     
     public init(config: DSPConfig = DSPConfig()) {
         self.config = config
@@ -62,7 +67,31 @@ public struct Filterbank: Sendable {
             weights.append(channelWeights)
             ch += 1
         }
-        self.melWeights = weights
+
+        // AoS の重みリストを SoA へ変換する。担当ビンは周波数が単調増加なので連続範囲になる
+        var binStarts = [Int](repeating: 0, count: numChannels)
+        var binCounts = [Int](repeating: 0, count: numChannels)
+        var weightOffsets = [Int](repeating: 0, count: numChannels)
+        var flatWeights: [Float] = []
+        var wc = 0
+        while wc < numChannels {
+            let list = weights[wc]
+            weightOffsets[wc] = flatWeights.count
+            binCounts[wc] = list.count
+            if 0 < list.count {
+                binStarts[wc] = list[0].bin
+                var wi = 0
+                while wi < list.count {
+                    flatWeights.append(list[wi].weight)
+                    wi += 1
+                }
+            }
+            wc += 1
+        }
+        self.melBinStart = binStarts
+        self.melBinCount = binCounts
+        self.melWeightOffset = weightOffsets
+        self.melWeightsFlat = flatWeights
     }
     
     /// FFT パワースペクトルから 64 次元 Mel 特徴量ベクトルを抽出 (Direct Input Current: 0.0〜1.0)
@@ -88,6 +117,25 @@ public struct Filterbank: Sendable {
         
         // 1. ハミング窓の適用 & ゼロパディング
         var i = 0
+        let winLimit = winCount - (winCount % 8)
+        while i < winLimit {
+            let p = SIMD8<Float>(
+                pcmPtr[i+0], pcmPtr[i+1], pcmPtr[i+2], pcmPtr[i+3],
+                pcmPtr[i+4], pcmPtr[i+5], pcmPtr[i+6], pcmPtr[i+7]
+            )
+            let w = SIMD8<Float>(
+                winTable[i+0], winTable[i+1], winTable[i+2], winTable[i+3],
+                winTable[i+4], winTable[i+5], winTable[i+6], winTable[i+7]
+            )
+            let v = p * w
+            var lane = 0
+            while lane < 8 {
+                fftReal[i+lane] = v[lane]
+                fftImag[i+lane] = 0.0
+                lane += 1
+            }
+            i += 8
+        }
         while i < winCount {
             fftReal[i] = pcmPtr[i] * winTable[i]
             fftImag[i] = 0.0
@@ -166,23 +214,29 @@ public struct Filterbank: Sendable {
             }
         }
         
-        // 4. 64ch Mel エネルギーの積算
-        var ch = 0
-        while ch < config.melChannels {
-            let wList = melWeights[ch]
-            var sumEnergy: Float = 1e-6
-            var idx = 0
-            while idx < wList.count {
-                let item = wList[idx]
-                sumEnergy += powerSpec[item.bin] * item.weight
-                idx += 1
+        // 4. 64ch Mel エネルギーの積算。
+        //    担当ビンが連続範囲なので powerSpec と重み列を同じ歩幅で読める。
+        //    加算順序は逐次のまま保つ (SIMD 化すると丸め順が変わり特徴量が変化するため)
+        melWeightsFlat.withUnsafeBufferPointer { wBuf in
+            let flatW = wBuf.baseAddress!
+            var ch = 0
+            while ch < config.melChannels {
+                let binBase = melBinStart[ch]
+                let wBase = melWeightOffset[ch]
+                let n = melBinCount[ch]
+                var sumEnergy: Float = 1e-6
+                var idx = 0
+                while idx < n {
+                    sumEnergy += powerSpec[binBase + idx] * flatW[wBase + idx]
+                    idx += 1
+                }
+                melEnergies[ch] = log(sumEnergy)
+                ch += 1
             }
-            melEnergies[ch] = log(sumEnergy)
-            ch += 1
         }
         
         // 5. 64ch Mel 特徴量の Direct Input Current への正規化 ([0.0, 1.0])
-        ch = 0
+        var ch = 0
         while ch < config.melChannels {
             let rawE = melEnergies[ch]
             let normE = (rawE + 10.0) / 10.0
