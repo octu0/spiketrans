@@ -42,6 +42,12 @@ enum Defaults {
     /// N エポックごとの重み書き出し
     static let checkpointEvery = 10
 
+    /// 学習率の暖機に使うステップ数の分母 (全ステップの 1/N を暖機に充てる)
+    static let warmupStepDivisor = 50
+
+    /// MLX のバッファキャッシュを捨てる間隔 (バッチ数)
+    static let clearCacheEveryBatches = 200
+
     /// 学習セットから評価する最大件数。
     /// 学習データが数十万件になると全件評価だけで何時間もかかるため、
     /// 再現性の確認はこの件数の抽出で足りる (未学習セットは常に全件評価する)
@@ -345,7 +351,7 @@ if epochs == 0 {
         bpttWindow: Defaults.bpttWindow
     )
     print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
-    let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 4)
+    let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
     print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
     let trainStartTime = CFAbsoluteTimeGetCurrent()
 
@@ -443,11 +449,21 @@ if epochs == 0 {
         var value: [[[Float]]] = []
     }
 
+    // 学習率はバッチ単位で刻む。エポック単位だとデータが増えたときに
+    // 暖機の割合が大きすぎる (6 エポック中 4 エポックが暖機など)
+    let totalSteps = max(1, epochs * batchGroups.count)
+    let warmupSteps = max(1, totalSteps / Defaults.warmupStepDivisor)
+    print("  学習ステップ数: \(totalSteps) (暖機 \(warmupSteps) ステップ)")
+
+    let checkpointInterval = min(Defaults.checkpointEvery, max(1, epochs / 6))
+    print("  チェックポイント間隔: \(checkpointInterval) エポックごと")
+
+    var globalStep = 0
     var ep = 1
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
-        let curLR = scheduler.learningRate(forEpoch: ep)
-        mlxTrainer.updateLearningRate(curLR)
+        var curLR = scheduler.learningRate(
+            step: globalStep + 1, totalSteps: totalSteps, warmupSteps: warmupSteps)
 
         var epLossSum: Float = 0.0
         var batchCount = 0
@@ -474,6 +490,11 @@ if epochs == 0 {
                 tBatch.append(allTargets[sampleIdx])
             }
 
+            globalStep += 1
+            curLR = scheduler.learningRate(
+                step: globalStep, totalSteps: totalSteps, warmupSteps: warmupSteps)
+            mlxTrainer.updateLearningRate(curLR)
+
             let res = mlxTrainer.trainBatchCTC(
                 featuresBatch: currentFeatures,
                 targetsBatch: tBatch,
@@ -481,6 +502,12 @@ if epochs == 0 {
             )
             epLossSum += res
             batchCount += 1
+
+            // MLX は解放したバッファを形ごとに使い回すため、系列長が毎バッチ違うと
+            // キャッシュが際限なく増えて Metal のリソース上限に達する。定期的に捨てる
+            if (batchCount % Defaults.clearCacheEveryBatches) == 0 {
+                MLX.Memory.clearCache()
+            }
 
             prefetchGroup.wait()
             currentFeatures = prefetchBox.value
@@ -491,8 +518,10 @@ if epochs == 0 {
         let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
         print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
 
-        // 定期チェックポイント: 長時間実行が途中で止まっても成果を失わないようにする
-        if 0 < Defaults.checkpointEvery && (ep % Defaults.checkpointEvery) == 0 && ep < epochs {
+        // 定期チェックポイント: 長時間実行が途中で止まっても成果を失わないようにする。
+        // エポック数が少ない大規模学習では 10 エポックごとだと 1 度も保存されないため、
+        // 全体の 1/6 を上限に間隔を詰める
+        if 0 < checkpointInterval && (ep % checkpointInterval) == 0 && ep < epochs {
             switch exportWeightsPath {
             case .some(let basePath):
                 let ckptPath = "\(basePath).ep\(ep).json"
@@ -543,10 +572,10 @@ if epochs == 0 {
     print("\nCPU 学習完了 (総所要時間: \(String(format: "%.3f", trainElapsed)) 秒)")
 }
 
-// 4.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド 8並列)
+// 4.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド)
 // --language-bonus 0 のときは言語 SNN の出力が第2段で一切使われないため学習を丸ごと省略する
 if 0.0 < Defaults.languageBonus {
-    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド 8並列) ---")
+    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド) ---")
     let lmStartTime = CFAbsoluteTimeGetCurrent()
     var lmEpoch = 1
     let lmMaxEpochs = 40

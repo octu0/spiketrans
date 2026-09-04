@@ -209,6 +209,12 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             return 0.0
         }
 
+        // 系列長を 32 の倍数へ切り上げる。
+        // MLX は解放したバッファを形ごとに使い回すため、毎バッチ長さが違うと
+        // 使い回せないバッファが溜まり Metal のリソース上限に達する。
+        // 増えたフレームは inputLengths で凍結されるので損失は変わらない
+        maxT = ((maxT + 31) / 32) * 32
+
         let validCount = validFeatures.count
         let inDim = network.inputDim
         var flatFeat = [Float](repeating: 0.0, count: validCount * maxT * inDim)
@@ -244,7 +250,10 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let (lossValues, grads) = lg(network, [featArray])
         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
         optimizer.update(model: network, gradients: clippedGrads)
-        eval(network, lossValues)
+        // オプティマイザの状態も評価する。network と損失だけ評価すると
+        // Adam の m/v が遅延グラフとして積み上がり、生存バッファ数が
+        // Metal のリソース上限 (約 50 万) に達して落ちる
+        eval(network, optimizer, lossValues)
 
         return lossValues[0].item(Float.self)
     }

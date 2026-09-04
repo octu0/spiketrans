@@ -190,14 +190,17 @@ public struct KanjiConverter: Sendable {
     /// 句読点は発音として音声に存在しないため、音響 SNN の教師には含めない。
     /// 句読点は第2段で語の連接統計から復元する。
     public func kanaOnly(_ text: String) -> String {
+        // 合成済みの形に揃えてから 1 スカラーずつ選ぶ。
+        // 書記素クラスタ単位で判定すると「を + 濁点」のように、かなに結合文字が
+        // 付いたものが 1 文字として通ってしまい、語彙が際限なく増える
         var result = ""
-        for c in text {
-            let val = c.unicodeScalars.first?.value ?? 0
+        for scalar in text.precomposedStringWithCanonicalMapping.unicodeScalars {
+            let val = scalar.value
             switch true {
             case 0x3041 <= val && val <= 0x3096:
-                result.append(c)
-            case c == "ー":
-                result.append(c)
+                result.unicodeScalars.append(scalar)
+            case val == 0x30FC:
+                result.unicodeScalars.append(scalar)
             default:
                 break
             }

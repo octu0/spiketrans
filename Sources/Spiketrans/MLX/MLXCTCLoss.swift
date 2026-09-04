@@ -42,6 +42,9 @@ public enum MLXCTCLoss {
                 }
                 b += 1
             }
+            // 拡張ラベル長も 8 の倍数へ切り上げて形状の種類を減らす。
+            // 超過分は validMask = 0 なので損失には影響しない
+            maxLen = ((maxLen + 7) / 8) * 8
             self.maxExtendedLength = maxLen
 
             var flatExt = [Int32](repeating: Int32(blankId), count: batchSize * maxLen)
