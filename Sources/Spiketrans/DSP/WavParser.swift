@@ -44,6 +44,7 @@ public struct WavParser: Sendable {
         var bitsPerSample = 0
         var dataOffset = 0
         var dataSize = 0
+        var isFloatFormat = false
         
         var offset = 12
         let fileLimit = bytes.count
@@ -57,22 +58,28 @@ public struct WavParser: Sendable {
             let chunkSize = Int(bytes[offset+4]) | (Int(bytes[offset+5]) << 8) | (Int(bytes[offset+6]) << 16) | (Int(bytes[offset+7]) << 24)
             
             if chunkSize < 0 || fileLimit < (offset + 8 + chunkSize) {
+                // fmt と data が揃っていれば、末尾の壊れたメタデータは無視して打ち切る。
+                // 録音機材が書く bext/iXML/id3 等は破損していることがある
+                if 0 < dataOffset && 0 < sampleRate {
+                    break
+                }
                 throw WavParserError.invalidHeader
             }
             
             // "fmt " chunk
             if chunkId0 == 0x66 && chunkId1 == 0x6d && chunkId2 == 0x74 && chunkId3 == 0x20 {
                 let formatCode = Int(bytes[offset+8]) | (Int(bytes[offset+9]) << 8)
-                // 0xFFFE は WAVE_FORMAT_EXTENSIBLE。実体は末尾のサブフォーマット GUID が示し、
-                // 先頭 2 バイトが 1 なら PCM。macOS の afconvert 等はこの形式で書き出す
-                var isPCM = (formatCode == 1)
+                // 1 = 整数 PCM, 3 = IEEE 浮動小数。
+                // 0xFFFE は WAVE_FORMAT_EXTENSIBLE で、実体は末尾のサブフォーマット GUID が示す
+                // (macOS の afconvert 等はこの形式で書き出す)
+                var effectiveFormat = formatCode
                 if formatCode == 0xFFFE && 40 <= chunkSize {
-                    let subFormat = Int(bytes[offset+32]) | (Int(bytes[offset+33]) << 8)
-                    isPCM = (subFormat == 1)
+                    effectiveFormat = Int(bytes[offset+32]) | (Int(bytes[offset+33]) << 8)
                 }
-                if isPCM != true {
-                    throw WavParserError.unsupportedFormat("Only PCM is supported, got format \(formatCode)")
+                if effectiveFormat != 1 && effectiveFormat != 3 {
+                    throw WavParserError.unsupportedFormat("Only integer PCM and IEEE float are supported, got format \(formatCode)")
                 }
+                isFloatFormat = (effectiveFormat == 3)
                 channels = Int(bytes[offset+10]) | (Int(bytes[offset+11]) << 8)
                 sampleRate = Int(bytes[offset+12]) | (Int(bytes[offset+13]) << 8) | (Int(bytes[offset+14]) << 16) | (Int(bytes[offset+15]) << 24)
                 bitsPerSample = Int(bytes[offset+22]) | (Int(bytes[offset+23]) << 8)
@@ -84,7 +91,8 @@ public struct WavParser: Sendable {
                 dataSize = chunkSize
             }
             
-            offset += (8 + chunkSize)
+            // RIFF はチャンクをワード境界に揃えるため、奇数長なら詰め物が 1 バイト入る
+            offset += 8 + chunkSize + (chunkSize & 1)
         }
         
         if sampleRate == 0 || channels == 0 || bitsPerSample == 0 {
@@ -93,11 +101,17 @@ public struct WavParser: Sendable {
         if dataOffset == 0 {
             throw WavParserError.dataChunkNotFound
         }
-        if bitsPerSample != 16 {
-            throw WavParserError.unsupportedFormat("Only 16-bit PCM is supported, got \(bitsPerSample)")
+        if isFloatFormat {
+            if bitsPerSample != 32 {
+                throw WavParserError.unsupportedFormat("Only 32-bit IEEE float is supported, got \(bitsPerSample)")
+            }
+        } else {
+            if bitsPerSample != 16 && bitsPerSample != 24 && bitsPerSample != 32 {
+                throw WavParserError.unsupportedFormat("Only 16/24/32-bit integer PCM is supported, got \(bitsPerSample)")
+            }
         }
-        
-        let bytesPerSample = 2
+
+        let bytesPerSample = bitsPerSample / 8
         let totalSamples = (dataSize / (bytesPerSample * channels))
         var pcmData = [Float](repeating: 0.0, count: totalSamples)
         
@@ -107,7 +121,34 @@ public struct WavParser: Sendable {
             let rawBytes = bytePtr.baseAddress!
             pcmData.withUnsafeMutableBufferPointer { pcmPtr in
                 let dst = pcmPtr.baseAddress!
-                
+
+                if isFloatFormat {
+                    // 32bit 浮動小数は既に -1.0〜1.0 の範囲なのでスケール不要
+                    Self.decodeFloat32(
+                        rawBytes: rawBytes,
+                        dst: dst,
+                        dataOffset: dataOffset,
+                        totalSamples: totalSamples,
+                        channels: channels,
+                        fileLimit: fileLimit
+                    )
+                    return
+                }
+
+                // 24/32bit 整数は上位ビットだけを見れば 16bit 相当に落とせる
+                if bitsPerSample != 16 {
+                    Self.decodeWideInteger(
+                        rawBytes: rawBytes,
+                        dst: dst,
+                        dataOffset: dataOffset,
+                        totalSamples: totalSamples,
+                        channels: channels,
+                        bytesPerSample: bytesPerSample,
+                        fileLimit: fileLimit
+                    )
+                    return
+                }
+
                 switch channels {
                 case 1:
                     Self.decodeMono(
@@ -141,6 +182,75 @@ public struct WavParser: Sendable {
         )
     }
     
+    /// 24bit / 32bit 整数 PCM のデコード。多チャネルは平均でモノラルへ落とす。
+    /// リトルエンディアンの最上位 2 バイトを 16bit サンプルとして読む
+    @inline(__always)
+    private static func decodeWideInteger(
+        rawBytes: UnsafePointer<UInt8>,
+        dst: UnsafeMutablePointer<Float>,
+        dataOffset: Int,
+        totalSamples: Int,
+        channels: Int,
+        bytesPerSample: Int,
+        fileLimit: Int
+    ) {
+        let frameBytes = bytesPerSample * channels
+        let invChannels = 1.0 / Float(channels)
+        let scale: Float = 1.0 / 32768.0
+        let highOffset = bytesPerSample - 2
+        var i = 0
+        while i < totalSamples {
+            let base = dataOffset + (i * frameBytes)
+            if fileLimit < (base + frameBytes) {
+                break
+            }
+            var sum: Float = 0.0
+            var ch = 0
+            while ch < channels {
+                let o = base + (ch * bytesPerSample) + highOffset
+                let raw = UInt16(rawBytes[o]) | (UInt16(rawBytes[o+1]) << 8)
+                sum += Float(Int16(bitPattern: raw)) * scale
+                ch += 1
+            }
+            dst[i] = sum * invChannels
+            i += 1
+        }
+    }
+
+    /// 32bit IEEE 浮動小数のデコード。多チャネルは平均でモノラルへ落とす
+    @inline(__always)
+    private static func decodeFloat32(
+        rawBytes: UnsafePointer<UInt8>,
+        dst: UnsafeMutablePointer<Float>,
+        dataOffset: Int,
+        totalSamples: Int,
+        channels: Int,
+        fileLimit: Int
+    ) {
+        let frameBytes = 4 * channels
+        let invChannels = 1.0 / Float(channels)
+        var i = 0
+        while i < totalSamples {
+            let base = dataOffset + (i * frameBytes)
+            if fileLimit < (base + frameBytes) {
+                break
+            }
+            var sum: Float = 0.0
+            var ch = 0
+            while ch < channels {
+                let o = base + (ch * 4)
+                let bits = UInt32(rawBytes[o])
+                    | (UInt32(rawBytes[o+1]) << 8)
+                    | (UInt32(rawBytes[o+2]) << 16)
+                    | (UInt32(rawBytes[o+3]) << 24)
+                sum += Float(bitPattern: bits)
+                ch += 1
+            }
+            dst[i] = sum * invChannels
+            i += 1
+        }
+    }
+
     @inline(__always)
     private static func decodeMono(
         rawBytes: UnsafePointer<UInt8>,

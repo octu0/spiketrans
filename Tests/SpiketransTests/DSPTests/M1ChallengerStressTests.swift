@@ -140,21 +140,128 @@ final class M1ChallengerStressTests: XCTestCase {
         XCTAssertEqual(result.pcmData[0], 4096.0 / 32768.0)
     }
     
-    /// サポート外フォーマット (Float PCM = format 3, A-law = format 6, mu-law = format 7, 24-bit PCM)
+    /// サポート外フォーマット (A-law = format 6, mu-law = format 7, 8-bit PCM)
     func testWavParserUnsupportedFormats() {
         let parser = WavParser()
-        
-        // Float 32-bit (format code 3)
-        let floatWav = buildCustomWav(audioFormat: 3, bitsPerSample: 32)
-        XCTAssertThrowsError(try parser.parse(bytes: floatWav))
-        
-        // 24-bit PCM (bitsPerSample 24)
-        let pcm24Wav = buildCustomWav(audioFormat: 1, bitsPerSample: 24)
-        XCTAssertThrowsError(try parser.parse(bytes: pcm24Wav))
-        
+
+        // A-law (format code 6)
+        let alawWav = buildCustomWav(audioFormat: 6, bitsPerSample: 8)
+        XCTAssertThrowsError(try parser.parse(bytes: alawWav))
+
+        // mu-law (format code 7)
+        let mulawWav = buildCustomWav(audioFormat: 7, bitsPerSample: 8)
+        XCTAssertThrowsError(try parser.parse(bytes: mulawWav))
+
         // 8-bit PCM (bitsPerSample 8)
         let pcm8Wav = buildCustomWav(audioFormat: 1, bitsPerSample: 8)
         XCTAssertThrowsError(try parser.parse(bytes: pcm8Wav))
+
+        // 浮動小数を名乗るが 32bit でない
+        let badFloatWav = buildCustomWav(audioFormat: 3, bitsPerSample: 16)
+        XCTAssertThrowsError(try parser.parse(bytes: badFloatWav))
+    }
+
+    /// 実録音で現れる形式 (32bit 浮動小数 / 24bit・32bit 整数) を読めること
+    func testWavParserWideFormats() throws {
+        let parser = WavParser()
+
+        // 32bit IEEE 浮動小数。0.5 を 4 サンプル
+        var floatPayload: [UInt8] = []
+        var i = 0
+        while i < 4 {
+            let bits = Float(0.5).bitPattern
+            floatPayload.append(UInt8(bits & 0xFF))
+            floatPayload.append(UInt8((bits >> 8) & 0xFF))
+            floatPayload.append(UInt8((bits >> 16) & 0xFF))
+            floatPayload.append(UInt8((bits >> 24) & 0xFF))
+            i += 1
+        }
+        let floatWav = buildCustomWav(
+            audioFormat: 3, bitsPerSample: 32,
+            dataSize: UInt32(floatPayload.count), rawPayload: floatPayload)
+        let floatResult = try parser.parse(bytes: floatWav)
+        XCTAssertEqual(floatResult.pcmData.count, 4)
+        XCTAssertEqual(floatResult.pcmData[0], 0.5, accuracy: 1e-6)
+
+        // 32bit 整数。上位 16bit が 4096 になるよう下位を 0 で埋める
+        var int32Payload: [UInt8] = []
+        i = 0
+        while i < 4 {
+            int32Payload.append(contentsOf: [0, 0, 0x00, 0x10])
+            i += 1
+        }
+        let int32Wav = buildCustomWav(
+            audioFormat: 1, bitsPerSample: 32,
+            dataSize: UInt32(int32Payload.count), rawPayload: int32Payload)
+        let int32Result = try parser.parse(bytes: int32Wav)
+        XCTAssertEqual(int32Result.pcmData.count, 4)
+        XCTAssertEqual(int32Result.pcmData[0], 4096.0 / 32768.0, accuracy: 1e-6)
+
+        // 24bit 整数
+        var int24Payload: [UInt8] = []
+        i = 0
+        while i < 4 {
+            int24Payload.append(contentsOf: [0, 0x00, 0x10])
+            i += 1
+        }
+        let int24Wav = buildCustomWav(
+            audioFormat: 1, bitsPerSample: 24,
+            dataSize: UInt32(int24Payload.count), rawPayload: int24Payload)
+        let int24Result = try parser.parse(bytes: int24Wav)
+        XCTAssertEqual(int24Result.pcmData.count, 4)
+        XCTAssertEqual(int24Result.pcmData[0], 4096.0 / 32768.0, accuracy: 1e-6)
+    }
+
+    /// 奇数長チャンクの後ろに続くチャンクを正しく読めること。
+    /// RIFF はワード境界に揃えるため奇数長の後に詰め物が 1 バイト入る
+    func testWavParserOddSizedChunkPadding() throws {
+        let parser = WavParser()
+        var bytes: [UInt8] = []
+
+        func appendUInt32(_ v: UInt32) {
+            bytes.append(UInt8(v & 0xFF))
+            bytes.append(UInt8((v >> 8) & 0xFF))
+            bytes.append(UInt8((v >> 16) & 0xFF))
+            bytes.append(UInt8((v >> 24) & 0xFF))
+        }
+
+        // 先頭に奇数長の未知チャンク (3 バイト + 詰め物 1 バイト) を置く
+        bytes.append(contentsOf: [0x52, 0x49, 0x46, 0x46])
+        appendUInt32(0)  // RIFF サイズは後で埋める
+        bytes.append(contentsOf: [0x57, 0x41, 0x56, 0x45])
+
+        bytes.append(contentsOf: [0x62, 0x65, 0x78, 0x74])  // "bext"
+        appendUInt32(3)
+        bytes.append(contentsOf: [1, 2, 3, 0])  // 3 バイト + 詰め物
+
+        bytes.append(contentsOf: [0x66, 0x6d, 0x74, 0x20])  // "fmt "
+        appendUInt32(16)
+        bytes.append(contentsOf: [1, 0])
+        bytes.append(contentsOf: [1, 0])
+        bytes.append(contentsOf: [0x80, 0x3E, 0, 0])
+        bytes.append(contentsOf: [0x00, 0x7D, 0, 0])
+        bytes.append(contentsOf: [2, 0])
+        bytes.append(contentsOf: [16, 0])
+
+        bytes.append(contentsOf: [0x64, 0x61, 0x74, 0x61])  // "data"
+        appendUInt32(8)
+        var s = 0
+        while s < 4 {
+            bytes.append(0)
+            bytes.append(0x10)
+            s += 1
+        }
+
+        let riffSize = UInt32(bytes.count - 8)
+        bytes[4] = UInt8(riffSize & 0xFF)
+        bytes[5] = UInt8((riffSize >> 8) & 0xFF)
+        bytes[6] = UInt8((riffSize >> 16) & 0xFF)
+        bytes[7] = UInt8((riffSize >> 24) & 0xFF)
+
+        let result = try parser.parse(bytes: bytes)
+        XCTAssertEqual(result.sampleRate, 16000)
+        XCTAssertEqual(result.pcmData.count, 4)
+        XCTAssertEqual(result.pcmData[0], 4096.0 / 32768.0, accuracy: 1e-6)
     }
     
     // MARK: - 2. 極限入力・異常信号に対する DSP パイプライン耐性
