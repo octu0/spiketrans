@@ -521,6 +521,8 @@ public final class BPTTTrainer: @unchecked Sendable {
         }
 
         optimizer.step()
+        // 重みが変わったので推論用の転置レイアウトを作り直す
+        network.rebuildInferenceLayout()
     }
 
     /// 単一サンプルの学習ステップ (直列用)
