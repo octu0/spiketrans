@@ -22,6 +22,10 @@ let package = Package(
         .executable(
             name: "stage2",
             targets: ["stage2"]
+        ),
+        .executable(
+            name: "transcribe",
+            targets: ["transcribe"]
         )
     ],
     dependencies: [
@@ -59,6 +63,11 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift")
             ],
             path: "script/stage2"
+        ),
+        .executableTarget(
+            name: "transcribe",
+            dependencies: ["Spiketrans"],
+            path: "script/transcribe"
         ),
         .testTarget(
             name: "SpiketransTests",

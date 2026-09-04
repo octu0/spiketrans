@@ -63,8 +63,15 @@ public struct WavParser: Sendable {
             // "fmt " chunk
             if chunkId0 == 0x66 && chunkId1 == 0x6d && chunkId2 == 0x74 && chunkId3 == 0x20 {
                 let formatCode = Int(bytes[offset+8]) | (Int(bytes[offset+9]) << 8)
-                if formatCode != 1 {
-                    throw WavParserError.unsupportedFormat("Only PCM (format 1) is supported, got \(formatCode)")
+                // 0xFFFE は WAVE_FORMAT_EXTENSIBLE。実体は末尾のサブフォーマット GUID が示し、
+                // 先頭 2 バイトが 1 なら PCM。macOS の afconvert 等はこの形式で書き出す
+                var isPCM = (formatCode == 1)
+                if formatCode == 0xFFFE && 40 <= chunkSize {
+                    let subFormat = Int(bytes[offset+32]) | (Int(bytes[offset+33]) << 8)
+                    isPCM = (subFormat == 1)
+                }
+                if isPCM != true {
+                    throw WavParserError.unsupportedFormat("Only PCM is supported, got format \(formatCode)")
                 }
                 channels = Int(bytes[offset+10]) | (Int(bytes[offset+11]) << 8)
                 sampleRate = Int(bytes[offset+12]) | (Int(bytes[offset+13]) << 8) | (Int(bytes[offset+14]) << 16) | (Int(bytes[offset+15]) << 24)
