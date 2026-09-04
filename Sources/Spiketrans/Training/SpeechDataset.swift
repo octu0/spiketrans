@@ -162,18 +162,37 @@ public final class SpeechDataset: @unchecked Sendable {
     }
 
     /// PCM 配列から 128次元音響特徴量系列 (Preemphasis + 64ch Mel + 3-tap 平滑/差分) を抽出
+    /// 発話単位のレベル正規化の目標 RMS。JSUT (スタジオ正規化済み) の実測値に合わせ、
+    /// 録音レベルがバラバラな実録音 (Common Voice・配信音声) を同じ入力電流レンジへ揃える
+    static let targetRMS: Float = 0.05
+    /// 正規化ゲインの上限。ほぼ無音の音声でノイズだけを増幅しないための歯止め
+    static let maxGain: Float = 20.0
+
     public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = 1) -> [[Float]] {
         let totalSamples = pcmData.count
         if totalSamples < 400 {
             return []
         }
 
+        // 0. 発話単位の RMS 正規化。静かな録音は入力電流が不足してスパイクが立たない
+        var sumSquares: Float = 0.0
+        var rIdx = 0
+        while rIdx < totalSamples {
+            sumSquares += pcmData[rIdx] * pcmData[rIdx]
+            rIdx += 1
+        }
+        let rms = sqrtf(sumSquares / Float(totalSamples))
+        var gain: Float = 1.0
+        if 1e-6 < rms {
+            gain = min(Self.targetRMS / rms, Self.maxGain)
+        }
+
         // 1. PCM プリエンファシス (2-tap, coeff: 0.97)
         var preemph = [Float](repeating: 0.0, count: totalSamples)
-        preemph[0] = pcmData[0]
+        preemph[0] = pcmData[0] * gain
         var pIdx = 1
         while pIdx < totalSamples {
-            preemph[pIdx] = pcmData[pIdx] - (0.97 * pcmData[pIdx - 1])
+            preemph[pIdx] = (pcmData[pIdx] - (0.97 * pcmData[pIdx - 1])) * gain
             pIdx += 1
         }
 

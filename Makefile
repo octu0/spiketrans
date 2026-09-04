@@ -6,8 +6,8 @@ SCHEME_TRAIN := train
 DESTINATION := platform=macOS
 CONFIG := Release
 
-# 引数パラメータ (CLIから DIR=... や EPOCHS=... 等で上書き可能)
-DIR ?= /path/to/loanword128
+# 引数パラメータ (CLIから DATA=... や EPOCHS=... 等で上書き可能)
+DATA ?= /path/to/train.jsonl
 EPOCHS ?= 200
 SAMPLES ?= 100
 WORKERS ?= 8
@@ -29,16 +29,16 @@ build-train:
 test:
 	xcodebuild test -scheme $(SCHEME_PKG) -destination '$(DESTINATION)' -configuration $(CONFIG) ENABLE_TESTABILITY=YES
 
-## GPU CTC 学習 & 全発話 CER 評価 (引数: DIR=..., EPOCHS=..., SAMPLES=...)
+## GPU CTC 学習 & 全発話 CER 評価 (引数: DATA=<manifest.jsonl>, EPOCHS=..., SAMPLES=...)
 ## 学習パラメータは script/train/main.swift の Defaults を参照
 train: build-train
 	@BIN=$$(ls -1d ~/Library/Developer/Xcode/DerivedData/spiketrans-*/Build/Products/$(CONFIG)/train | head -n 1); \
-	$$BIN -s $(SAMPLES) -e $(EPOCHS) -p $(WORKERS) --export-weights $(WEIGHTS) -d $(DIR)
+	$$BIN -s $(SAMPLES) -e $(EPOCHS) -p $(WORKERS) --export-weights $(WEIGHTS) -d $(DATA)
 
-## 学習済み重みを用いた全発話 CER 評価 (引数: DIR=..., WEIGHTS=...)
+## 学習済み重みを用いた全発話 CER 評価 (引数: DATA=<manifest.jsonl>, WEIGHTS=...)
 eval: build-train
 	@BIN=$$(ls -1d ~/Library/Developer/Xcode/DerivedData/spiketrans-*/Build/Products/$(CONFIG)/train | head -n 1); \
-	$$BIN -s $(SAMPLES) --import-weights $(WEIGHTS) -d $(DIR)
+	$$BIN -s $(SAMPLES) -e 0 --import-weights $(WEIGHTS) -d $(DATA)
 
 ## クリーン
 clean:
@@ -52,11 +52,12 @@ help:
 	@echo "  make build               - パッケージ全体を Release ビルド"
 	@echo "  make build-train         - train 実行バイナリを Release ビルド"
 	@echo "  make test                - Release 構成で全ユニットテスト・敵対的テストを実行"
-	@echo "  make train DIR=... [EPOCHS=... SAMPLES=... WEIGHTS=...]"
+	@echo "  make train DATA=<manifest.jsonl> [EPOCHS=... SAMPLES=... WEIGHTS=...]"
 	@echo "                           - GPU CTC 学習と全発話 CER 評価"
-	@echo "  make eval DIR=... WEIGHTS=... [SAMPLES=...]"
+	@echo "  make eval DATA=<manifest.jsonl> WEIGHTS=... [SAMPLES=...]"
 	@echo "                           - 学習済み重みで全発話 CER 評価"
 	@echo "  make clean               - ビルド成果物と中間生成物をクリーン"
 	@echo ""
-	@echo "学習パラメータ (フレーム束ね数・BPTT 窓・学習率・スライス重み等) は"
+	@echo "学習マニフェストは script/dataset/ の各コーパス用スクリプトで生成します。"
+	@echo "学習パラメータは"
 	@echo "script/train/main.swift の Defaults に定数として定義しています。"

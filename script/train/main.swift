@@ -36,27 +36,21 @@ enum Defaults {
     static let lrMax: Float = 0.003
     static let lrMin: Float = 0.0005
 
-    /// 各スライスの損失重み。
-    /// Base も実用対象とするため High 偏重を緩めている。
-    static let sliceWeightBase: Float = 0.5
-    static let sliceWeightHigh: Float = 1.0
-
     /// LIF 設定。ALIF (gamma > 0) は損失・CER とも悪化したため無効。
-    static let lifConfig = LIFConfig(beta: 0.80, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
-
-    /// High の事後確率を Base/Middle へ蒸留する重み。
-    /// 読み出し行列を共有したまま、High が獲得したアライメントを小スライスへ伝える。
-    static let distillWeight: Float = 1.0
+    static let lifConfig = LIFConfig(beta: 0.92, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
 
     /// N エポックごとの重み書き出し
     static let checkpointEvery = 10
 
     /// ミニバッチサイズ
-    static let batchSize = 16
+    static let batchSize = 64
 
     /// 第2段 言語 SNN の予測一致加点。
     /// 現状は第1段の出力に対して効果が測定できなかったため 0 (言語 SNN の学習ごと省略)。
     static let languageBonus: Float = 0.0
+
+    /// 推論時の CTC ブランク割引率 (0.0 で無効)
+    static let blankPenalty: Float = 0.0
 }
 
 /// 並列評価の既定ワーカー数は P コア数。静的分割で E コアを混ぜると
@@ -95,7 +89,7 @@ while argIdx < args.count {
     case "-e", "--epochs":
         if (argIdx + 1) < args.count {
             if let val = Int(args[argIdx + 1]) {
-                epochs = max(1, val)
+                epochs = max(0, val)
             }
             argIdx += 1
         }
@@ -136,9 +130,10 @@ while argIdx < args.count {
 
 // データセットのパスは必須。特定コーパスを既定値に埋め込まない
 if datasetPath.isEmpty {
-    print("エラー: データセットディレクトリを指定してください。")
-    print("  使い方: train -d <データセットディレクトリ> [-s 件数] [-e エポック数]")
-    print("  ディレクトリ構成: <dir>/transcript_utf8.txt と <dir>/wav/<fileId>.wav")
+    print("エラー: 学習マニフェスト (JSONL) を指定してください。")
+    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数]")
+    print("  各行: {\"path\": \"/path/to/voice.wav\", \"text\": \"漢字かな混じりの発話テキスト\"}")
+    print("  マニフェストは script/dataset/ の各コーパス用スクリプトで生成する")
     exit(1)
 }
 
@@ -172,28 +167,39 @@ if let imp = importWeightsPath {
     print("重み読込元 (--import-weights): \(imp)")
 }
 
-// 2. transcript_utf8.txt からコーパスとファイルリストを読み込み (漢字のまま)
-let transcriptPath = (datasetPath as NSString).appendingPathComponent("transcript_utf8.txt")
-let wavDir = (datasetPath as NSString).appendingPathComponent("wav")
+// 2. JSONL マニフェストから発話リストを読み込み (漢字のまま)。
+// 各行が {"path": ..., "text": ...} の 1 発話。コーパス固有の構造は
+// script/dataset/ の生成スクリプト側で吸収し、学習側はこの形式だけを知る。
+struct ManifestEntry: Codable {
+    let path: String
+    let text: String
+}
 
-guard let transcriptContent = try? String(contentsOfFile: transcriptPath, encoding: .utf8) else {
-    print("エラー: \(transcriptPath) が見つかりません。")
+guard let manifestContent = try? String(contentsOfFile: datasetPath, encoding: .utf8) else {
+    print("エラー: マニフェスト \(datasetPath) が読み込めません。")
     exit(1)
 }
 
+let manifestDir = (datasetPath as NSString).deletingLastPathComponent
+let jsonDecoder = JSONDecoder()
 var textLines: [String] = []
-var rawPairs: [(fileId: String, text: String)] = []
+var rawPairs: [(path: String, fileId: String, text: String)] = []
 
-for line in transcriptContent.components(separatedBy: .newlines) {
+for line in manifestContent.components(separatedBy: .newlines) {
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty != true {
-        let parts = trimmed.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: true)
-        if parts.count == 2 {
-            let fileId = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let text = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-            textLines.append(text)
-            rawPairs.append((fileId: fileId, text: text))
+        guard let entry = try? jsonDecoder.decode(ManifestEntry.self, from: Data(trimmed.utf8)) else {
+            print("エラー: マニフェストの行を解釈できません: \(trimmed.prefix(120))")
+            exit(1)
         }
+        // 相対パスはマニフェストのあるディレクトリ基準で解決する
+        var wavPath = entry.path
+        if wavPath.hasPrefix("/") != true {
+            wavPath = (manifestDir as NSString).appendingPathComponent(wavPath)
+        }
+        let fileId = ((wavPath as NSString).lastPathComponent as NSString).deletingPathExtension
+        textLines.append(entry.text)
+        rawPairs.append((path: wavPath, fileId: fileId, text: entry.text))
     }
 }
 
@@ -228,7 +234,7 @@ for pair in rawPairs {
         break
     }
 
-    let wavPath = (wavDir as NSString).appendingPathComponent("\(pair.fileId).wav")
+    let wavPath = pair.path
     if FileManager.default.fileExists(atPath: wavPath) {
         if let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)) {
             let bytes = [UInt8](fileData)
@@ -299,15 +305,31 @@ let trainer = Trainer(
     config: trainConfig
 )
 
+// 重みのインポート。-e 0 なら評価のみ、-e N なら読み込んだ重みから追加学習する
+var importedWeights: SpikingNetworkWeights? = nil
 if let impPath = importWeightsPath {
     print("\n[重み読込] 外部ファイルからモデル重みをインポート中: \(impPath)")
     let impURL = URL(fileURLWithPath: impPath)
-    if let wData = try? SpikingNetworkWeights.load(from: impURL) {
-        trainer.acousticTrainer.network.importWeights(from: wData)
-        print("  ✓ 音響モデル重みのインポートが完了しました。学習フェーズをスキップします。")
-    } else {
-        print("  ✕ 重みファイルの読み込みに失敗しました。通常学習を実行します。")
+    guard let wData = try? SpikingNetworkWeights.load(from: impURL) else {
+        print("  ✕ 重みファイルの読み込みに失敗しました。")
+        exit(1)
     }
+    guard wData.outputDim == phoneticVocabulary.size,
+          wData.inputDim == acousticInputDim else {
+        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size))。")
+        exit(1)
+    }
+    trainer.acousticTrainer.network.importWeights(from: wData)
+    importedWeights = wData
+    if epochs == 0 {
+        print("  ✓ 音響モデル重みのインポート完了。評価のみ実行します (-e 0)。")
+    } else {
+        print("  ✓ 音響モデル重みのインポート完了。この重みから \(epochs) エポックの追加学習を行います。")
+    }
+}
+
+if epochs == 0 {
+    // 追加学習なし。インポート済み重みで評価へ進む
 } else if useGPU {
     print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(Defaults.batchSize))...")
 
@@ -326,39 +348,68 @@ if let impPath = importWeightsPath {
         timeSteps: 4,
         lifConfig: trainer.acousticTrainer.network.lifConfig
     )
+    if let wData = importedWeights {
+        mlxNet.importWeights(from: wData)
+        print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
+    }
     let mlxTrainer = MLXBPTTTrainer(
         network: mlxNet,
         config: trainConfig,
-        bpttWindow: Defaults.bpttWindow,
-        sliceWeightBase: Defaults.sliceWeightBase,
-        sliceWeightHigh: Defaults.sliceWeightHigh,
-        distillWeight: Defaults.distillWeight
+        bpttWindow: Defaults.bpttWindow
     )
-    print("  スライス損失重み (Base/High): \(Defaults.sliceWeightBase) / \(Defaults.sliceWeightHigh)")
     print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
-    print("  High → Base/Middle 蒸留重み: \(Defaults.distillWeight)")
     let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 4)
     print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
     let trainStartTime = CFAbsoluteTimeGetCurrent()
 
     let batchSize = Defaults.batchSize
 
+    // CTC はフレーム数 T >= ラベル数 + 連続重複数 を要求する。
+    // これを満たさないサンプル (早口・短尺音声に長い教師) は尤度が定義できず、
+    // 番兵 -1e30 が損失に漏れて学習を汚染するため除外する。
+    func ctcMinimumFrames(_ labels: [Int]) -> Int {
+        var required = labels.count
+        var i = 1
+        while i < labels.count {
+            if labels[i] == labels[i - 1] {
+                required += 1
+            }
+            i += 1
+        }
+        return required
+    }
+    var feasibleIndices: [Int] = []
+    var infeasibleCount = 0
+    var di = 0
+    while di < dataset.count {
+        let frames = dataset[di].acousticFeatures.count
+        if ctcMinimumFrames(allTargets[di]) <= frames {
+            feasibleIndices.append(di)
+        } else {
+            infeasibleCount += 1
+        }
+        di += 1
+    }
+    if 0 < infeasibleCount {
+        print("  CTC 整合不可のため学習から除外: \(infeasibleCount) 件 (フレーム数 < 必要ラベル長)")
+    }
+
     // 長さ順にバッチを組む。バッチ内の最長フレーム数までパディングされるため、
     // 長さの近いサンプルをまとめると無駄な逐次ステップが減る。
-    let lengthSortedIndices = (0..<dataset.count).sorted { a, b in
+    let lengthSortedIndices = feasibleIndices.sorted { a, b in
         return dataset[a].acousticFeatures.count < dataset[b].acousticFeatures.count
     }
     var paddedFrameTotal = 0
     var unsortedFrameTotal = 0
     var probeStart = 0
-    while probeStart < dataset.count {
-        let probeEnd = min(probeStart + batchSize, dataset.count)
+    while probeStart < lengthSortedIndices.count {
+        let probeEnd = min(probeStart + batchSize, lengthSortedIndices.count)
         var sortedMax = 0
         var plainMax = 0
         var pi = probeStart
         while pi < probeEnd {
             sortedMax = max(sortedMax, dataset[lengthSortedIndices[pi]].acousticFeatures.count)
-            plainMax = max(plainMax, dataset[pi].acousticFeatures.count)
+            plainMax = max(plainMax, dataset[feasibleIndices[pi]].acousticFeatures.count)
             pi += 1
         }
         paddedFrameTotal += sortedMax
@@ -377,8 +428,8 @@ if let impPath = importWeightsPath {
         var batchCount = 0
 
         var bStart = 0
-        while bStart < dataset.count {
-            let bEnd = min(bStart + batchSize, dataset.count)
+        while bStart < lengthSortedIndices.count {
+            let bEnd = min(bStart + batchSize, lengthSortedIndices.count)
             var fBatch: [[[Float]]] = []
             var tBatch: [[Int]] = []
             var idx = bStart
@@ -827,6 +878,8 @@ func levenshteinDistance(_ s1: String, _ s2: String) -> Int {
 struct EvalResult {
     let index: Int
     let fileId: String
+    /// 由来コーパス (WAV の親ディレクトリ名)。複数コーパス混合時の内訳集計用
+    let corpus: String
     let targetText: String
     let predText: String
     let editDistance: Int
@@ -919,7 +972,7 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
 }
 
 let parser = WavParser()
-let dummyEval = EvalResult(index: 0, fileId: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0, goldKanaKanji: "", goldKanaKanjiCer: 1.0, goldKanaKanjiCerNoPunct: 1.0, goldExactNoPunct: false)
+let dummyEval = EvalResult(index: 0, fileId: "", corpus: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0, goldKanaKanji: "", goldKanaKanjiCer: 1.0, goldKanaKanjiCerNoPunct: 1.0, goldExactNoPunct: false)
 
 final class BatchEvalBuffer: @unchecked Sendable {
     var results: [EvalResult]
@@ -945,7 +998,7 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
     let goldDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
     func processUtterance(_ idx: Int) {
         let pair = evalPairs[idx]
-        let wavPath = (wavDir as NSString).appendingPathComponent("\(pair.fileId).wav")
+        let wavPath = pair.path
         if FileManager.default.fileExists(atPath: wavPath) != true {
             return
         }
@@ -971,7 +1024,8 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
                 minConfidence: 0.05,
                 boundaries: boundaries,
                 useCTC: true,
-                languageBonus: evalLanguageBonus
+                languageBonus: evalLanguageBonus,
+                blankPenalty: Defaults.blankPenalty
             )
             let dist = levenshteinDistance(pair.text, res.kanji)
             let cer = Float(dist) / Float(max(1, pair.text.count))
@@ -988,9 +1042,15 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
             let goldDistNoPunct = levenshteinDistance(targetNoPunct, goldNoPunct)
             let goldCerNoPunct = Float(goldDistNoPunct) / Float(max(1, targetNoPunct.count))
 
+            var corpusDir = ((pair.path as NSString).deletingLastPathComponent as NSString).lastPathComponent
+            if corpusDir == "wav" {
+                let parent = ((pair.path as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+                corpusDir = (parent as NSString).lastPathComponent
+            }
             return EvalResult(
                 index: idx + 1,
                 fileId: pair.fileId,
+                corpus: corpusDir,
                 targetText: pair.text,
                 predText: res.kanji,
                 editDistance: dist,
@@ -1032,6 +1092,19 @@ let unseenResults = allEval.filter { $0.isTrain != true }
 
 let trainSummary = computeSummary(trainResults)
 let unseenSummary = computeSummary(unseenResults)
+
+// 複数コーパス混合時はコーパスごとの内訳も出す
+let corpusGroups = Dictionary(grouping: allEval, by: { $0.corpus })
+func printCorpusBreakdown() {
+    if corpusGroups.count < 2 {
+        return
+    }
+    print("\n=== [コーパス別内訳] ===")
+    for (name, results) in corpusGroups.sorted(by: { $0.key < $1.key }) {
+        let cs = computeSummary(results)
+        print("  • \(name) (\(cs.count)件): Exact率: \(String(format: "%.1f", cs.exactRate))%, 漢字CER: \(String(format: "%.2f", cs.meanCer))% (中央値 \(String(format: "%.2f", cs.medianCer))%), かなCER: \(String(format: "%.2f", cs.meanKanaCer))% (中央値 \(String(format: "%.2f", cs.medianKanaCer))%)")
+    }
+}
 
 func printSliceSummary(
     _ label: String,
@@ -1198,7 +1271,7 @@ if 0 < rawPairs.count {
     var benchIdx = 0
     while benchIdx < benchCount {
         let pair = rawPairs[benchIdx]
-        let wavPath = (wavDir as NSString).appendingPathComponent("\(pair.fileId).wav")
+        let wavPath = pair.path
         if let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
            let wavData = try? parser.parse(bytes: [UInt8](fileData)) {
             let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
@@ -1303,6 +1376,7 @@ print("=== [集計結果] 学習セット (\(trainSummary.count)件) vs 未学�
 print("=== かなCER = 第1段 音響 SNN の音素発火精度 / 漢字CER = 第2段 通過後の最終精度 ===")
 print("==================================================")
 printSliceSummary("隠れ層 \(Defaults.maxHiddenDim)次元", train: trainSummary, unseen: unseenSummary)
+printCorpusBreakdown()
 
 // 未学習セットのソート (High スライスの CER 順)
 let sortedUnseen = unseenResults.sorted { $0.cer < $1.cer }

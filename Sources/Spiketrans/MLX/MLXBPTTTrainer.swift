@@ -14,32 +14,15 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// フレームをまたぐ信用割り当てが完全に消え、第1段は実質フレーム独立の
     /// 分類器になる。大きくすると時間文脈を学習できる一方、計算グラフが深くなる。
     public let bpttWindow: Int
-    /// 各スライスの損失重み。
-    ///
-    /// Base は「速度優先だが文字起こしとして成立する」ことが要件のため、
-    /// 用途に応じて High 偏重から均等寄りへ調整できるようにしている。
-    public let sliceWeightBase: Float
-    public let sliceWeightHigh: Float
-    /// High の事後確率を Base/Middle へ蒸留する重み (0.0 で無効)。
-    /// CTC 単独だと小スライスは自前の (誤った) アライメントで学習してしまうため、
-    /// High が獲得したフレーム単位のアライメントを教師として与える。
-    public let distillWeight: Float
-
     public init(
         network: MLXSpikingNetwork,
         config: TrainingConfig = TrainingConfig(learningRate: 0.015),
-        bpttWindow: Int = 16,
-        sliceWeightBase: Float = 0.1,
-        sliceWeightHigh: Float = 1.0,
-        distillWeight: Float = 1.0
+        bpttWindow: Int = 16
     ) {
         self.network = network
         self.config = config
         self.optimizer = Adam(learningRate: config.learningRate)
         self.bpttWindow = max(1, bpttWindow)
-        self.sliceWeightBase = sliceWeightBase
-        self.sliceWeightHigh = sliceWeightHigh
-        self.distillWeight = distillWeight
     }
 
     /// 学習率を更新

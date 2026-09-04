@@ -70,3 +70,5 @@ fastlane/test_output
 ./script/benchmark/benchmark_runner
 ./script/train/train_runner
 default.profraw
+script/dataset/*
+!script/dataset/.gitkeep

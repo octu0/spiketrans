@@ -362,7 +362,8 @@ extension Trainer {
     /// 学習側と同じ sliceNorm を適用するためスライス間のスケールも一致する。
     public func transcribeAcousticCTC(
         featuresSeq: [[Float]],
-        beamWidth: Int = 16
+        beamWidth: Int = 16,
+        blankPenalty: Float = 0.0
     ) -> String {
         if featuresSeq.isEmpty {
             return ""
@@ -390,12 +391,19 @@ extension Trainer {
             repeating: [Float](repeating: 0.0, count: outDim),
             count: frameProbs.count
         )
+        // ブランク割引: 疎なスパイクでは不確実フレームがブランクに寄りやすく
+        // 文字脱落を招くため、ブランク確率を一定率で割り引く
+        let blankDiscount = max(0.01, 1.0 - blankPenalty)
         var f = 0
         while f < frameProbs.count {
             let probs = frameProbs[f].probabilities
             var c = 0
             while c < outDim {
-                logProbs[f][c] = log(max(1e-30, probs[c]))
+                var prob = probs[c]
+                if c == TextVocabulary.padId && 0.0 < blankPenalty {
+                    prob *= blankDiscount
+                }
+                logProbs[f][c] = log(max(1e-30, prob))
                 c += 1
             }
             f += 1
@@ -418,11 +426,12 @@ extension Trainer {
         minConfidence: Float = 0.05,
         boundaries: [Int]? = nil,
         useCTC: Bool = false,
-        languageBonus: Float = 4.0
+        languageBonus: Float = 4.0,
+        blankPenalty: Float = 0.0
     ) -> (kana: String, kanji: String) {
         let kanaText: String
         if useCTC {
-            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, beamWidth: 16)
+            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, beamWidth: 16, blankPenalty: blankPenalty)
         } else {
             kanaText = transcribeAcousticDirect(
                 featuresSeq: featuresSeq,

@@ -15,6 +15,7 @@ var nbest = 0              // 0 で N-best 評価なし
 var lmWeightsPath = ""     // 言語モデル重みのパス。無ければ学習して保存する
 var lmEpochs = 60
 var lmWeight: Float = 0.5  // 再スコアリングにおける言語モデルの重み
+var extraCorpusPath = ""   // 第2段辞書に統合する追加コーパステキストのパス
 
 var argIdx = 1
 let args = CommandLine.arguments
@@ -50,6 +51,11 @@ while argIdx < args.count {
             if let v = Int(args[argIdx + 1]) {
                 lmEpochs = max(1, v)
             }
+            argIdx += 1
+        }
+    case "--extra-corpus":
+        if (argIdx + 1) < args.count {
+            extraCorpusPath = args[argIdx + 1]
             argIdx += 1
         }
     case "--lm-weight":
@@ -111,6 +117,21 @@ let dictTexts = Array(texts.prefix(dictLimit))
 let converter = KanjiConverter()
 let dictionary = KanaKanjiDictionary()
 dictionary.buildFromCorpus(rawTexts: dictTexts, converter: converter)
+if extraCorpusPath.isEmpty != true {
+    guard let extraContent = try? String(contentsOfFile: extraCorpusPath, encoding: .utf8) else {
+        print("追加コーパスの読み込みに失敗: \(extraCorpusPath)")
+        exit(1)
+    }
+    var extraLines: [String] = []
+    for line in extraContent.components(separatedBy: .newlines) {
+        let tr = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if tr.isEmpty != true {
+            extraLines.append(tr)
+        }
+    }
+    dictionary.buildFromCorpus(rawTexts: extraLines, converter: converter)
+    print("追加コーパス統合: \(extraCorpusPath) (\(extraLines.count) 行)")
+}
 
 print("データセット: \(datasetPath)")
 print("総行数: \(texts.count) 行 / 辞書構築: \(dictTexts.count) 行")
