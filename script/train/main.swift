@@ -42,6 +42,11 @@ enum Defaults {
     /// N エポックごとの重み書き出し
     static let checkpointEvery = 10
 
+    /// 学習セットから評価する最大件数。
+    /// 学習データが数十万件になると全件評価だけで何時間もかかるため、
+    /// 再現性の確認はこの件数の抽出で足りる (未学習セットは常に全件評価する)
+    static let maxTrainEvalSamples = 5000
+
     /// ミニバッチサイズ
     static let batchSize = 64
 
@@ -849,7 +854,7 @@ if 0 < dataset.count {
 // === 4. データセット全件の正誤率・CER 評価 ===
 // ==================================================
 print("\n==================================================")
-print("=== 4. 全 \(rawPairs.count) サンプル 音響直接デコード CER 評価 ===")
+print("=== 4. 音響直接デコード CER 評価 ===")
 print("==================================================")
 
 /// 句読点を除去した文字列 (句読点の寄与を分離して測るため)
@@ -1015,15 +1020,51 @@ final class BatchEvalBuffer: @unchecked Sendable {
     }
 }
 
-let evalBuffer = BatchEvalBuffer(count: rawPairs.count, dummy: dummyEval)
+// 評価対象の選定。
+// 未学習セットは全件、学習セットは等間隔で間引く。
+// 間引きは先頭からの連続ではなく全域から取るため、コーパスの偏りが出ない
+var evalIndices: [Int] = []
+let trainEvalTarget = min(Defaults.maxTrainEvalSamples, sampleLimit)
+if trainEvalTarget < sampleLimit {
+    // 比例配分で全域から均等に取る。指定件数がそのまま得られる
+    var previousBucket = -1
+    var selectIdx = 0
+    while selectIdx < sampleLimit {
+        let bucket = (selectIdx * trainEvalTarget) / sampleLimit
+        if bucket != previousBucket {
+            evalIndices.append(selectIdx)
+            previousBucket = bucket
+        }
+        selectIdx += 1
+    }
+} else {
+    var selectIdx = 0
+    while selectIdx < sampleLimit {
+        evalIndices.append(selectIdx)
+        selectIdx += 1
+    }
+}
+var unseenIdx = sampleLimit
+while unseenIdx < rawPairs.count {
+    evalIndices.append(unseenIdx)
+    unseenIdx += 1
+}
+
+let evalBuffer = BatchEvalBuffer(count: evalIndices.count, dummy: dummyEval)
 let evalLanguageBonus = Defaults.languageBonus
-let evalLimit = sampleLimit
-let evalPairs = rawPairs
+let evalPairs = evalIndices.map { rawPairs[$0] }
+let evalIsTrain = evalIndices.map { $0 < sampleLimit }
 let evalKanjiConverter = KanjiConverter()
 let evalFrameStack = Defaults.frameStack
 
 let evalWorkers = max(1, numWorkers)
-print("全 \(rawPairs.count) 件の WAV 読み込み・並列推論実行中 (\(evalWorkers) ワーカー)...")
+let unseenEvalCount = rawPairs.count - sampleLimit
+if trainEvalTarget < sampleLimit {
+    print("評価対象: 学習セット \(trainEvalTarget) 件 (\(sampleLimit) 件から均等抽出) + 未学習セット \(unseenEvalCount) 件 (全件)")
+} else {
+    print("評価対象: 学習セット \(trainEvalTarget) 件 + 未学習セット \(unseenEvalCount) 件 (いずれも全件)")
+}
+print("全 \(evalPairs.count) 件の WAV 読み込み・並列推論実行中 (\(evalWorkers) ワーカー)...")
 let evalStartTime = Date()
 DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
     // 第2段デコーダはワーカー内で使い回し、発話ごとの再確保を避ける
@@ -1042,7 +1083,7 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
         let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: evalFrameStack)
         let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
-        let isTrain = idx < evalLimit
+        let isTrain = evalIsTrain[idx]
 
         // 正解のかな読み (第1段の評価基準)
         let targetKana = evalKanjiConverter.convertToHiragana(pair.text)
@@ -1112,7 +1153,7 @@ print(String(format: "評価所要時間: %.1f 秒 (%d ワーカー)", Date().ti
 
 var allEval: [EvalResult] = []
 var evIdx = 0
-while evIdx < rawPairs.count {
+while evIdx < evalPairs.count {
     if evalBuffer.valid[evIdx] {
         allEval.append(evalBuffer.results[evIdx])
     }
@@ -1433,10 +1474,10 @@ printExamples("未学習セット 悪い例 Top 5", top5Worst)
 
 // レポートファイルの生成
 var reportContent = """
-# \(datasetPath) 全 \(rawPairs.count) 発話 正誤率・CER 評価レポート
+# \(datasetPath) 正誤率・CER 評価レポート
 
 ## 1. 概要
-- **評価対象**: `\(datasetPath)` 全 \(rawPairs.count) 発話 (WAV + UTF-8 正解テキスト)
+- **評価対象**: `\(datasetPath)` \(evalPairs.count) 発話 (学習セットは間引き / 未学習セットは全件)
 - **モデル**: `-s \(sampleLimit) -e \(epochs)` で学習した直接漢字音響 SNN (学習セット \(sampleLimit) 発話)
 - **第1段 LIF**: beta = \(Defaults.lifConfig.beta), rho = \(Defaults.lifConfig.rho), gamma = \(Defaults.lifConfig.gamma)
 - **特徴量**: \(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね = \(Defaults.acousticInputDim) 次元
