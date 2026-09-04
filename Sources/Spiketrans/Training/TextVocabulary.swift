@@ -77,6 +77,27 @@ public struct TextVocabulary: Sendable {
         self.charToIdTable = table
     }
 
+    /// 特殊トークンを除いた文字列。重みファイルへ同梱して ID 割当を再現するために使う。
+    /// これを `init(characters:)` に渡せば同じ語彙が復元できる
+    public var serializedCharacters: String {
+        let specialChars: Set<Character> = ["\u{0000}", "\u{0001}", "\u{0002}", "\u{0003}"]
+        var result = ""
+        var i = 0
+        while i < tokenList.count {
+            let c = tokenList[i]
+            if specialChars.contains(c) != true {
+                result.append(c)
+            }
+            i += 1
+        }
+        return result
+    }
+
+    /// `serializedCharacters` から語彙を復元する
+    public init(serializedCharacters: String) {
+        self.init(characters: Array(serializedCharacters))
+    }
+
     /// 文字からトークン ID を取得
     public func id(for char: Character) -> Int {
         switch charToIdTable[char] {

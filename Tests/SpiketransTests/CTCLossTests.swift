@@ -71,4 +71,59 @@ final class CTCLossTests: XCTestCase {
         let beamRes = decoder.decode(logProbs: logProbs)
         XCTAssertEqual(beamRes.tokens, [4], "Beam search CTC should decode identical token")
     }
+
+    /// フレーム単位に流し込んだ結果が、一括デコードと一致すること
+    func testCTCStreamingMatchesBatch() {
+        let vocab = TextVocabulary(characters: ["あ", "い", "う", "え", "お"])
+        let decoder = CTCBeamDecoder(vocabulary: vocab, blankId: 0, beamWidth: 8)
+
+        // 適当だが決定的な対数確率系列を作る
+        var logProbs: [[Float]] = []
+        var t = 0
+        while t < 40 {
+            var frame = [Float](repeating: -8.0, count: vocab.size)
+            let peak = (t / 5) % vocab.size
+            frame[peak] = -0.2
+            frame[(peak + 1) % vocab.size] = -1.5
+            frame[0] = (t % 3 == 0) ? -0.5 : -3.0
+            logProbs.append(frame)
+            t += 1
+        }
+
+        let batch = decoder.decode(logProbs: logProbs)
+
+        let streaming = decoder.makeStreamingDecoder()
+        var i = 0
+        while i < logProbs.count {
+            streaming.push(frame: logProbs[i])
+            i += 1
+        }
+        let incremental = streaming.best
+
+        XCTAssertEqual(streaming.frameCount, logProbs.count)
+        XCTAssertEqual(incremental.text, batch.text)
+        XCTAssertEqual(incremental.tokens, batch.tokens)
+        XCTAssertEqual(incremental.score, batch.score, accuracy: 1e-5)
+    }
+
+    /// 途中結果が伸びていくこと、reset で初期状態へ戻ること
+    func testCTCStreamingPartialAndReset() {
+        let vocab = TextVocabulary(characters: ["あ", "い", "う"])
+        let decoder = CTCBeamDecoder(vocabulary: vocab, blankId: 0, beamWidth: 4)
+        let streaming = decoder.makeStreamingDecoder()
+
+        XCTAssertEqual(streaming.best.text, "")
+
+        // 「あ」を強く出すフレームを積むと、途中結果に文字が現れる
+        var frame = [Float](repeating: -9.0, count: vocab.size)
+        frame[vocab.id(for: "あ")] = -0.05
+        streaming.push(frame: frame)
+        streaming.push(frame: frame)
+        let partial = streaming.best.text
+        XCTAssertFalse(partial.isEmpty)
+
+        streaming.reset()
+        XCTAssertEqual(streaming.frameCount, 0)
+        XCTAssertEqual(streaming.best.text, "")
+    }
 }

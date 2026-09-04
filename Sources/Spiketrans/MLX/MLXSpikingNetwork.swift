@@ -61,7 +61,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     }
 
     /// Pure Swift の SpikingNetworkWeights へ重みをエクスポート
-    public func exportWeights() -> SpikingNetworkWeights {
+    public func exportWeights(vocabulary: TextVocabulary? = nil) -> SpikingNetworkWeights {
         eval(self.wIn, self.wRec, self.bH, self.wOut, self.bOut)
 
         // [inputDim, maxHiddenDim] -> transposed [maxHiddenDim, inputDim] -> [Float]
@@ -81,7 +81,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             wRec: wRecFlat,
             bH: bHFlat,
             wOut: wOutFlat,
-            bOut: bOutFlat
+            bOut: bOutFlat,
+            vocabularyCharacters: vocabulary?.serializedCharacters
         )
     }
 }

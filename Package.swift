@@ -26,6 +26,10 @@ let package = Package(
         .executable(
             name: "transcribe",
             targets: ["transcribe"]
+        ),
+        .executable(
+            name: "mictrans",
+            targets: ["mictrans"]
         )
     ],
     dependencies: [
@@ -68,6 +72,11 @@ let package = Package(
             name: "transcribe",
             dependencies: ["Spiketrans"],
             path: "script/transcribe"
+        ),
+        .executableTarget(
+            name: "mictrans",
+            dependencies: ["Spiketrans"],
+            path: "Sources/mictrans"
         ),
         .testTarget(
             name: "SpiketransTests",

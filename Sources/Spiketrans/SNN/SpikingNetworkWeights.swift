@@ -19,6 +19,10 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let wOut: [Float]   // [outputDim * maxHiddenDim]
     public let bOut: [Float]   // [outputDim]
 
+    /// 出力層の ID 割当に対応する文字列 (特殊トークンを除く)。
+    /// 言語モデルなど語彙を持たないネットワークでは nil になる
+    public let vocabularyCharacters: String?
+
     public init(
         inputDim: Int,
         maxHiddenDim: Int,
@@ -34,7 +38,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         wRec: [Float],
         bH: [Float],
         wOut: [Float],
-        bOut: [Float]
+        bOut: [Float],
+        vocabularyCharacters: String? = nil
     ) {
         self.inputDim = inputDim
         self.maxHiddenDim = maxHiddenDim
@@ -51,6 +56,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.bH = bH
         self.wOut = wOut
         self.bOut = bOut
+        self.vocabularyCharacters = vocabularyCharacters
     }
 
     /// LIFConfig から直接構築
@@ -64,7 +70,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         wRec: [Float],
         bH: [Float],
         wOut: [Float],
-        bOut: [Float]
+        bOut: [Float],
+        vocabularyCharacters: String? = nil
     ) {
         self.init(
             inputDim: inputDim,
@@ -81,7 +88,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wRec: wRec,
             bH: bH,
             wOut: wOut,
-            bOut: bOut
+            bOut: bOut,
+            vocabularyCharacters: vocabularyCharacters
         )
     }
 
@@ -95,6 +103,14 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             rho: rho,
             gamma: gamma
         )
+    }
+
+    /// 同梱された語彙。無ければ nil (学習時テキストからの再構築が必要)
+    public var vocabulary: TextVocabulary? {
+        guard let chars = vocabularyCharacters, chars.isEmpty != true else {
+            return nil
+        }
+        return TextVocabulary(serializedCharacters: chars)
     }
 
     /// ファイルに保存

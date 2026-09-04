@@ -104,34 +104,48 @@ guard let weights = try? SpikingNetworkWeights.load(from: URL(fileURLWithPath: w
 print("第1段: 入力 \(weights.inputDim) 次元 / 隠れ \(weights.maxHiddenDim) / 出力 \(weights.outputDim), beta = \(weights.beta)")
 
 // 3. 語彙と第2段辞書。
-// 語彙は重みファイルに含まれないため、学習時と同じテキストから作り直す必要がある。
-if dictPath.isEmpty {
-    print("エラー: 学習時と同じテキスト (-d) が必要です。かな語彙の ID 割当を再現するために使います。")
-    exit(1)
-}
-guard let dictContent = try? String(contentsOfFile: dictPath, encoding: .utf8) else {
-    print("エラー: テキストを読み込めません: \(dictPath)")
-    exit(1)
-}
+// 語彙は重みに同梱されているものを優先し、無い場合だけテキストから作り直す。
 var corpusLines: [String] = []
-for line in dictContent.components(separatedBy: .newlines) {
-    let tr = line.trimmingCharacters(in: .whitespacesAndNewlines)
-    if tr.isEmpty != true {
-        corpusLines.append(tr)
+if dictPath.isEmpty != true {
+    guard let dictContent = try? String(contentsOfFile: dictPath, encoding: .utf8) else {
+        print("エラー: テキストを読み込めません: \(dictPath)")
+        exit(1)
+    }
+    for line in dictContent.components(separatedBy: "\n") {
+        let tr = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if tr.isEmpty != true {
+            corpusLines.append(tr)
+        }
     }
 }
+
 let kanjiConverter = KanjiConverter()
-let phoneticVocabulary = TextVocabulary(corpus: corpusLines.map { kanjiConverter.convertToHiragana($0) })
+let phoneticVocabulary: TextVocabulary
+switch weights.vocabulary {
+case .some(let embedded):
+    phoneticVocabulary = embedded
+    print("かな語彙: \(phoneticVocabulary.size) 文字 (重みに同梱)")
+case .none:
+    if corpusLines.isEmpty {
+        print("エラー: この重みにはかな語彙が含まれていません。学習時と同じテキストを -d に指定してください。")
+        exit(1)
+    }
+    phoneticVocabulary = TextVocabulary(corpus: corpusLines.map { kanjiConverter.convertToHiragana($0) })
+    print("かな語彙: \(phoneticVocabulary.size) 文字 (\(corpusLines.count) 行から再構築)")
+}
 if phoneticVocabulary.size != weights.outputDim {
-    print("エラー: 語彙数 \(phoneticVocabulary.size) が重みの出力次元 \(weights.outputDim) と一致しません。学習時と同じテキストを指定してください。")
+    print("エラー: 語彙数 \(phoneticVocabulary.size) が重みの出力次元 \(weights.outputDim) と一致しません。")
     exit(1)
 }
-print("かな語彙: \(phoneticVocabulary.size) 文字 (\(corpusLines.count) 行から再構築)")
 
 let kanaKanjiDict = KanaKanjiDictionary()
-kanaKanjiDict.buildFromCorpus(rawTexts: corpusLines)
-print("第2段辞書: \(kanaKanjiDict.count) 語")
-report("辞書構築後")
+if corpusLines.isEmpty != true {
+    kanaKanjiDict.buildFromCorpus(rawTexts: corpusLines)
+    print("第2段辞書: \(kanaKanjiDict.count) 語")
+    report("辞書構築後")
+} else {
+    print("第2段辞書: なし (かなのみ出力します)")
+}
 
 // 4. 分割単位の決定
 let frameStack = 4
@@ -231,7 +245,7 @@ print("  処理フレーム数: \(totalFrames), かな文字数: \(kanaText.coun
 print(String(format: "  ピークメモリ: %.0f MB", peakMemory))
 
 // 6. 第2段 (辞書がある場合)
-if 0 < kanaText.count {
+if 0 < kanaText.count && 0 < kanaKanjiDict.count {
     let stage2Start = CFAbsoluteTimeGetCurrent()
     let kanaDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
     var kanjiParts: [String] = []

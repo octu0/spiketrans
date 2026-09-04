@@ -77,7 +77,7 @@ public final class SpikingNetwork: @unchecked Sendable {
     }
 
     /// 全体重みのエクスポート
-    public func exportWeights() -> SpikingNetworkWeights {
+    public func exportWeights(vocabulary: TextVocabulary? = nil) -> SpikingNetworkWeights {
         return SpikingNetworkWeights(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
@@ -88,7 +88,8 @@ public final class SpikingNetwork: @unchecked Sendable {
             wRec: pWRec.data,
             bH: pBH.data,
             wOut: pWOut.data,
-            bOut: pBOut.data
+            bOut: pBOut.data,
+            vocabularyCharacters: vocabulary?.serializedCharacters
         )
     }
 

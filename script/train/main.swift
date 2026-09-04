@@ -185,7 +185,9 @@ let jsonDecoder = JSONDecoder()
 var textLines: [String] = []
 var rawPairs: [(path: String, fileId: String, text: String)] = []
 
-for line in manifestContent.components(separatedBy: .newlines) {
+// JSONL は改行 (LF) 区切り。CharacterSet.newlines で分けると U+2028 等の
+// 行区切り文字でも切れてしまい、字幕由来のテキストを含む行が壊れる
+for line in manifestContent.components(separatedBy: "\n") {
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty != true {
         guard let entry = try? jsonDecoder.decode(ManifestEntry.self, from: Data(trimmed.utf8)) else {
@@ -490,7 +492,7 @@ if epochs == 0 {
             case .some(let basePath):
                 let ckptPath = "\(basePath).ep\(ep).json"
                 do {
-                    try mlxNet.exportWeights().save(to: URL(fileURLWithPath: ckptPath))
+                    try mlxNet.exportWeights(vocabulary: phoneticVocabulary).save(to: URL(fileURLWithPath: ckptPath))
                     print("    ✓ チェックポイント保存: \(ckptPath)")
                 } catch {
                     print("    ✕ チェックポイント保存に失敗: \(error)")
@@ -506,7 +508,7 @@ if epochs == 0 {
     print("\nGPU 学習完了 (総所要時間: \(String(format: "%.3f", trainElapsed)) 秒)")
     
     // 学習した重みを Pure Swift 推論エンジンに転送
-    let exported = mlxNet.exportWeights()
+    let exported = mlxNet.exportWeights(vocabulary: phoneticVocabulary)
     trainer.acousticTrainer.network.importWeights(from: exported)
     print("  ✓ GPU 学習パラメータを Pure Swift 推論エンジンに転送完了")
 
@@ -564,7 +566,7 @@ if 0.0 < Defaults.languageBonus {
 if let expPath = exportWeightsPath {
     print("\n[重み保存] モデル重みをファイルにエクスポート中: \(expPath)")
     let expURL = URL(fileURLWithPath: expPath)
-    let wData = trainer.acousticTrainer.network.exportWeights()
+    let wData = trainer.acousticTrainer.network.exportWeights(vocabulary: phoneticVocabulary)
     do {
         try wData.save(to: expURL)
         print("  ✓ 重みパラメータのエクスポートが完了しました: \(expPath)")
