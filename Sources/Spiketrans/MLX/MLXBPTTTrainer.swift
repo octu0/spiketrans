@@ -17,6 +17,19 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// フレームをまたぐ信用割り当てが完全に消え、第1段は実質フレーム独立の
     /// 分類器になる。大きくすると時間文脈を学習できる一方、計算グラフが深くなる。
     public let bpttWindow: Int
+
+    /// 系列長 (padded maxT) をキーとするコンパイル済み CTC 学習ステップのキャッシュ
+    private var compiledCTCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// 系列長 (T) をキーとするコンパイル済み logitsBatch のキャッシュ
+    private var compiledLogitsSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// CTC 学習ステップのコンパイル（キャッシュミス）回数
+    public private(set) var ctcCompileCount: Int = 0
+
+    /// CTC 学習ステップのキャッシュヒット回数
+    public private(set) var ctcCacheHitCount: Int = 0
+
     public init(
         network: MLXSpikingNetwork,
         config: TrainingConfig = TrainingConfig(learningRate: 0.015),
@@ -36,8 +49,20 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// バッチ（複数発話）に対するフォワードとロジット系列 [B, T, outputDim] の計算
     public func logitsBatch(
         network: MLXSpikingNetwork,
-        features: MLXArray           // [B, T, inputDim]
+        features: MLXArray,          // [B, T, inputDim]
+        compiled: Bool = false
     ) -> MLXArray {
+        if compiled {
+            let seqLen = features.shape[1]
+            if let cached = compiledLogitsSteps[seqLen] {
+                return cached([features])[0]
+            }
+            let fn = compile(inputs: [network]) { arrays in
+                return [self.logitsBatch(network: network, features: arrays[0], compiled: false)]
+            }
+            compiledLogitsSteps[seqLen] = fn
+            return fn([features])[0]
+        }
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
@@ -231,7 +256,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     public func trainBatchCTC(
         featuresBatch: [[[Float]]],
         targetsBatch: [[Int]],
-        blankId: Int = 0
+        blankId: Int = 0,
+        compiled: Bool = true
     ) -> Float {
         let bSize = featuresBatch.count
         if bSize == 0 {
@@ -293,14 +319,60 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             blankId: blankId
         )
 
-        let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
-            let logits = self.logitsBatch(network: model, features: arrays[0])
-            return [MLXCTCLoss.loss(logits: logits, targets: extTargets)]
+        if compiled != true {
+            let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+                let logits = self.logitsBatch(network: model, features: arrays[0], compiled: false)
+                return [MLXCTCLoss.loss(logits: logits, targets: extTargets)]
+            }
+
+            let (lossValues, grads) = lg(network, [featArray])
+            let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+            optimizer.update(model: network, gradients: clippedGrads)
+            eval(network, optimizer, lossValues)
+
+            return lossValues[0].item(Float.self)
         }
 
-        let (lossValues, grads) = lg(network, [featArray])
-        let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
-        optimizer.update(model: network, gradients: clippedGrads)
+        let stepFn: ([MLXArray]) -> [MLXArray]
+        if let cached = compiledCTCSteps[maxT] {
+            ctcCacheHitCount += 1
+            stepFn = cached
+        } else {
+            ctcCompileCount += 1
+            let computeLoss = { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+                let logits = self.logitsBatch(network: model, features: arrays[0], compiled: false)
+                let targets = MLXCTCLoss.ExtendedTargets(
+                    extTargets: arrays[1],
+                    skipMask: arrays[2],
+                    validMask: arrays[3],
+                    finalIndex1: arrays[4],
+                    finalIndex2: arrays[5],
+                    hasSecondFinal: arrays[6],
+                    inputLengths: arrays[7]
+                )
+                let loss = MLXCTCLoss.loss(logits: logits, targets: targets)
+                return [loss]
+            }
+            let lg = valueAndGrad(model: self.network, computeLoss)
+            func step(arrays: [MLXArray]) -> [MLXArray] {
+                let (lossValues, grads) = lg(self.network, arrays)
+                let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+                self.optimizer.update(model: self.network, gradients: clippedGrads)
+                return lossValues
+            }
+            let newStep = compile(
+                inputs: [self.network, self.optimizer],
+                outputs: [self.network, self.optimizer],
+                step
+            )
+            compiledCTCSteps[maxT] = newStep
+            stepFn = newStep
+        }
+
+        var inputs: [MLXArray] = [featArray]
+        inputs.append(contentsOf: extTargets.toArrays())
+
+        let lossValues = stepFn(inputs)
         // オプティマイザの状態も評価する。network と損失だけ評価すると
         // Adam の m/v が遅延グラフとして積み上がり、生存バッファ数が
         // Metal のリソース上限 (約 50 万) に達して落ちる

@@ -100,6 +100,37 @@ public enum MLXCTCLoss {
             self.hasSecondFinal = MLXArray(hasSecond, [batchSize])
             self.inputLengths = MLXArray(lengths, [batchSize])
         }
+
+        public init(
+            extTargets: MLXArray,
+            skipMask: MLXArray,
+            validMask: MLXArray,
+            finalIndex1: MLXArray,
+            finalIndex2: MLXArray,
+            hasSecondFinal: MLXArray,
+            inputLengths: MLXArray
+        ) {
+            self.extTargets = extTargets
+            self.skipMask = skipMask
+            self.validMask = validMask
+            self.finalIndex1 = finalIndex1
+            self.finalIndex2 = finalIndex2
+            self.hasSecondFinal = hasSecondFinal
+            self.inputLengths = inputLengths
+            self.maxExtendedLength = extTargets.shape[1]
+        }
+
+        public func toArrays() -> [MLXArray] {
+            return [
+                extTargets,
+                skipMask,
+                validMask,
+                finalIndex1,
+                finalIndex2,
+                hasSecondFinal,
+                inputLengths,
+            ]
+        }
     }
 
     /// alpha を s 方向に k だけずらす。空いた先頭は -inf 相当で埋める。
