@@ -277,10 +277,10 @@ extension Trainer {
             boundaries: boundaries
         )
         var rawTokens: [Int] = []
-        rawTokens.reserveCapacity(featuresSeq.count)
+        rawTokens.reserveCapacity(frameProbs.count)
 
         var f = 0
-        while f < featuresSeq.count {
+        while f < frameProbs.count {
             let frame = frameProbs[f]
             // 1. 低信頼度フレームは pad として扱う
             if frame.topProbability < minConfidence {

@@ -94,6 +94,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
     private var segmentSpeechActive: Bool = false
     private var consecutiveSilenceFrames: Int = 0
     private var consecutiveSpeechFrames: Int = 0
+    private var convStreamingState = Conv2DStreamingState()
 
     public init(
         config: StreamingTranscriberConfig = StreamingTranscriberConfig(),
@@ -146,7 +147,8 @@ public final class StreamingTranscriber: @unchecked Sendable {
         self.acousticWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticNetwork.maxHiddenDim,
             outputDim: acousticNetwork.outputDim,
-            inputDim: acousticNetwork.inputDim
+            inputDim: acousticNetwork.inputDim,
+            numLayers: acousticNetwork.numLayers
         )
 
         let lmConfig = LanguageDecoderConfig(
@@ -260,15 +262,31 @@ public final class StreamingTranscriber: @unchecked Sendable {
                     workspace: dspWorkspace
                 )
 
-                let acousticFrame = acousticDecoder.decodeFrame(
-                    features: features,
-                    workspace: acousticWorkspace,
-                    frameIndex: segmentProbs.count
-                )
+                let acousticFrame: AcousticFrameProbabilities?
+                switch acousticDecoder.convSubsampling {
+                case .some:
+                    acousticFrame = acousticDecoder.decodeStreaming(
+                        melFrame: features,
+                        state: &convStreamingState,
+                        workspace: acousticWorkspace,
+                        frameIndex: segmentProbs.count
+                    )
+                case .none:
+                    acousticFrame = acousticDecoder.decodeFrame(
+                        features: features,
+                        workspace: acousticWorkspace,
+                        frameIndex: segmentProbs.count
+                    )
+                }
 
-                if segmentProbs.count < maxSegmentFrames {
-                    segmentProbs.append(acousticFrame)
-                    segmentRawFeatures.append(features)
+                switch acousticFrame {
+                case .some(let frame):
+                    if segmentProbs.count < maxSegmentFrames {
+                        segmentProbs.append(frame)
+                        segmentRawFeatures.append(features)
+                    }
+                case .none:
+                    break
                 }
 
                 // 5. 部分認識結果コールバック (10フレーム = 100ms ごと、コールバック登録時のみ実行)
@@ -407,6 +425,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
         consecutiveSilenceFrames = 0
         consecutiveSpeechFrames = 0
         acousticWorkspace.reset()
+        convStreamingState.reset()
     }
 
     /// 残存バッファのフラッシュと終端処理
@@ -445,5 +464,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         segmentProbs.removeAll(keepingCapacity: true)
         segmentRawFeatures.removeAll(keepingCapacity: true)
         acousticWorkspace.reset()
+        convStreamingState.reset()
     }
 }

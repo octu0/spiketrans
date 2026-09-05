@@ -206,6 +206,100 @@ public enum LIFNeuronEngine {
         }
     }
 
+    /// SIMD8 一括ポインタ更新ステップ (Hot Path ゼロアロケーション & 多層対応)
+    @inline(__always)
+    public static func stepAdaptiveSIMD8(
+        config: LIFConfig,
+        vPtr: UnsafeMutablePointer<Float>,
+        sPtr: UnsafeMutablePointer<Float>,
+        aPtr: UnsafeMutablePointer<Float>,
+        curPtr: UnsafePointer<Float>,
+        spikeSumPtr: UnsafeMutablePointer<Float>?,
+        count: Int
+    ) {
+        let limit = count - (count % 8)
+        let betaVec = SIMD8<Float>(repeating: config.beta)
+        let oneVec = SIMD8<Float>(repeating: 1.0)
+        let rhoVec = SIMD8<Float>(repeating: config.rho)
+        let gammaVec = SIMD8<Float>(repeating: config.gamma)
+        let vThVec = SIMD8<Float>(repeating: config.vTh)
+        let lowVec = SIMD8<Float>(repeating: vClampMin)
+        let highVec = SIMD8<Float>(repeating: vClampMax)
+        let zeroVec = SIMD8<Float>(repeating: 0.0)
+
+        var i = 0
+        while i < limit {
+            let vPrev = SIMD8<Float>(
+                vPtr[i+0], vPtr[i+1], vPtr[i+2], vPtr[i+3],
+                vPtr[i+4], vPtr[i+5], vPtr[i+6], vPtr[i+7]
+            )
+            let sPrev = SIMD8<Float>(
+                sPtr[i+0], sPtr[i+1], sPtr[i+2], sPtr[i+3],
+                sPtr[i+4], sPtr[i+5], sPtr[i+6], sPtr[i+7]
+            )
+            let aPrev = SIMD8<Float>(
+                aPtr[i+0], aPtr[i+1], aPtr[i+2], aPtr[i+3],
+                aPtr[i+4], aPtr[i+5], aPtr[i+6], aPtr[i+7]
+            )
+            let inCur = SIMD8<Float>(
+                curPtr[i+0], curPtr[i+1], curPtr[i+2], curPtr[i+3],
+                curPtr[i+4], curPtr[i+5], curPtr[i+6], curPtr[i+7]
+            )
+
+            let vDecayed = betaVec * vPrev * (oneVec - sPrev)
+            let vRaw = vDecayed + inCur
+            var vNext = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
+            vNext = vNext.replacing(with: highVec, where: highVec .< vNext)
+            let aNext = (rhoVec * aPrev) + (gammaVec * sPrev)
+            let dynVTh = vThVec + aNext
+            let sNext = zeroVec.replacing(with: oneVec, where: dynVTh .<= vNext)
+
+            switch spikeSumPtr {
+            case .some(let sumPtr):
+                let sumPrev = SIMD8<Float>(
+                    sumPtr[i+0], sumPtr[i+1], sumPtr[i+2], sumPtr[i+3],
+                    sumPtr[i+4], sumPtr[i+5], sumPtr[i+6], sumPtr[i+7]
+                )
+                let sumNext = sumPrev + sNext
+                var lane = 0
+                while lane < 8 {
+                    sumPtr[i+lane] = sumNext[lane]
+                    lane += 1
+                }
+            case .none:
+                break
+            }
+
+            var lane = 0
+            while lane < 8 {
+                vPtr[i+lane] = vNext[lane]
+                sPtr[i+lane] = sNext[lane]
+                aPtr[i+lane] = aNext[lane]
+                lane += 1
+            }
+            i += 8
+        }
+        while i < count {
+            let res = stepScalarAdaptive(
+                config: config,
+                vPrev: vPtr[i],
+                sPrev: sPtr[i],
+                aPrev: aPtr[i],
+                inputCurrent: curPtr[i]
+            )
+            vPtr[i] = res.vNext
+            sPtr[i] = res.sNext
+            aPtr[i] = res.aNext
+            switch spikeSumPtr {
+            case .some(let sumPtr):
+                sumPtr[i] += res.sNext
+            case .none:
+                break
+            }
+            i += 1
+        }
+    }
+
     /// SIMD8 による 8 ニューロン一括更新ステップ
     @inline(__always)
     public static func stepSIMD8(

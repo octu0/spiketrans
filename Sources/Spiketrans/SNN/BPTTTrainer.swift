@@ -6,19 +6,24 @@ public final class ForwardCache: @unchecked Sendable {
     public let timeSteps: Int
     public let hiddenDim: Int
     public let outputDim: Int
+    public let numLayers: Int
 
-    public var vStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim]
-    public var sStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim]
-    public var aStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim] (ALIF 適応閾値状態)
-    public var spikeAvg: [[Float]]   // [seqLen][hiddenDim]
+    public var vStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim] (第0層)
+    public var sStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim] (第0層)
+    public var aStates: [[[Float]]]  // [seqLen][timeSteps][hiddenDim] (第0層 ALIF)
+    public var vStatesLayers: [[[[Float]]]] // [numLayers-1][seqLen][timeSteps][hiddenDim]
+    public var sStatesLayers: [[[[Float]]]] // [numLayers-1][seqLen][timeSteps][hiddenDim]
+    public var aStatesLayers: [[[[Float]]]] // [numLayers-1][seqLen][timeSteps][hiddenDim]
+    public var spikeAvg: [[Float]]   // [seqLen][hiddenDim] (最終層)
     public var logits: [[Float]]     // [seqLen][outputDim]
     public var probs: [[Float]]      // [seqLen][outputDim]
 
-    public init(seqLen: Int, timeSteps: Int, hiddenDim: Int, outputDim: Int) {
+    public init(seqLen: Int, timeSteps: Int, hiddenDim: Int, outputDim: Int, numLayers: Int = 1) {
         self.seqLen = seqLen
         self.timeSteps = timeSteps
         self.hiddenDim = hiddenDim
         self.outputDim = outputDim
+        self.numLayers = numLayers
 
         self.vStates = [[[Float]]](
             repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
@@ -32,6 +37,36 @@ public final class ForwardCache: @unchecked Sendable {
             repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
             count: seqLen
         )
+
+        if 1 < numLayers {
+            let upperCount = numLayers - 1
+            self.vStatesLayers = [[[[Float]]]](
+                repeating: [[[Float]]](
+                    repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
+                    count: seqLen
+                ),
+                count: upperCount
+            )
+            self.sStatesLayers = [[[[Float]]]](
+                repeating: [[[Float]]](
+                    repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
+                    count: seqLen
+                ),
+                count: upperCount
+            )
+            self.aStatesLayers = [[[[Float]]]](
+                repeating: [[[Float]]](
+                    repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
+                    count: seqLen
+                ),
+                count: upperCount
+            )
+        } else {
+            self.vStatesLayers = []
+            self.sStatesLayers = []
+            self.aStatesLayers = []
+        }
+
         self.spikeAvg = [[Float]](
             repeating: [Float](repeating: 0.0, count: hiddenDim),
             count: seqLen
@@ -53,12 +88,25 @@ public struct NetworkGradients: @unchecked Sendable {
     public var gradWRec: [Float]
     public var gradWOut: [Float]        // 全スライス共有
     public var gradBOut: [Float]
+    public var gradWLayers: [[Float]]
+    public var gradBHLayers: [[Float]]
+    public var gradGammaRMS: [[Float]]
 
-    public init(inputDim: Int, maxHiddenDim: Int, outputDim: Int) {
+    public init(inputDim: Int, maxHiddenDim: Int, outputDim: Int, numLayers: Int = 1) {
         self.gradWIn = [Float](repeating: 0.0, count: maxHiddenDim * inputDim)
         self.gradWRec = [Float](repeating: 0.0, count: maxHiddenDim * maxHiddenDim)
         self.gradWOut = [Float](repeating: 0.0, count: outputDim * maxHiddenDim)
         self.gradBOut = [Float](repeating: 0.0, count: outputDim)
+        if 1 < numLayers {
+            let upperCount = numLayers - 1
+            self.gradWLayers = [[Float]](repeating: [Float](repeating: 0.0, count: maxHiddenDim * maxHiddenDim), count: upperCount)
+            self.gradBHLayers = [[Float]](repeating: [Float](repeating: 0.0, count: maxHiddenDim), count: upperCount)
+            self.gradGammaRMS = [[Float]](repeating: [Float](repeating: 0.0, count: maxHiddenDim), count: upperCount)
+        } else {
+            self.gradWLayers = []
+            self.gradBHLayers = []
+            self.gradGammaRMS = []
+        }
     }
 
     public mutating func zeroGrad() {
@@ -70,8 +118,16 @@ public struct NetworkGradients: @unchecked Sendable {
         while i < gradWOut.count { gradWOut[i] = 0.0; i += 1 }
         i = 0
         while i < gradBOut.count { gradBOut[i] = 0.0; i += 1 }
-
-
+        var l = 0
+        while l < gradWLayers.count {
+            i = 0
+            while i < gradWLayers[l].count { gradWLayers[l][i] = 0.0; i += 1 }
+            i = 0
+            while i < gradBHLayers[l].count { gradBHLayers[l][i] = 0.0; i += 1 }
+            i = 0
+            while i < gradGammaRMS[l].count { gradGammaRMS[l][i] = 0.0; i += 1 }
+            l += 1
+        }
     }
 
     public mutating func accumulate(from other: NetworkGradients) {
@@ -83,8 +139,18 @@ public struct NetworkGradients: @unchecked Sendable {
         while i < gradWOut.count { gradWOut[i] += other.gradWOut[i]; i += 1 }
         i = 0
         while i < gradBOut.count { gradBOut[i] += other.gradBOut[i]; i += 1 }
-
-
+        var l = 0
+        while l < gradWLayers.count {
+            if l < other.gradWLayers.count {
+                i = 0
+                while i < gradWLayers[l].count { gradWLayers[l][i] += other.gradWLayers[l][i]; i += 1 }
+                i = 0
+                while i < gradBHLayers[l].count { gradBHLayers[l][i] += other.gradBHLayers[l][i]; i += 1 }
+                i = 0
+                while i < gradGammaRMS[l].count { gradGammaRMS[l][i] += other.gradGammaRMS[l][i]; i += 1 }
+            }
+            l += 1
+        }
     }
 }
 
@@ -103,7 +169,8 @@ public final class BPTTTrainer: @unchecked Sendable {
         return NetworkGradients(
             inputDim: network.inputDim,
             maxHiddenDim: network.maxHiddenDim,
-            outputDim: network.outputDim
+            outputDim: network.outputDim,
+            numLayers: network.numLayers
         )
     }
 
@@ -300,6 +367,29 @@ public final class BPTTTrainer: @unchecked Sendable {
         while i < network.pBOut.grad.count {
             network.pBOut.grad[i] += grads.gradBOut[i]
             i += 1
+        }
+        if 1 < network.numLayers {
+            var l = 0
+            while l < network.pWLayers.count {
+                if l < grads.gradWLayers.count {
+                    var j = 0
+                    while j < network.pWLayers[l].grad.count {
+                        network.pWLayers[l].grad[j] += grads.gradWLayers[l][j]
+                        j += 1
+                    }
+                    j = 0
+                    while j < network.pBHLayers[l].grad.count {
+                        network.pBHLayers[l].grad[j] += grads.gradBHLayers[l][j]
+                        j += 1
+                    }
+                    j = 0
+                    while j < network.pGammaRMS[l].grad.count {
+                        network.pGammaRMS[l].grad[j] += grads.gradGammaRMS[l][j]
+                        j += 1
+                    }
+                }
+                l += 1
+            }
         }
     }
 
@@ -518,6 +608,29 @@ public final class BPTTTrainer: @unchecked Sendable {
             // 出力層バイアスの特定文字張り付きを抑え、重み主導の分類を促進
             network.pBOut.grad[i] = grads.gradBOut[i] * scale * 0.05
             i += 1
+        }
+        if 1 < network.numLayers {
+            var l = 0
+            while l < network.pWLayers.count {
+                if l < grads.gradWLayers.count {
+                    var j = 0
+                    while j < network.pWLayers[l].grad.count {
+                        network.pWLayers[l].grad[j] = grads.gradWLayers[l][j] * scale
+                        j += 1
+                    }
+                    j = 0
+                    while j < network.pBHLayers[l].grad.count {
+                        network.pBHLayers[l].grad[j] = grads.gradBHLayers[l][j] * scale
+                        j += 1
+                    }
+                    j = 0
+                    while j < network.pGammaRMS[l].grad.count {
+                        network.pGammaRMS[l].grad[j] = grads.gradGammaRMS[l][j] * scale
+                        j += 1
+                    }
+                }
+                l += 1
+            }
         }
 
         optimizer.step()

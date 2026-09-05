@@ -218,7 +218,12 @@ if listMicrophones {
     var i = 0
     while i < devices.count {
         let d = devices[i]
-        let mark = (d.id == defaultId) ? " [既定]" : ""
+        let mark: String
+        if d.id == defaultId {
+            mark = " [既定]"
+        } else {
+            mark = ""
+        }
         print(String(format: "  %d: %@ (%d ch, %.0f Hz)%@",
                      i, d.name, d.channels, d.sampleRate, mark))
         i += 1
@@ -347,7 +352,12 @@ print("==================================================")
 print("=== マイク入力 文字起こし ===")
 print("==================================================")
 print("第1段: 入力 \(weights.inputDim) 次元 / 隠れ \(weights.maxHiddenDim) / 出力 \(weights.outputDim)")
-let vocabSource = weights.vocabulary == nil ? "テキストから再構築" : "重みに同梱"
+let vocabSource: String
+if weights.vocabulary == nil {
+    vocabSource = "テキストから再構築"
+} else {
+    vocabSource = "重みに同梱"
+}
 print("かな語彙: \(phoneticVocabulary.size) 文字 (\(vocabSource))")
 if 0 < kanaKanjiDict.count {
     print("第2段辞書: \(kanaKanjiDict.count) 語")
@@ -593,7 +603,12 @@ final class Transcriber: @unchecked Sendable {
                 if 10 <= meterBlocks {
                     let bars = Int(min(24.0, meterPeak * 400.0))
                     let bar = String(repeating: "=", count: max(0, bars))
-                    let mark = (0 < speechRun) ? "有声" : "無音"
+                    let mark: String
+                    if 0 < speechRun {
+                        mark = "有声"
+                    } else {
+                        mark = "無音"
+                    }
                     // 行末はエスケープで消すので詰め物は要らない
                     let text = String(
                         format: "[音量] %.4f x%.1f 有声度 %.2f 底 %.5f %@ ",
@@ -676,7 +691,11 @@ final class Transcriber: @unchecked Sendable {
 
         // ゆっくり減衰する最大音量から、目標レベルへ寄せるゲインを決める
         let decayed = recentPeakRMS * 0.995
-        recentPeakRMS = (decayed < rms) ? rms : decayed
+        if decayed < rms {
+            recentPeakRMS = rms
+        } else {
+            recentPeakRMS = decayed
+        }
         var gain: Float = 1.0
         if 1e-5 < recentPeakRMS {
             gain = min(20.0, max(1.0, Transcriber.vadTargetRMS / recentPeakRMS))
@@ -705,7 +724,13 @@ final class Transcriber: @unchecked Sendable {
 
     private func recognize(_ pcm: [Float], isFinal: Bool) {
         let started = CFAbsoluteTimeGetCurrent()
-        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm, frameStack: frameStack)
+        let features: [[Float]]
+        switch network.convSubsampling {
+        case .some:
+            features = SpeechDataset.extractMelSpectrogram(pcmData: pcm)
+        case .none:
+            features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm, frameStack: frameStack)
+        }
         if features.isEmpty {
             return
         }

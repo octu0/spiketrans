@@ -161,7 +161,13 @@ if chunkSeconds <= 0.0 {
         offset += n
     }
 }
-print("分割: \(segments.count) チャンク" + (chunkSeconds <= 0.0 ? " (分割なし)" : " (\(Int(chunkSeconds)) 秒ごと)"))
+let chunkDesc: String
+if chunkSeconds <= 0.0 {
+    chunkDesc = " (分割なし)"
+} else {
+    chunkDesc = " (\(Int(chunkSeconds)) 秒ごと)"
+}
+print("分割: \(segments.count) チャンク" + chunkDesc)
 
 // 5. 文字起こし
 let network = SpikingNetwork(
@@ -199,7 +205,13 @@ var segIdx = 0
 while segIdx < segments.count {
     let seg = segments[segIdx]
     let segPCM = Array(pcm[seg.start..<(seg.start + seg.count)])
-    let features = SpeechDataset.extractFeaturesFromPCM(pcmData: segPCM, frameStack: frameStack)
+    let features: [[Float]]
+    switch network.convSubsampling {
+    case .some:
+        features = SpeechDataset.extractMelSpectrogram(pcmData: segPCM)
+    case .none:
+        features = SpeechDataset.extractFeaturesFromPCM(pcmData: segPCM, frameStack: frameStack)
+    }
     totalFrames += features.count
 
     if 0 < features.count {

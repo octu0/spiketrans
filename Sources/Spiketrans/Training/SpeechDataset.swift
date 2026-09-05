@@ -178,8 +178,18 @@ public final class SpeechDataset: @unchecked Sendable {
             while m < outCount {
                 let srcIdx = m * 3
                 let s0 = pcmData[srcIdx]
-                let s1 = (srcIdx + 1 < pcmData.count) ? pcmData[srcIdx + 1] : s0
-                let s2 = (srcIdx + 2 < pcmData.count) ? pcmData[srcIdx + 2] : s1
+                let s1: Float
+                if (srcIdx + 1) < pcmData.count {
+                    s1 = pcmData[srcIdx + 1]
+                } else {
+                    s1 = s0
+                }
+                let s2: Float
+                if (srcIdx + 2) < pcmData.count {
+                    s2 = pcmData[srcIdx + 2]
+                } else {
+                    s2 = s1
+                }
                 // 3 サンプル平均ローパスフィルタによるエイリアシング防止
                 out[m] = (s0 + s1 + s2) / 3.0
                 m += 1
@@ -285,13 +295,14 @@ public final class SpeechDataset: @unchecked Sendable {
     /// 正規化ゲインの上限。ほぼ無音の音声でノイズだけを増幅しないための歯止め
     static let maxGain: Float = 20.0
 
-    public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = 1) -> [[Float]] {
+    /// PCM 配列から 64ch Mel スペクトログラム系列 (Preemphasis + 64ch Mel Filterbank) を抽出
+    public static func extractMelSpectrogram(pcmData: [Float]) -> [[Float]] {
         let totalSamples = pcmData.count
         if totalSamples < 400 {
             return []
         }
 
-        // 0. 発話単位の RMS 正規化。静かな録音は入力電流が不足してスパイクが立たない
+        // 0. 発話単位の RMS 正規化
         var sumSquares: Float = 0.0
         var rIdx = 0
         while rIdx < totalSamples {
@@ -337,6 +348,11 @@ public final class SpeechDataset: @unchecked Sendable {
             }
         }
 
+        return rawMelSeq
+    }
+
+    public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = 1) -> [[Float]] {
+        let rawMelSeq = extractMelSpectrogram(pcmData: pcmData)
         let numFrames = rawMelSeq.count
         if numFrames <= 0 {
             return []
@@ -348,9 +364,19 @@ public final class SpeechDataset: @unchecked Sendable {
 
         var t = 0
         while t < numFrames {
-            let prevIdx = (t == 0) ? 0 : t - 1
+            let prevIdx: Int
+            if t == 0 {
+                prevIdx = 0
+            } else {
+                prevIdx = t - 1
+            }
             let currIdx = t
-            let nextIdx = (t == numFrames - 1) ? (numFrames - 1) : t + 1
+            let nextIdx: Int
+            if t == (numFrames - 1) {
+                nextIdx = numFrames - 1
+            } else {
+                nextIdx = t + 1
+            }
 
             let prevMel = rawMelSeq[prevIdx]
             let currMel = rawMelSeq[currIdx]

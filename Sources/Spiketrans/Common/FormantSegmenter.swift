@@ -123,4 +123,31 @@ public struct FormantSegmenter: Sendable {
 
         return boundaries
     }
+
+    /// 境界フレームインデックスを Subsampling 比率（既定 4）に合わせて圧縮・重複排除する
+    public static func subsampleBoundaries(boundaries: [Int], factor: Int = 4) -> [Int] {
+        if boundaries.isEmpty || factor <= 1 {
+            return boundaries
+        }
+        var scaled: [Int] = []
+        scaled.reserveCapacity(boundaries.count)
+        var lastIdx: Int? = nil
+
+        var i = 0
+        while i < boundaries.count {
+            let s = boundaries[i] / factor
+            switch lastIdx {
+            case .some(let prev):
+                if prev < s {
+                    scaled.append(s)
+                    lastIdx = s
+                }
+            case .none:
+                scaled.append(s)
+                lastIdx = s
+            }
+            i += 1
+        }
+        return scaled
+    }
 }
