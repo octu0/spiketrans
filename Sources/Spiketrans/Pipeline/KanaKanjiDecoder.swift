@@ -267,6 +267,14 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
         vocabularySize = surfaceTotals.count
     }
 
+    /// 辞書内の連接統計に基づく統計的文脈スコアラーを生成
+    public func makeContextScorer(wordWeight: Float = 1.0) -> StatisticalNGramScorer {
+        return StatisticalNGramScorer(
+            dictionary: self,
+            wordWeight: wordWeight
+        )
+    }
+
 
     /// 音素調音距離によるファジー検索
     ///
@@ -443,6 +451,7 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
 
     public let dictionary: KanaKanjiDictionary
     public let languageDecoder: LanguageDecoder?
+    public let languageModel: (any LanguageModelScorer)?
     /// 言語 SNN に入力するかな側の語彙 (languageDecoder 併用時に必須)
     public let kanaVocabulary: TextVocabulary?
     /// 言語 SNN のスライス
@@ -450,6 +459,12 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
     public let languageBonus: Float
     /// Bigram 項の重み
     public let bigramWeight: Float
+    /// セカンドパス・形態素辞書項の重み (\lambda_{lex})
+    public let lexicalWeight: Float
+    /// セカンドパス・言語モデル項の重み (\lambda_{LM})
+    public let lmWeight: Float
+    /// セカンドパス・長さボーナス (LenBonus)
+    public let lengthBonus: Float
     /// 語の直後に読点を付ける連接率の閾値
     public let commaThreshold: Float
     /// 文末句読点を付ける出現率の閾値
@@ -461,17 +476,25 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
     public init(
         dictionary: KanaKanjiDictionary,
         languageDecoder: LanguageDecoder? = nil,
+        languageModel: (any LanguageModelScorer)? = nil,
         kanaVocabulary: TextVocabulary? = nil,
         languageBonus: Float = 4.0,
         bigramWeight: Float = 1.0,
+        lexicalWeight: Float = 1.0,
+        lmWeight: Float = 0.3,
+        lengthBonus: Float = 0.0,
         commaThreshold: Float = 0.5,
         sentenceFinalThreshold: Float = 0.5
     ) {
         self.dictionary = dictionary
         self.languageDecoder = languageDecoder
+        self.languageModel = languageModel
         self.kanaVocabulary = kanaVocabulary
         self.languageBonus = languageBonus
         self.bigramWeight = bigramWeight
+        self.lexicalWeight = lexicalWeight
+        self.lmWeight = lmWeight
+        self.lengthBonus = lengthBonus
         self.commaThreshold = commaThreshold
         self.sentenceFinalThreshold = sentenceFinalThreshold
     }
@@ -586,10 +609,24 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
         var beams = [[BeamState]](repeating: [], count: n + 1)
         beams[0] = [BeamState(score: 0.0, text: "", lastWord: "", trace: [])]
 
-        /// 候補を追加し、上位 K 件だけ残す
+        /// 候補を追加し、同一 (text, lastWord) の重複をマージして上位 K 件だけ残す
         func push(_ index: Int, _ state: BeamState) {
             var list = beams[index]
-            list.append(state)
+            var found = false
+            var idx = 0
+            while idx < list.count {
+                if list[idx].text == state.text && list[idx].lastWord == state.lastWord {
+                    found = true
+                    if list[idx].score < state.score {
+                        list[idx] = state
+                    }
+                    break
+                }
+                idx += 1
+            }
+            if found != true {
+                list.append(state)
+            }
             list.sort { b, a in a.score < b.score }
             if k < list.count {
                 list.removeLast(list.count - k)
@@ -682,23 +719,185 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
         if let best = beams[n].first {
             lastTrace = best.trace
         }
-        return beams[n].map { st in
+        var seenCands = Set<String>()
+        var candidates: [Candidate] = []
+        candidates.reserveCapacity(beams[n].count)
+        var sIdx = 0
+        while sIdx < beams[n].count {
+            let st = beams[n][sIdx]
             var restored = st.text
             if let last = restored.last {
                 if punctuationCharacters.contains(last) {
                     restored.removeLast()
                 }
             }
-            return Candidate(text: restored + suffix, score: st.score)
+            let fullText = restored + suffix
+            if seenCands.contains(fullText) != true {
+                seenCands.insert(fullText)
+                candidates.append(Candidate(text: fullText, score: st.score))
+            }
+            sIdx += 1
+        }
+        return candidates
+    }
+
+    /// セカンドパス・リスコアリング後の候補結果
+    public struct RescoredCandidate: Sendable, Equatable {
+        /// 最終漢字表記 Y
+        public let text: String
+        /// 元となった音響かな仮説 X
+        public let kanaText: String
+        /// 元となった音響仮説のトークン ID 系列
+        public let tokens: [Int]
+        /// 総合スコア S(Y, X)
+        public let totalScore: Float
+        /// 音響スコア S_acoustic(X)
+        public let acousticScore: Float
+        /// 形態素・語彙辞書スコア S_lexical(Y|X)
+        public let lexicalScore: Float
+        /// 言語モデルスコア S_LM(Y)
+        public let lmScore: Float
+        /// 長さボーナス LenBonus
+        public let lengthBonus: Float
+
+        public init(
+            text: String,
+            kanaText: String,
+            tokens: [Int] = [],
+            totalScore: Float,
+            acousticScore: Float,
+            lexicalScore: Float,
+            lmScore: Float,
+            lengthBonus: Float
+        ) {
+            self.text = text
+            self.kanaText = kanaText
+            self.tokens = tokens
+            self.totalScore = totalScore
+            self.acousticScore = acousticScore
+            self.lexicalScore = lexicalScore
+            self.lmScore = lmScore
+            self.lengthBonus = lengthBonus
+        }
+    }
+
+    /// 音響 N-best 仮説に対する漢字変換パスを統合し、言語モデルによるセカンドパス・リスコアリングを実行:
+    /// S(Y, X) = S_acoustic(X) + \lambda_{lex} S_lexical(Y|X) + \lambda_{LM} S_LM(Y) + LenBonus * |Y|
+    public func rescoreNBest(
+        hypotheses: [AcousticHypothesis],
+        customLMScorer: (any LanguageModelScorer)? = nil,
+        lexicalWeight: Float? = nil,
+        lmWeight: Float? = nil,
+        lengthBonus: Float? = nil,
+        kanjiBeamWidth: Int = 5
+    ) -> [RescoredCandidate] {
+        if hypotheses.isEmpty {
+            return []
+        }
+
+        let lLex = lexicalWeight ?? self.lexicalWeight
+        let lLM = lmWeight ?? self.lmWeight
+        let lBonus = lengthBonus ?? self.lengthBonus
+        let scorer = customLMScorer ?? self.languageModel
+
+        var allRescored: [RescoredCandidate] = []
+        var hIdx = 0
+        while hIdx < hypotheses.count {
+            let hyp = hypotheses[hIdx]
+            if hyp.text.isEmpty {
+                allRescored.append(RescoredCandidate(
+                    text: "",
+                    kanaText: "",
+                    tokens: hyp.tokens,
+                    totalScore: hyp.acousticScore,
+                    acousticScore: hyp.acousticScore,
+                    lexicalScore: 0.0,
+                    lmScore: 0.0,
+                    lengthBonus: 0.0
+                ))
+                hIdx += 1
+                continue
+            }
+
+            let kanjiCands = decodeNBest(kanaText: hyp.text, beamWidth: kanjiBeamWidth)
+
+            var cIdx = 0
+            while cIdx < kanjiCands.count {
+                let cand = kanjiCands[cIdx]
+                let sAcoustic = hyp.acousticScore
+                let sLexical = cand.score
+                var sLM: Float = 0.0
+                switch scorer {
+                case .some(let s):
+                    sLM = s.logProbability(of: cand.text)
+                case .none:
+                    sLM = 0.0
+                }
+                let lenBonusTerm = Float(cand.text.count) * lBonus
+                let totalScore = sAcoustic + (lLex * sLexical) + (lLM * sLM) + lenBonusTerm
+
+                allRescored.append(RescoredCandidate(
+                    text: cand.text,
+                    kanaText: hyp.text,
+                    tokens: hyp.tokens,
+                    totalScore: totalScore,
+                    acousticScore: sAcoustic,
+                    lexicalScore: sLexical,
+                    lmScore: sLM,
+                    lengthBonus: lenBonusTerm
+                ))
+                cIdx += 1
+            }
+            hIdx += 1
+        }
+
+        if allRescored.isEmpty {
+            return []
+        }
+
+        // スコア降順にソート (同点時は文字数降順)
+        allRescored.sort { a, b in
+            if a.totalScore != b.totalScore {
+                return b.totalScore < a.totalScore
+            }
+            return b.text.count < a.text.count
+        }
+
+        // 表記重複の統合 (最良スコアを保持)
+        var deduplicated: [RescoredCandidate] = []
+        deduplicated.reserveCapacity(allRescored.count)
+        var seen = Set<String>()
+        var rIdx = 0
+        while rIdx < allRescored.count {
+            let item = allRescored[rIdx]
+            if seen.contains(item.text) != true {
+                seen.insert(item.text)
+                deduplicated.append(item)
+            }
+            rIdx += 1
+        }
+
+        return deduplicated
+    }
+
+    /// 音響 N-best 仮説からセカンドパス・リスコアリングにより最尤漢字表記を決定
+    public func decode(
+        acousticHypotheses: [AcousticHypothesis],
+        customLMScorer: (any LanguageModelScorer)? = nil
+    ) -> String {
+        let rescored = rescoreNBest(hypotheses: acousticHypotheses, customLMScorer: customLMScorer)
+        switch rescored.first {
+        case .some(let best):
+            return best.text
+        case .none:
+            return ""
         }
     }
 
     /// 音響 SNN の出力かな文字列から漢字かな混じり文を復元する
-    ///
-    /// スコアが直前の語に依存するため、位置ごとに 1 状態だけ残す Viterbi では
-    /// 厳密解にならない。ビーム付き探索の最良候補を返す。
     public func decode(kanaText: String) -> String {
-        let candidates = decodeNBest(kanaText: kanaText, beamWidth: Self.defaultBeamWidth)
+        let hyp = AcousticHypothesis(text: kanaText, tokens: [], acousticScore: 0.0, score: 0.0)
+        let candidates = rescoreNBest(hypotheses: [hyp], kanjiBeamWidth: Self.defaultBeamWidth)
         switch candidates.first {
         case .some(let best):
             return best.text

@@ -445,6 +445,7 @@ extension Trainer {
             let decoder = KanaKanjiDecoder(
                 dictionary: dict,
                 languageDecoder: lmDecoder,
+                languageModel: dict.makeContextScorer(),
                 kanaVocabulary: textVocabulary,
                 languageBonus: languageBonus
             )

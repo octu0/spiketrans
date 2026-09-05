@@ -137,6 +137,31 @@ public struct KanjiConverter: Sendable {
         return result
     }
 
+    /// テキストを単語境界で分割し、表層文字列の配列のみを高速に取得する (翻字をスキップ)
+    public func tokenizeSurfaces(_ text: String) -> [String] {
+        if text.isEmpty {
+            return []
+        }
+
+        let loc = Locale(identifier: "ja_JP") as CFLocale
+        let nsText = text as NSString
+        let tokenizer = CFStringTokenizerCreate(
+            nil,
+            text as CFString,
+            CFRangeMake(0, nsText.length),
+            kCFStringTokenizerUnitWordBoundary,
+            loc
+        )
+
+        var surfaces: [String] = []
+        while CFStringTokenizerAdvanceToNextToken(tokenizer) != [] {
+            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
+            let surface = nsText.substring(with: NSRange(location: range.location, length: range.length))
+            surfaces.append(surface)
+        }
+        return surfaces
+    }
+
     /// テキストを形態素に分割し、表層と読みを同時に取得する。
     ///
     /// 読みは形態素解析器が文脈から決めたものを使う。漢字単体から読みを引く

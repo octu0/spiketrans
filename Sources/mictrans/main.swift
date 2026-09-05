@@ -526,7 +526,13 @@ final class Transcriber: @unchecked Sendable {
             blankId: TextVocabulary.padId,
             beamWidth: 16
         )
-        self.kanaDecoder = KanaKanjiDecoder(dictionary: dictionary, languageBonus: 0.0)
+        self.kanaDecoder = KanaKanjiDecoder(
+            dictionary: dictionary,
+            languageModel: dictionary.makeContextScorer(),
+            languageBonus: 0.0,
+            lexicalWeight: 1.0,
+            lmWeight: 0.3
+        )
     }
 
     /// マイクスレッドから呼ぶ。蓄積と無音判定だけを音声キューで行う
@@ -752,7 +758,11 @@ final class Transcriber: @unchecked Sendable {
             f += 1
         }
 
-        let kana = beamDecoder.decode(logProbs: logProbs).text
+        let nBestHyps = beamDecoder.decodeNBest(logProbs: logProbs, n: 5)
+        if nBestHyps.isEmpty {
+            return
+        }
+        let kana = nBestHyps[0].text
         if kana.isEmpty {
             return
         }
@@ -772,7 +782,7 @@ final class Transcriber: @unchecked Sendable {
         let hasDictionary = (0 < dictionary.count)
         var kanji = ""
         if hasDictionary {
-            kanji = kanaDecoder.decode(kanaText: kana)
+            kanji = kanaDecoder.decode(acousticHypotheses: nBestHyps)
         }
         let elapsed = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
         let seconds = Double(pcm.count) / 16000.0

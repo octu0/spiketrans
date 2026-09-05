@@ -14,6 +14,8 @@ public final class ForwardCache: @unchecked Sendable {
     public var vStatesLayers: [[[[Float]]]] // [numLayers-1][seqLen][timeSteps][hiddenDim]
     public var sStatesLayers: [[[[Float]]]] // [numLayers-1][seqLen][timeSteps][hiddenDim]
     public var aStatesLayers: [[[[Float]]]] // [numLayers-1][seqLen][timeSteps][hiddenDim]
+    public var denseCurLayers: [[[[Float]]]] // [numLayers-1][seqLen][timeSteps][hiddenDim]
+    public var rmsLayers: [[[Float]]]        // [numLayers-1][seqLen][timeSteps]
     public var spikeAvg: [[Float]]   // [seqLen][hiddenDim] (最終層)
     public var logits: [[Float]]     // [seqLen][outputDim]
     public var probs: [[Float]]      // [seqLen][outputDim]
@@ -61,10 +63,23 @@ public final class ForwardCache: @unchecked Sendable {
                 ),
                 count: upperCount
             )
+            self.denseCurLayers = [[[[Float]]]](
+                repeating: [[[Float]]](
+                    repeating: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: timeSteps),
+                    count: seqLen
+                ),
+                count: upperCount
+            )
+            self.rmsLayers = [[[Float]]](
+                repeating: [[Float]](repeating: [Float](repeating: 1.0, count: timeSteps), count: seqLen),
+                count: upperCount
+            )
         } else {
             self.vStatesLayers = []
             self.sStatesLayers = []
             self.aStatesLayers = []
+            self.denseCurLayers = []
+            self.rmsLayers = []
         }
 
         self.spikeAvg = [[Float]](
@@ -184,16 +199,26 @@ public final class BPTTTrainer: @unchecked Sendable {
         let tSteps = network.timeSteps
         let outDim = network.outputDim
 
-        let cache = ForwardCache(seqLen: seqLen, timeSteps: tSteps, hiddenDim: hSize, outputDim: outDim)
+        let cache = ForwardCache(seqLen: seqLen, timeSteps: tSteps, hiddenDim: hSize, outputDim: outDim, numLayers: network.numLayers)
         if seqLen <= 0 {
             return (cache, 0.0)
         }
 
         let sliceBiasData = network.pBOut.data
 
-        var vPrev = [Float](repeating: 0.0, count: hSize)
-        var sPrev = [Float](repeating: 0.0, count: hSize)
-        var aPrev = [Float](repeating: 0.0, count: hSize)
+        var vPrev0 = [Float](repeating: 0.0, count: hSize)
+        var sPrev0 = [Float](repeating: 0.0, count: hSize)
+        var aPrev0 = [Float](repeating: 0.0, count: hSize)
+
+        var vPrevLayers: [[Float]] = []
+        var sPrevLayers: [[Float]] = []
+        var aPrevLayers: [[Float]] = []
+        if 1 < network.numLayers {
+            let upperCount = network.numLayers - 1
+            vPrevLayers = [[Float]](repeating: [Float](repeating: 0.0, count: hSize), count: upperCount)
+            sPrevLayers = [[Float]](repeating: [Float](repeating: 0.0, count: hSize), count: upperCount)
+            aPrevLayers = [[Float]](repeating: [Float](repeating: 0.0, count: hSize), count: upperCount)
+        }
 
         var totalLoss: Float = 0.0
         var numTargets: Float = 0.0
@@ -205,13 +230,14 @@ public final class BPTTTrainer: @unchecked Sendable {
 
             var t = 0
             while t < tSteps {
-                var vNew = [Float](repeating: 0.0, count: hSize)
-                var sNew = [Float](repeating: 0.0, count: hSize)
-                var aNew = [Float](repeating: 0.0, count: hSize)
+                // 第0層 (時系列文脈・共調音を担う再帰 LIF 層)
+                var vNew0 = [Float](repeating: 0.0, count: hSize)
+                var sNew0 = [Float](repeating: 0.0, count: hSize)
+                var aNew0 = [Float](repeating: 0.0, count: hSize)
+                var totalCurrent0 = [Float](repeating: 0.0, count: hSize)
 
                 var i = 0
                 while i < hSize {
-                    // 入力電流: bH + WIn * feat
                     let wInOffset = i * network.inputDim
                     var current: Float = network.pBH.data[i]
                     var d = 0
@@ -220,42 +246,133 @@ public final class BPTTTrainer: @unchecked Sendable {
                         d += 1
                     }
 
-                    // 再帰電流: WRec * sPrev
                     let wRecOffset = i * network.maxHiddenDim
                     var j = 0
                     while j < hSize {
-                        current += network.pWRec.data[wRecOffset + j] * sPrev[j]
+                        current += network.pWRec.data[wRecOffset + j] * sPrev0[j]
                         j += 1
                     }
+                    totalCurrent0[i] = current
 
-                    // LIF 膜電位更新
-                    let vDecayed = network.lifConfig.beta * vPrev[i] * (1.0 - sPrev[i])
+                    let vDecayed = network.lifConfig.beta * vPrev0[i] * (1.0 - sPrev0[i])
                     let vUpdated = LIFNeuronEngine.clampMembrane(vDecayed + current)
-                    vNew[i] = vUpdated
+                    vNew0[i] = vUpdated
 
-                    // ALIF 適応閾値の更新 (gamma = 0.0 のとき固定閾値 LIF と等価)
-                    let aUpdated = (network.lifConfig.rho * aPrev[i]) + (network.lifConfig.gamma * sPrev[i])
-                    aNew[i] = aUpdated
+                    let aUpdated = (network.lifConfig.rho * aPrev0[i]) + (network.lifConfig.gamma * sPrev0[i])
+                    aNew0[i] = aUpdated
                     let dynVTh = network.lifConfig.vTh + aUpdated
 
-                    // スパイク発火
                     if dynVTh <= vUpdated {
-                        sNew[i] = 1.0
+                        sNew0[i] = 1.0
                     }
                     if vUpdated < dynVTh {
-                        sNew[i] = 0.0
+                        sNew0[i] = 0.0
                     }
 
-                    spikeSum[i] += sNew[i]
-                    cache.vStates[k][t][i] = vNew[i]
-                    cache.sStates[k][t][i] = sNew[i]
+                    if network.numLayers == 1 {
+                        spikeSum[i] += sNew0[i]
+                    }
+                    cache.vStates[k][t][i] = vNew0[i]
+                    cache.sStates[k][t][i] = sNew0[i]
                     cache.aStates[k][t][i] = aUpdated
                     i += 1
                 }
 
-                vPrev = vNew
-                sPrev = sNew
-                aPrev = aNew
+                vPrev0 = vNew0
+                sPrev0 = sNew0
+                aPrev0 = aNew0
+
+                // 上位層 (Layer 1 以降: 電流 RMSNorm & Membrane-Shortcut)
+                if 1 < network.numLayers {
+                    var prevCurrent = totalCurrent0
+                    var l = 1
+                    while l < network.numLayers {
+                        let upperIdx = l - 1
+                        let sPrevLayer: [Float]
+                        switch l {
+                        case 1:
+                            sPrevLayer = sNew0
+                        default:
+                            sPrevLayer = cache.sStatesLayers[upperIdx - 1][k][t]
+                        }
+
+                        let bHL = network.pBHLayers[upperIdx].data
+                        let wL = network.pWLayers[upperIdx].data
+                        var denseCur = [Float](repeating: 0.0, count: hSize)
+                        var sumSq: Float = 0.0
+
+                        i = 0
+                        while i < hSize {
+                            var cVal = bHL[i]
+                            let rowOffset = i * hSize
+                            var j = 0
+                            while j < hSize {
+                                cVal += wL[rowOffset + j] * sPrevLayer[j]
+                                j += 1
+                            }
+                            denseCur[i] = cVal
+                            sumSq += cVal * cVal
+                            i += 1
+                        }
+
+                        let rms = sqrt((sumSq / Float(hSize)) + 1e-5)
+                        let invRms = 1.0 / rms
+                        cache.rmsLayers[upperIdx][k][t] = rms
+                        cache.denseCurLayers[upperIdx][k][t] = denseCur
+
+                        let gamma = network.pGammaRMS[upperIdx].data
+                        var totalCurrent_l = [Float](repeating: 0.0, count: hSize)
+                        i = 0
+                        while i < hSize {
+                            let normCur = (denseCur[i] * invRms) * gamma[i]
+                            totalCurrent_l[i] = normCur + prevCurrent[i]
+                            i += 1
+                        }
+                        prevCurrent = totalCurrent_l
+
+                        // 上位層 LIF 膜電位・スパイク更新
+                        var vNew_l = [Float](repeating: 0.0, count: hSize)
+                        var sNew_l = [Float](repeating: 0.0, count: hSize)
+                        var aNew_l = [Float](repeating: 0.0, count: hSize)
+                        let vPrev_l = vPrevLayers[upperIdx]
+                        let sPrev_l = sPrevLayers[upperIdx]
+                        let aPrev_l = aPrevLayers[upperIdx]
+                        let isFinal = (l + 1) == network.numLayers
+
+                        i = 0
+                        while i < hSize {
+                            let vDecayed = network.lifConfig.beta * vPrev_l[i] * (1.0 - sPrev_l[i])
+                            let vUpdated = LIFNeuronEngine.clampMembrane(vDecayed + totalCurrent_l[i])
+                            vNew_l[i] = vUpdated
+
+                            let aUpdated = (network.lifConfig.rho * aPrev_l[i]) + (network.lifConfig.gamma * sPrev_l[i])
+                            aNew_l[i] = aUpdated
+                            let dynVTh = network.lifConfig.vTh + aUpdated
+
+                            if dynVTh <= vUpdated {
+                                sNew_l[i] = 1.0
+                            }
+                            if vUpdated < dynVTh {
+                                sNew_l[i] = 0.0
+                            }
+
+                            if isFinal {
+                                spikeSum[i] += sNew_l[i]
+                            }
+                            i += 1
+                        }
+
+                        cache.vStatesLayers[upperIdx][k][t] = vNew_l
+                        cache.sStatesLayers[upperIdx][k][t] = sNew_l
+                        cache.aStatesLayers[upperIdx][k][t] = aNew_l
+
+                        vPrevLayers[upperIdx] = vNew_l
+                        sPrevLayers[upperIdx] = sNew_l
+                        aPrevLayers[upperIdx] = aNew_l
+                        l += 1
+                    }
+                }
+
                 t += 1
             }
 
@@ -405,6 +522,8 @@ public final class BPTTTrainer: @unchecked Sendable {
         let hSize = network.maxHiddenDim
         let tSteps = cache.timeSteps
         let outDim = cache.outputDim
+        let numLayers = network.numLayers
+        let upperCount = numLayers - 1
 
         var numTargets: Float = 0.0
         var k = 0
@@ -429,8 +548,16 @@ public final class BPTTTrainer: @unchecked Sendable {
 
         let lossScale = (1.0 / numTargets) * lossWeight
 
-        var dVNextStep = [Float](repeating: 0.0, count: hSize)
-        var dSNextStep = [Float](repeating: 0.0, count: hSize)
+        var dVNextStep0 = [Float](repeating: 0.0, count: hSize)
+        var dSNextStep0 = [Float](repeating: 0.0, count: hSize)
+
+        var dVNextStepLayers: [[Float]] = []
+        var dSNextStepLayers: [[Float]] = []
+        if 1 < numLayers {
+            dVNextStepLayers = [[Float]](repeating: [Float](repeating: 0.0, count: hSize), count: upperCount)
+            dSNextStepLayers = [[Float]](repeating: [Float](repeating: 0.0, count: hSize), count: upperCount)
+        }
+
         let invT = 1.0 / Float(tSteps)
 
         k = seqLen - 1
@@ -463,7 +590,6 @@ public final class BPTTTrainer: @unchecked Sendable {
                 }
             }
 
-
             var dSpikeAvg = [Float](repeating: 0.0, count: hSize)
             var c = 0
             while c < outDim {
@@ -479,47 +605,170 @@ public final class BPTTTrainer: @unchecked Sendable {
                 c += 1
             }
 
-            var dVTime = dVNextStep
-            var dSTime = dSNextStep
+            var dVTime0 = dVNextStep0
+            var dSTime0 = dSNextStep0
+            var dVTimeLayers = dVNextStepLayers
+            var dSTimeLayers = dSNextStepLayers
 
             var t = tSteps - 1
             while 0 <= t {
-                let vCurr = cache.vStates[k][t]
-                let vPrevT: [Float]
-                let sPrevT: [Float]
+                var dSTimeStep0 = dSTime0
+                var dSTimeStepLayers = dSTimeLayers
 
-                if t == 0 {
-                    if 0 < k {
-                        vPrevT = cache.vStates[k - 1][tSteps - 1]
-                        sPrevT = cache.sStates[k - 1][tSteps - 1]
-                    } else {
-                        vPrevT = [Float](repeating: 0.0, count: hSize)
-                        sPrevT = [Float](repeating: 0.0, count: hSize)
+                if numLayers == 1 {
+                    var i = 0
+                    while i < hSize {
+                        dSTimeStep0[i] += dSpikeAvg[i] * invT
+                        i += 1
                     }
                 } else {
-                    vPrevT = cache.vStates[k][t - 1]
-                    sPrevT = cache.sStates[k][t - 1]
+                    let lastUpperIdx = upperCount - 1
+                    var i = 0
+                    while i < hSize {
+                        dSTimeStepLayers[lastUpperIdx][i] += dSpikeAvg[i] * invT
+                        i += 1
+                    }
                 }
 
-                let aCurr = cache.aStates[k][t]
+                var dShortcutToPrev = [Float](repeating: 0.0, count: hSize)
+                if 1 < numLayers {
+                    var l = numLayers - 1
+                    while 1 <= l {
+                        let upperIdx = l - 1
+                        let vCurr_l = cache.vStatesLayers[upperIdx][k][t]
+                        let aCurr_l = cache.aStatesLayers[upperIdx][k][t]
+                        let denseCur = cache.denseCurLayers[upperIdx][k][t]
+                        let rms = cache.rmsLayers[upperIdx][k][t]
+                        let invRms = 1.0 / rms
+                        let gamma = network.pGammaRMS[upperIdx].data
+                        let wL = network.pWLayers[upperIdx].data
 
-                var dVList = [Float](repeating: 0.0, count: hSize)
+                        var dVList_l = [Float](repeating: 0.0, count: hSize)
+                        var dTotalCur_l = [Float](repeating: 0.0, count: hSize)
+
+                        var i = 0
+                        while i < hSize {
+                            let dS_total = dSTimeStepLayers[upperIdx][i]
+                            let surrogateGrad = SurrogateGradient.derivative(
+                                v: vCurr_l[i],
+                                vTh: network.lifConfig.vTh + aCurr_l[i],
+                                alpha: network.lifConfig.alpha
+                            )
+                            let dV_i = dVTimeLayers[upperIdx][i] + (dS_total * surrogateGrad)
+                            dVList_l[i] = dV_i
+                            dTotalCur_l[i] = dV_i + dShortcutToPrev[i]
+                            i += 1
+                        }
+
+                        dShortcutToPrev = dTotalCur_l
+
+                        var dotG: Float = 0.0
+                        i = 0
+                        while i < hSize {
+                            grads.gradGammaRMS[upperIdx][i] += dTotalCur_l[i] * (denseCur[i] * invRms)
+                            dotG += (dTotalCur_l[i] * gamma[i]) * denseCur[i]
+                            i += 1
+                        }
+
+                        let S = dotG / (Float(hSize) * rms * rms)
+                        var dDenseCur = [Float](repeating: 0.0, count: hSize)
+                        i = 0
+                        while i < hSize {
+                            dDenseCur[i] = ((dTotalCur_l[i] * gamma[i]) - (denseCur[i] * S)) * invRms
+                            i += 1
+                        }
+
+                        let s_prev: [Float]
+                        switch l {
+                        case 1:
+                            s_prev = cache.sStates[k][t]
+                        default:
+                            s_prev = cache.sStatesLayers[upperIdx - 1][k][t]
+                        }
+
+                        i = 0
+                        while i < hSize {
+                            let dD = dDenseCur[i]
+                            grads.gradBHLayers[upperIdx][i] += dD
+                            let rowOffset = i * hSize
+                            var j = 0
+                            while j < hSize {
+                                grads.gradWLayers[upperIdx][rowOffset + j] += dD * s_prev[j]
+                                let dS_contrib = wL[rowOffset + j] * dD
+                                switch l {
+                                case 1:
+                                    dSTimeStep0[j] += dS_contrib
+                                default:
+                                    dSTimeStepLayers[upperIdx - 1][j] += dS_contrib
+                                }
+                                j += 1
+                            }
+                            i += 1
+                        }
+
+                        let vPrevT_l: [Float]
+                        let sPrevT_l: [Float]
+                        if t == 0 {
+                            if 0 < k {
+                                vPrevT_l = cache.vStatesLayers[upperIdx][k - 1][tSteps - 1]
+                                sPrevT_l = cache.sStatesLayers[upperIdx][k - 1][tSteps - 1]
+                            } else {
+                                vPrevT_l = [Float](repeating: 0.0, count: hSize)
+                                sPrevT_l = [Float](repeating: 0.0, count: hSize)
+                            }
+                        } else {
+                            vPrevT_l = cache.vStatesLayers[upperIdx][k][t - 1]
+                            sPrevT_l = cache.sStatesLayers[upperIdx][k][t - 1]
+                        }
+
+                        var j = 0
+                        while j < hSize {
+                            let decayFactor = network.lifConfig.beta * (1.0 - sPrevT_l[j])
+                            dVTimeLayers[upperIdx][j] = dVList_l[j] * decayFactor
+                            dSTimeLayers[upperIdx][j] = -network.lifConfig.beta * vPrevT_l[j] * dVList_l[j]
+                            j += 1
+                        }
+
+                        l -= 1
+                    }
+                }
+
+                // 第0層の逆伝播 (再帰 LIF 層 + ショートカット受流し)
+                let vCurr0 = cache.vStates[k][t]
+                let aCurr0 = cache.aStates[k][t]
+                let vPrevT0: [Float]
+                let sPrevT0: [Float]
+                if t == 0 {
+                    if 0 < k {
+                        vPrevT0 = cache.vStates[k - 1][tSteps - 1]
+                        sPrevT0 = cache.sStates[k - 1][tSteps - 1]
+                    } else {
+                        vPrevT0 = [Float](repeating: 0.0, count: hSize)
+                        sPrevT0 = [Float](repeating: 0.0, count: hSize)
+                    }
+                } else {
+                    vPrevT0 = cache.vStates[k][t - 1]
+                    sPrevT0 = cache.sStates[k][t - 1]
+                }
+
+                var dVList0 = [Float](repeating: 0.0, count: hSize)
                 var i = 0
                 while i < hSize {
-                    let dS_total = (dSpikeAvg[i] * invT) + dSTime[i]
-                    // 代理勾配は順伝播で実際に用いた動的閾値で評価する
-                    // (適応状態 a は定数扱い = detached adaptation 近似)
+                    let dS_total = dSTimeStep0[i]
                     let surrogateGrad = SurrogateGradient.derivative(
-                        v: vCurr[i],
-                        vTh: network.lifConfig.vTh + aCurr[i],
+                        v: vCurr0[i],
+                        vTh: network.lifConfig.vTh + aCurr0[i],
                         alpha: network.lifConfig.alpha
                     )
-                    let dV_i = dVTime[i] + (dS_total * surrogateGrad)
-                    dVList[i] = dV_i
+                    let dV_i = dVTime0[i] + (dS_total * surrogateGrad)
+                    dVList0[i] = dV_i
 
-                    let dInput_i = dV_i
+                    var dInput_i = dV_i
+                    if 1 < numLayers {
+                        dInput_i += dShortcutToPrev[i]
+                    }
 
-                    // 入力重み勾配
+                    // 入力重み勾配 WIn
                     let inOffset = i * network.inputDim
                     var d = 0
                     while d < network.inputDim {
@@ -527,41 +776,42 @@ public final class BPTTTrainer: @unchecked Sendable {
                         d += 1
                     }
 
-                    // 再帰重み勾配
+                    // 再帰重み勾配 WRec
                     let recOffset = i * network.maxHiddenDim
                     var j = 0
                     while j < hSize {
-                        grads.gradWRec[recOffset + j] += dInput_i * sPrevT[j]
+                        grads.gradWRec[recOffset + j] += dInput_i * sPrevT0[j]
                         j += 1
                     }
                     i += 1
                 }
 
-                var newDVTime = [Float](repeating: 0.0, count: hSize)
-                var newDSTime = [Float](repeating: 0.0, count: hSize)
-
                 var j = 0
                 while j < hSize {
-                    let decayFactor = network.lifConfig.beta * (1.0 - sPrevT[j])
-                    newDVTime[j] = dVList[j] * decayFactor
+                    let decayFactor = network.lifConfig.beta * (1.0 - sPrevT0[j])
+                    dVTime0[j] = dVList0[j] * decayFactor
 
-                    var dS_j = -network.lifConfig.beta * vPrevT[j] * dVList[j]
+                    var dS_j = -network.lifConfig.beta * vPrevT0[j] * dVList0[j]
                     var iRec = 0
                     while iRec < hSize {
-                        dS_j += network.pWRec.data[iRec * network.maxHiddenDim + j] * dVList[iRec]
+                        var dIn = dVList0[iRec]
+                        if 1 < numLayers {
+                            dIn += dShortcutToPrev[iRec]
+                        }
+                        dS_j += network.pWRec.data[iRec * network.maxHiddenDim + j] * dIn
                         iRec += 1
                     }
-                    newDSTime[j] = dS_j
+                    dSTime0[j] = dS_j
                     j += 1
                 }
 
-                dVTime = newDVTime
-                dSTime = newDSTime
                 t -= 1
             }
 
-            dVNextStep = dVTime
-            dSNextStep = dSTime
+            dVNextStep0 = dVTime0
+            dSNextStep0 = dSTime0
+            dVNextStepLayers = dVTimeLayers
+            dSNextStepLayers = dSTimeLayers
             k -= 1
         }
     }

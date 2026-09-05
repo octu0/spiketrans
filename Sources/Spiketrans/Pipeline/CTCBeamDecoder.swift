@@ -16,6 +16,29 @@ public struct CTCPrefixHypothesis: Sendable {
     }
 }
 
+/// 音響 CTC デコーダが出力するかな音響仮説 (N-best 候補)
+public struct AcousticHypothesis: Sendable, Equatable {
+    public let text: String            // かな文字列
+    public let tokens: [Int]           // トークン ID 系列
+    public let acousticScore: Float    // 対数音響確率 (S_acoustic(X))
+    public let score: Float            // 長さ加点等を含む総合スコア
+
+    public init(
+        text: String,
+        tokens: [Int],
+        acousticScore: Float,
+        score: Float
+    ) {
+        self.text = text
+        self.tokens = tokens
+        self.acousticScore = acousticScore
+        self.score = score
+    }
+}
+
+/// CTCBeamSearch のエイリアス
+public typealias CTCBeamSearch = CTCBeamDecoder
+
 /// Pure Swift SNN CTC プレフィックスビーム探索デコーダ (CTC Prefix Beam Search)
 public final class CTCBeamDecoder: @unchecked Sendable {
     public let vocabulary: TextVocabulary
@@ -53,6 +76,16 @@ public final class CTCBeamDecoder: @unchecked Sendable {
         let streaming = makeStreamingDecoder()
         streaming.push(frames: logProbs)
         return streaming.best
+    }
+
+    /// 対数確率系列 (T x V) から CTC プレフィックスビーム探索により上位 N 個のかな音響仮説を抽出
+    public func decodeNBest(logProbs: [[Float]], n: Int = 5) -> [AcousticHypothesis] {
+        if logProbs.isEmpty {
+            return []
+        }
+        let streaming = makeStreamingDecoder()
+        streaming.push(frames: logProbs)
+        return streaming.nBest(n: n)
     }
 
     /// 同じ設定でフレーム単位に進められるデコーダを作る

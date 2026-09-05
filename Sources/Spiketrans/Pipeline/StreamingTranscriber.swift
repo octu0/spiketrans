@@ -77,6 +77,8 @@ public final class StreamingTranscriber: @unchecked Sendable {
     private let acousticDecoder: AcousticDecoder
     private let acousticWorkspace: AcousticWorkspace
     private let languageDecoder: LanguageDecoder
+    public let kanaKanjiDecoder: KanaKanjiDecoder?
+    public let ctcBeamDecoder: CTCBeamDecoder?
 
     // O(1) 固定長リングバッファ
     private let ringBufferCapacity: Int = 32768
@@ -103,12 +105,31 @@ public final class StreamingTranscriber: @unchecked Sendable {
         quantizedAcousticEngine: QuantizedEngine? = nil,
         textVocabulary: TextVocabulary = TextVocabulary(),
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        unkThreshold: Float = StreamingTranscriber.defaultUnkThreshold
+        unkThreshold: Float = StreamingTranscriber.defaultUnkThreshold,
+        kanaKanjiDecoder: KanaKanjiDecoder? = nil,
+        ctcBeamDecoder: CTCBeamDecoder? = nil
     ) {
         self.config = config
         self.textVocabulary = textVocabulary
         self.phonemeVocabulary = phonemeVocabulary
         self.unkThreshold = unkThreshold
+        self.kanaKanjiDecoder = kanaKanjiDecoder
+        switch ctcBeamDecoder {
+        case .some(let customBeam):
+            self.ctcBeamDecoder = customBeam
+        case .none:
+            switch kanaKanjiDecoder {
+            case .some:
+                self.ctcBeamDecoder = CTCBeamDecoder(
+                    vocabulary: textVocabulary,
+                    blankId: TextVocabulary.padId,
+                    beamWidth: config.beamWidth,
+                    lmWeight: config.lmWeight
+                )
+            case .none:
+                self.ctcBeamDecoder = nil
+            }
+        }
 
         let dspCfg = config.dspConfig
         self.vad = VAD(config: dspCfg)
@@ -387,21 +408,71 @@ public final class StreamingTranscriber: @unchecked Sendable {
     /// 現在の発話セグメントの言語デコードと結果確定 (本線: 直接漢字かな + 未知語フォールバック: 聞こえた音のかな)
     private func finalizeSegment() {
         if segmentProbs.isEmpty != true {
-            let decodeRes: (tokens: [Int], text: String, score: Float)
-            if config.beamWidth <= 1 {
-                decodeRes = languageDecoder.decodeGreedy(
-                    acousticProbs: segmentProbs,
-                    unkThreshold: unkThreshold
-                )
-            } else {
-                decodeRes = languageDecoder.decodeBeamSearch(
-                    acousticProbs: segmentProbs,
-                    unkThreshold: unkThreshold
-                )
+            var finalText = ""
+            var finalTokens: [Int] = []
+
+            switch kanaKanjiDecoder {
+            case .some(let kkDecoder):
+                let beamDec: CTCBeamDecoder
+                switch ctcBeamDecoder {
+                case .some(let bd):
+                    beamDec = bd
+                case .none:
+                    beamDec = CTCBeamDecoder(
+                        vocabulary: textVocabulary,
+                        blankId: TextVocabulary.padId,
+                        beamWidth: config.beamWidth,
+                        lmWeight: config.lmWeight
+                    )
+                }
+                let outDim = segmentProbs[0].probabilities.count
+                let streaming = beamDec.makeStreamingDecoder()
+                var logFrame = [Float](repeating: 0.0, count: outDim)
+                var f = 0
+                while f < segmentProbs.count {
+                    let probs = segmentProbs[f].probabilities
+                    var c = 0
+                    while c < outDim {
+                        logFrame[c] = log(max(1e-30, probs[c]))
+                        c += 1
+                    }
+                    streaming.push(frame: logFrame)
+                    f += 1
+                }
+                let nBestHyps = streaming.nBest(n: config.beamWidth)
+                let rescored = kkDecoder.rescoreNBest(hypotheses: nBestHyps)
+                switch rescored.first {
+                case .some(let best):
+                    finalText = best.text
+                    finalTokens = best.tokens
+                case .none:
+                    switch nBestHyps.first {
+                    case .some(let h):
+                        finalText = h.text
+                        finalTokens = h.tokens
+                    case .none:
+                        finalText = ""
+                        finalTokens = []
+                    }
+                }
+            case .none:
+                let decodeRes: (tokens: [Int], text: String, score: Float)
+                if config.beamWidth <= 1 {
+                    decodeRes = languageDecoder.decodeGreedy(
+                        acousticProbs: segmentProbs,
+                        unkThreshold: unkThreshold
+                    )
+                } else {
+                    decodeRes = languageDecoder.decodeBeamSearch(
+                        acousticProbs: segmentProbs,
+                        unkThreshold: unkThreshold
+                    )
+                }
+                finalText = decodeRes.text
+                finalTokens = decodeRes.tokens
             }
 
             // 本線デコード結果の確定 (未知語トークン <unk>, ? のサニタイズ)
-            var finalText = decodeRes.text
             finalText = finalText.replacingOccurrences(of: "<unk>", with: "")
             finalText = finalText.replacingOccurrences(of: "?", with: "")
 
@@ -410,7 +481,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
             let finalRes = TranscriptionResult(
                 text: finalText,
                 phonemes: phonemeVocabulary.kanaToPhonemes(finalText),
-                tokenIds: decodeRes.tokens,
+                tokenIds: finalTokens,
                 startTimeSeconds: startSec,
                 endTimeSeconds: endSec,
                 confidence: 0.95,

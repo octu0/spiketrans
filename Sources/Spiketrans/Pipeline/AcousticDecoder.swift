@@ -115,6 +115,7 @@ public final class AcousticDecoder: @unchecked Sendable {
     }
 
     /// 1フレームの音響特徴量から音素事後確率分布を推定
+    @discardableResult
     @inline(__always)
     public func decodeFrame(
         features: [Float],
@@ -298,5 +299,54 @@ public final class AcousticDecoder: @unchecked Sendable {
         }
 
         return collapsed
+    }
+
+    /// 音響特徴量系列から各フレームの対数事後確率 (log-probabilities) を算出
+    public func decodeLogProbabilities(
+        featuresSeq: [[Float]],
+        workspace: AcousticWorkspace
+    ) -> [[Float]] {
+        let frameProbs = decodeSequence(featuresSeq: featuresSeq, workspace: workspace)
+        let outDim = network.outputDim
+        var logProbs = [[Float]](
+            repeating: [Float](repeating: 0.0, count: outDim),
+            count: frameProbs.count
+        )
+        var f = 0
+        while f < frameProbs.count {
+            let probs = frameProbs[f].probabilities
+            var c = 0
+            while c < outDim {
+                logProbs[f][c] = log(max(1e-30, probs[c]))
+                c += 1
+            }
+            f += 1
+        }
+        return logProbs
+    }
+
+    /// 特徴量系列から CTC ビーム探索を用いて上位 N 個のかな音響仮説を抽出
+    public func decodeNBest(
+        featuresSeq: [[Float]],
+        workspace: AcousticWorkspace,
+        beamDecoder: CTCBeamDecoder? = nil,
+        beamWidth: Int = 16,
+        n: Int = 5,
+        lengthBonus: Float = 0.0
+    ) -> [AcousticHypothesis] {
+        let bDecoder: CTCBeamDecoder
+        switch beamDecoder {
+        case .some(let bd):
+            bDecoder = bd
+        case .none:
+            bDecoder = CTCBeamDecoder(
+                vocabulary: vocabulary,
+                blankId: TextVocabulary.padId,
+                beamWidth: beamWidth,
+                lengthBonus: lengthBonus
+            )
+        }
+        let logProbs = decodeLogProbabilities(featuresSeq: featuresSeq, workspace: workspace)
+        return bDecoder.decodeNBest(logProbs: logProbs, n: n)
     }
 }

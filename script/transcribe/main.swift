@@ -191,6 +191,7 @@ let beamDecoder = CTCBeamDecoder(
 )
 
 var kanaParts: [String] = []
+var segmentNBest: [[AcousticHypothesis]] = []
 var totalFrames = 0
 var peakMemory = residentMemoryMB()
 let inferStart = CFAbsoluteTimeGetCurrent()
@@ -225,7 +226,14 @@ while segIdx < segments.count {
             }
             f += 1
         }
-        kanaParts.append(beamDecoder.decode(logProbs: logProbs).text)
+        let nBest = beamDecoder.decodeNBest(logProbs: logProbs, n: 5)
+        segmentNBest.append(nBest)
+        switch nBest.first {
+        case .some(let h):
+            kanaParts.append(h.text)
+        case .none:
+            kanaParts.append("")
+        }
     }
 
     let mem = residentMemoryMB()
@@ -253,11 +261,17 @@ print(String(format: "  ピークメモリ: %.0f MB", peakMemory))
 // 6. 第2段 (辞書がある場合)
 if 0 < kanaText.count && 0 < kanaKanjiDict.count {
     let stage2Start = CFAbsoluteTimeGetCurrent()
-    let kanaDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
+    let kanaDecoder = KanaKanjiDecoder(
+        dictionary: kanaKanjiDict,
+        languageModel: kanaKanjiDict.makeContextScorer(),
+        languageBonus: 0.0,
+        lexicalWeight: 1.0,
+        lmWeight: 0.3
+    )
     var kanjiParts: [String] = []
     var pIdx = 0
-    while pIdx < kanaParts.count {
-        kanjiParts.append(kanaDecoder.decode(kanaText: kanaParts[pIdx]))
+    while pIdx < segmentNBest.count {
+        kanjiParts.append(kanaDecoder.decode(acousticHypotheses: segmentNBest[pIdx]))
         pIdx += 1
     }
     let kanjiText = kanjiParts.joined()

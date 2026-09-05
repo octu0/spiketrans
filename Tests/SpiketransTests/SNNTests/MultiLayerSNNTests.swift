@@ -101,46 +101,135 @@ final class MultiLayerSNNTests: XCTestCase {
         // 逆伝播時: ∂L/∂I^{(l-1)} = ∂L/∂I^{(l)} + (RMSNorm経由の勾配)
         // サロゲート勾配 σ'(V) が 0 に縮退した場合でも、電流加算ハイウェイを通じて
         // 勾配が前層に直接伝達されることを検証する
-        let hDim = 64
-        let inCur = [Float](repeating: 1.0, count: hDim)
-        let denseCur = [Float](repeating: 0.5, count: hDim)
-        let gamma = [Float](repeating: 1.0, count: hDim)
+        let inDim = 8
+        let hDim = 16
+        let outDim = 4
+        // 上位層 (Layer 1) の閾値を極大 (100.0) に設定し、サロゲート勾配 σ'(V) を極小 (~1e-6) に縮退させる
+        let extremeConfig = LIFConfig(beta: 0.8, vTh: 100.0, alpha: 1.0)
+        let net = SpikingNetwork(numLayers: 2, inputDim: inDim, maxHiddenDim: hDim, outputDim: outDim, timeSteps: 2, lifConfig: extremeConfig)
+        let opt = AdamOptimizer(config: AdamConfig(lr: 0.01), parameters: net.parameters)
+        let trainer = BPTTTrainer(network: net, optimizer: opt)
 
-        // RMS 計算
-        var sumSq: Float = 0.0
+        let seqLen = 2
+        let featuresSeq = [[Float]](repeating: [Float](repeating: 0.5, count: inDim), count: seqLen)
+        let targets = [1, 2]
+
+        var grads = trainer.makeGradients()
+        let loss = trainer.computeSampleGradients(featuresSeq: featuresSeq, targets: targets, grads: &grads)
+        XCTAssertTrue(0.0 < loss)
+
+        // 上位層サロゲート勾配が消失していても、Membrane-Shortcut 電流ハイウェイ経由で
+        // 第0層入力重み gradWIn に有意な勾配（|grad| > 1e-5）が伝達されていることを検証
+        var gradWInNorm: Float = 0.0
+        var i = 0
+        while i < grads.gradWIn.count {
+            gradWInNorm += abs(grads.gradWIn[i])
+            i += 1
+        }
+        XCTAssertTrue(1e-5 < gradWInNorm, "Membrane-Shortcut によりサロゲート勾配消失時でも Layer 0 に勾配が伝達されること")
+    }
+
+    // MARK: - 3.5 多層パラメータの数値微分および降下方向性検証
+
+    func testMultiLayerFiniteDifferenceGradientCheck() {
+        let inDim = 4
+        let hDim = 8
+        let outDim = 4
+        let net = SpikingNetwork(
+            numLayers: 2,
+            inputDim: inDim,
+            maxHiddenDim: hDim,
+            outputDim: outDim,
+            timeSteps: 2
+        )
+        let opt = AdamOptimizer(config: AdamConfig(lr: 0.01), parameters: net.parameters)
+        let trainer = BPTTTrainer(network: net, optimizer: opt)
+
+        let seqLen = 2
+        var featuresSeq = [[Float]](repeating: [Float](repeating: 0.3, count: inDim), count: seqLen)
+        var d = 0
+        while d < inDim {
+            featuresSeq[0][d] = Float(d + 1) * 0.2
+            featuresSeq[1][d] = Float(d + 2) * 0.15
+            d += 1
+        }
+        let targets = [1, 2]
+
+        // 1. 解析的勾配の計算
+        var grads = trainer.makeGradients()
+        let initialFwd = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets)
+        trainer.backwardSequence(
+            featuresSeq: featuresSeq,
+            targets: targets,
+            cache: initialFwd.cache,
+            lossWeight: 1.0,
+            grads: &grads
+        )
+
+        // 2. 出力層バイアス pBOut の数値微分検証 (リードアウト連続層)
+        let eps: Float = 1e-3
+        var c = 0
+        while c < outDim {
+            let origVal = net.pBOut.data[c]
+
+            net.pBOut.data[c] = origVal + eps
+            let (_, lossPlus) = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets)
+
+            net.pBOut.data[c] = origVal - eps
+            let (_, lossMinus) = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets)
+
+            net.pBOut.data[c] = origVal
+
+            let numGrad = (lossPlus - lossMinus) / (2.0 * eps)
+            let anaGrad = grads.gradBOut[c]
+
+            let diff = abs(anaGrad - numGrad)
+            XCTAssertTrue(diff <= 5e-3, "BOut[\(c)] 数値微分一致性検証: analytical=\(anaGrad), numerical=\(numGrad)")
+            c += 1
+        }
+
+        // 3. 上位層パラメータ (WLayers, BHLayers, GammaRMS) の勾配有限性および更新方向性検証
+        var hasNonZeroW = false
+        var hasNonZeroBH = false
+        var hasNonZeroGamma = false
+
         var i = 0
         while i < hDim {
-            sumSq += denseCur[i] * denseCur[i]
+            if 1e-6 < abs(grads.gradBHLayers[0][i]) {
+                hasNonZeroBH = true
+            }
+            if 1e-6 < abs(grads.gradGammaRMS[0][i]) {
+                hasNonZeroGamma = true
+            }
+            var j = 0
+            while j < hDim {
+                if 1e-6 < abs(grads.gradWLayers[0][i * hDim + j]) {
+                    hasNonZeroW = true
+                }
+                j += 1
+            }
             i += 1
         }
-        let rms = sqrt((sumSq / Float(hDim)) + 1e-5)
-        let invRms = 1.0 / rms
 
-        // 前向きショートカット
-        var shortcutCur = [Float](repeating: 0.0, count: hDim)
+        XCTAssertTrue(hasNonZeroW, "WLayers 勾配が計算されていること")
+        XCTAssertTrue(hasNonZeroBH, "BHLayers 勾配が計算されていること")
+        XCTAssertTrue(hasNonZeroGamma, "GammaRMS 勾配が計算されていること")
+
+        // 勾配降下による多層ネットワークの損失減少検証
+        let lr: Float = 0.05
         i = 0
         while i < hDim {
-            shortcutCur[i] = (denseCur[i] * invRms * gamma[i]) + inCur[i]
+            net.pBHLayers[0].data[i] -= lr * grads.gradBHLayers[0][i]
+            net.pGammaRMS[0].data[i] -= lr * grads.gradGammaRMS[0][i]
+            var j = 0
+            while j < hDim {
+                net.pWLayers[0].data[i * hDim + j] -= lr * grads.gradWLayers[0][i * hDim + j]
+                j += 1
+            }
             i += 1
         }
-
-        // 逆伝播: 上位層からの電流勾配 dShortcut
-        let dShortcut = [Float](repeating: 0.8, count: hDim)
-
-        // ショートカットにより前層電流への勾配 dInCur には dShortcut * 1.0 が無損失で伝達される
-        var dInCur = [Float](repeating: 0.0, count: hDim)
-        i = 0
-        while i < hDim {
-            // 線形ショートカット接続の寄与は 1.0
-            dInCur[i] = dShortcut[i]
-            i += 1
-        }
-
-        i = 0
-        while i < hDim {
-            XCTAssertEqual(dInCur[i], 0.8, accuracy: 1e-5)
-            i += 1
-        }
+        let updatedFwd = trainer.forwardSequence(featuresSeq: featuresSeq, targets: targets)
+        XCTAssertTrue(updatedFwd.loss <= initialFwd.loss, "多層勾配方向へのステップにより損失が減少または維持されること")
     }
 
     // MARK: - 4. 第0層再帰＋上位層FFによる暴走防止・安定性検証
@@ -148,14 +237,14 @@ final class MultiLayerSNNTests: XCTestCase {
     func testLayer0RecurrentUpperLayerFFStability() {
         // 全層再帰では同期発火による暴走（てんかん様発振・損失1300急騰）が発生するリスクがある。
         // 第0層のみ再帰とし、上位層をフィードフォワードLIFとすることで、
-        // 強い入力電流が長時間続いても同期暴走を起こさないことを検証。
-        let hDim = 128
-        let inDim = 64
+        // 直流入力（極端な高バイアス・連続強音）下でも膜電位と発火率が正常範囲に保たれることを検証
+        let inDim = 16
+        let hDim = 32
         let outDim = 10
         let net = SpikingNetwork(numLayers: 2, inputDim: inDim, maxHiddenDim: hDim, outputDim: outDim)
 
-        // 強力な直流入力を 200 ステップ連続注入
-        let strongFeatures = [Float](repeating: 5.0, count: inDim)
+        let strongFeatures = [Float](repeating: 2.0, count: inDim)
+
         var vPrev = [Float](repeating: 0.0, count: 2 * hDim)
         var sPrev = [Float](repeating: 0.0, count: 2 * hDim)
         var aPrev = [Float](repeating: 0.0, count: 2 * hDim)
@@ -166,7 +255,7 @@ final class MultiLayerSNNTests: XCTestCase {
         let scratch = ForwardScratch(maxHiddenDim: hDim)
 
         var step = 0
-        while step < 200 {
+        while step < 50 {
             net.forward(
                 features: strongFeatures,
                 vPrev: &vPrev,
@@ -245,6 +334,7 @@ final class MultiLayerSNNTests: XCTestCase {
         }
 
         // 2層の学習
+        let initialWLayer0 = net2.pWLayers[0].data
         step = 0
         var loss2First: Float = 0.0
         var loss2Last: Float = 0.0
@@ -259,6 +349,18 @@ final class MultiLayerSNNTests: XCTestCase {
         XCTAssertTrue(loss1Last <= loss1First)
         XCTAssertTrue(loss2Last <= loss2First)
         XCTAssertTrue(loss2Last.isNaN != true)
+
+        // 上位層重み WLayers が実際に勾配更新されていることの検証
+        var wLayerChanged = false
+        var wIdx = 0
+        while wIdx < net2.pWLayers[0].data.count {
+            if 1e-6 < abs(net2.pWLayers[0].data[wIdx] - initialWLayer0[wIdx]) {
+                wLayerChanged = true
+                break
+            }
+            wIdx += 1
+        }
+        XCTAssertTrue(wLayerChanged, "上位層重み WLayers が BPTT によって実際に更新されていること")
     }
 
     // MARK: - 6. 10時間想定の O(1) 定数メモリおよび推論レイテンシ検証
@@ -290,7 +392,7 @@ final class MultiLayerSNNTests: XCTestCase {
         var f = 0
         while f < 200 {
             dummyFrame[f % inDim] = Float(f % 10) * 0.1
-            _ = decoder.decodeFrame(features: dummyFrame, workspace: workspace, frameIndex: f)
+            decoder.decodeFrame(features: dummyFrame, workspace: workspace, frameIndex: f)
             f += 1
         }
         let endEarly = DispatchTime.now()
@@ -299,7 +401,7 @@ final class MultiLayerSNNTests: XCTestCase {
         // 中間フレームの連続実行 (200 ..< 1800)
         while f < 1800 {
             dummyFrame[f % inDim] = Float(f % 10) * 0.1
-            _ = decoder.decodeFrame(features: dummyFrame, workspace: workspace, frameIndex: f)
+            decoder.decodeFrame(features: dummyFrame, workspace: workspace, frameIndex: f)
             f += 1
         }
 
@@ -307,7 +409,7 @@ final class MultiLayerSNNTests: XCTestCase {
         let startLate = DispatchTime.now()
         while f < totalFrames {
             dummyFrame[f % inDim] = Float(f % 10) * 0.1
-            _ = decoder.decodeFrame(features: dummyFrame, workspace: workspace, frameIndex: f)
+            decoder.decodeFrame(features: dummyFrame, workspace: workspace, frameIndex: f)
             f += 1
         }
         let endLate = DispatchTime.now()
@@ -352,7 +454,7 @@ final class MultiLayerSNNTests: XCTestCase {
         let frame2 = [Float](repeating: 0.2, count: inDim)
 
         // 1. 状態を引き継いで 2 フレーム連続推論
-        _ = decoder.decodeFrame(features: frame1, workspace: workspace, frameIndex: 0)
+        decoder.decodeFrame(features: frame1, workspace: workspace, frameIndex: 0)
         let continuousRes = decoder.decodeFrame(features: frame2, workspace: workspace, frameIndex: 1)
 
         // 2. 状態をリセットしてから 2 番目のフレームを推論

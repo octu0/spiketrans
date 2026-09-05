@@ -245,6 +245,70 @@ public final class CTCStreamingDecoder: @unchecked Sendable {
         return (vocabulary.idsToText(tokens), tokens, bestTotal)
     }
 
+    /// 現時点で上位 N 個の音響仮説を抽出 (重複文字列は高スコア側を優先統合)
+    public func nBest(n: Int = 5) -> [AcousticHypothesis] {
+        if beams.isEmpty {
+            return []
+        }
+        let targetCount = max(1, n)
+
+        struct ScoredHypothesis {
+            let node: Int32
+            let totalProb: Float
+            let score: Float
+        }
+
+        var scoredList: [ScoredHypothesis] = []
+        scoredList.reserveCapacity(beams.count)
+
+        var i = 0
+        while i < beams.count {
+            let hyp = beams[i]
+            let total = hyp.totalProb
+            let score = total + (Float(trie.depths[Int(hyp.node)]) * lengthBonus)
+            scoredList.append(ScoredHypothesis(node: hyp.node, totalProb: total, score: score))
+            i += 1
+        }
+
+        // スコア降順にソート (同点時は node 昇順)
+        scoredList.sort { a, b in
+            if a.score != b.score {
+                return b.score < a.score
+            }
+            return a.node < b.node
+        }
+
+        var results: [AcousticHypothesis] = []
+        results.reserveCapacity(min(targetCount, scoredList.count))
+        var seenTexts = Set<String>()
+
+        var sIdx = 0
+        while sIdx < scoredList.count {
+            let item = scoredList[sIdx]
+            if item.node < 0 {
+                sIdx += 1
+                continue
+            }
+            let tokens = trie.sequence(of: item.node)
+            let text = vocabulary.idsToText(tokens)
+            if seenTexts.contains(text) != true {
+                seenTexts.insert(text)
+                results.append(AcousticHypothesis(
+                    text: text,
+                    tokens: tokens,
+                    acousticScore: item.totalProb,
+                    score: item.score
+                ))
+                if targetCount <= results.count {
+                    break
+                }
+            }
+            sIdx += 1
+        }
+
+        return results
+    }
+
     /// ノードに対応する仮説の位置を返す (無ければ -inf で作る)
     private func slot(for node: Int32) -> Int {
         switch nextIndex[node] {
