@@ -3,6 +3,9 @@ import MLX
 import MLXNN
 import MLXOptimizers
 
+/// 上位層の電流 RMSNorm で分散 0 のときの除算を避ける微小値 (推論側と共有)
+internal let rmsNormEpsilon: Float = 1e-5
+
 /// MLX GPU による SNN BPTT 学習エンジン (フレーム単位安定化 BPTT & ミニバッチ対応)
 public final class MLXBPTTTrainer: @unchecked Sendable {
     public let network: MLXSpikingNetwork
@@ -39,56 +42,93 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
         let tSteps = network.timeSteps
+        let numLayers = network.numLayers
         let beta = network.lifConfig.beta
         let vTh = network.lifConfig.vTh
         let alpha = network.lifConfig.alpha
         let rho = network.lifConfig.rho
         let gamma = network.lifConfig.gamma
 
-        // [B, T, hMax] = [B, T, inputDim] @ [inputDim, hMax] + bH
-        let currentSeq = matmul(features, network.wIn) + network.bH
+        // 層 0 の入力電流系列: [B, T, hMax] = [B, T, inputDim] @ [inputDim, hMax] + bH
+        let currentSeq0 = matmul(features, network.wIn) + network.bH
 
-        var v = MLXArray.zeros([batchSize, hMax])
-        var s = MLXArray.zeros([batchSize, hMax])
-        var a = MLXArray.zeros([batchSize, hMax])
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
 
         var sAvgList: [MLXArray] = []
         sAvgList.reserveCapacity(seqLen)
 
         var t = 0
         while t < seqLen {
-            let current_t = currentSeq[0..., t, 0...]
-            var sSum = MLXArray.zeros([batchSize, hMax])
+            let current0_t = currentSeq0[0..., t, 0...]
+            var sSumFinal = MLXArray.zeros([batchSize, hMax])
 
             // 切り詰め BPTT: bpttWindow フレームごとに勾配を切り離す。
-            // 窓の内側ではフレームをまたいで勾配が流れるため、時間文脈を学習できる。
             if (t % bpttWindow) == 0 {
-                v = stopGradient(v)
-                s = stopGradient(s)
-                a = stopGradient(a)
+                var l = 0
+                while l < numLayers {
+                    v[l] = stopGradient(v[l])
+                    s[l] = stopGradient(s[l])
+                    a[l] = stopGradient(a[l])
+                    l += 1
+                }
             }
 
             var step = 0
             while step < tSteps {
-                let rec = matmul(s, network.wRec)
-                let vDecayed = (v * beta) * (1.0 - s)
-                v = clip(vDecayed + current_t + rec, min: -20.0, max: 20.0)
+                // 層 0: 再帰 LIF 層 (時間文脈を担う)
+                let rec0 = matmul(s[0], network.wRec)
+                let totalCurrent0 = current0_t + rec0
+                let vDecayed0 = (v[0] * beta) * (1.0 - s[0])
+                v[0] = clip(vDecayed0 + totalCurrent0, min: -20.0, max: 20.0)
 
-                // 適応型発火閾値 (ALIF: 生物の神経順応)
-                a = (a * rho) + (s * gamma)
-                let dynVTh = vTh + a
+                a[0] = (a[0] * rho) + (s[0] * gamma)
+                let dynVTh0 = vTh + a[0]
 
-                // Fast Sigmoid Surrogate Gradient
-                let vRel = (v - dynVTh) * alpha
-                let sSurrogate = 0.5 * (vRel / (1.0 + abs(vRel)) + 1.0)
-                let sHard = (v .>= dynVTh).asType(.float32)
-                s = stopGradient(sHard - sSurrogate) + sSurrogate
+                let vRel0 = (v[0] - dynVTh0) * alpha
+                let sSurrogate0 = 0.5 * (vRel0 / (1.0 + abs(vRel0)) + 1.0)
+                let sHard0 = (dynVTh0 .<= v[0]).asType(.float32)
+                s[0] = stopGradient(sHard0 - sSurrogate0) + sSurrogate0
 
-                sSum = sSum + s
+                var prevCurrent = totalCurrent0
+
+                // 層 1 以降: 前層スパイクを受けるフィードフォワード LIF 層。
+                // 前層の発火は疎で電流の分散が小さすぎるため RMSNorm で単位スケールに揃え、
+                // 前層の入力電流を加算する (電流空間の残差)。サロゲート勾配が閾値近傍の
+                // 外で 0 になっても、この加算経路を通って下位層へ勾配が届く
+                var l = 1
+                while l < numLayers {
+                    let upperIdx = l - 1
+                    let denseCur = matmul(s[l - 1], network.wLayers[upperIdx]) + network.bHLayers[upperIdx]
+
+                    let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
+                    let rms = sqrt(meanSq + rmsNormEpsilon)
+                    let normCur = (denseCur / rms) * network.gammaRMS[upperIdx]
+
+                    let totalCurrent_l = normCur + prevCurrent
+                    prevCurrent = totalCurrent_l
+
+                    let vDecayed_l = (v[l] * beta) * (1.0 - s[l])
+                    v[l] = clip(vDecayed_l + totalCurrent_l, min: -20.0, max: 20.0)
+
+                    a[l] = (a[l] * rho) + (s[l] * gamma)
+                    let dynVTh_l = vTh + a[l]
+
+                    let vRel_l = (v[l] - dynVTh_l) * alpha
+                    let sSurrogate_l = 0.5 * (vRel_l / (1.0 + abs(vRel_l)) + 1.0)
+                    let sHard_l = (dynVTh_l .<= v[l]).asType(.float32)
+                    s[l] = stopGradient(sHard_l - sSurrogate_l) + sSurrogate_l
+
+                    l += 1
+                }
+
+                // 最終層のスパイクを積算
+                sSumFinal = sSumFinal + s[numLayers - 1]
                 step += 1
             }
 
-            let sAvg_t = sSum / Float(tSteps)
+            let sAvg_t = sSumFinal / Float(tSteps)
             sAvgList.append(sAvg_t)
             t += 1
         }
@@ -134,18 +174,29 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var flatFeat = [Float](repeating: 0.0, count: bSize * maxT * inDim)
         var flatTgt = [Int32](repeating: -1, count: bSize * maxT)
 
-        for b in 0..<bSize {
+        var b = 0
+        while b < bSize {
             let fSeq = featuresBatch[b]
             let tSeq = targetsBatch[b]
             let curT = fSeq.count
-            for t in 0..<curT {
+            var t = 0
+            while t < curT {
                 let fVec = fSeq[t]
-                let offset = (b * maxT + t) * inDim
-                for d in 0..<inDim {
+                let offset = ((b * maxT) + t) * inDim
+                var d = 0
+                while d < inDim {
                     flatFeat[offset + d] = fVec[d]
+                    d += 1
                 }
-                flatTgt[b * maxT + t] = Int32(tSeq[t])
+                t += 1
             }
+
+            var ot = 0
+            while ot < min(curT, tSeq.count) {
+                flatTgt[(b * maxT) + ot] = Int32(tSeq[ot])
+                ot += 1
+            }
+            b += 1
         }
 
         let featArray = MLXArray(flatFeat, [bSize, maxT, inDim])

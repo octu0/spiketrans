@@ -108,16 +108,18 @@ public enum LIFNeuronEngine {
 
     /// ALIF 状態を SIMD8 で一括更新する。
     ///
-    /// 状態配列 (v, s, a) を直接更新し、スパイク積算も同時に行う。
+    /// 状態配列 (v, s, a) をポインタ経由で直接更新する。層ごとの状態は 1 本の配列の
+    /// 区間なので、呼び出し側が先頭ポインタをずらして層を選ぶ。spikeSumPtr が nil の
+    /// 層は積算しない (リードアウトに使うのは最終層だけ)。
     /// 演算はニューロンごとに独立なので、スカラー版と結果はビット一致する。
     @inline(__always)
-    public static func stepAdaptiveSIMD8Array(
+    public static func stepAdaptiveSIMD8(
         config: LIFConfig,
-        currents: [Float],
-        vState: inout [Float],
-        sState: inout [Float],
-        aState: inout [Float],
-        spikeSum: inout [Float],
+        vPtr: UnsafeMutablePointer<Float>,
+        sPtr: UnsafeMutablePointer<Float>,
+        aPtr: UnsafeMutablePointer<Float>,
+        curPtr: UnsafePointer<Float>,
+        spikeSumPtr: UnsafeMutablePointer<Float>?,
         count: Int
     ) {
         let limit = count - (count % 8)
@@ -130,79 +132,76 @@ public enum LIFNeuronEngine {
         let highVec = SIMD8<Float>(repeating: vClampMax)
         let zeroVec = SIMD8<Float>(repeating: 0.0)
 
-        currents.withUnsafeBufferPointer { curBuf in
-            vState.withUnsafeMutableBufferPointer { vBuf in
-                sState.withUnsafeMutableBufferPointer { sBuf in
-                    aState.withUnsafeMutableBufferPointer { aBuf in
-                        spikeSum.withUnsafeMutableBufferPointer { sumBuf in
-                            let cur = curBuf.baseAddress!
-                            let v = vBuf.baseAddress!
-                            let sp = sBuf.baseAddress!
-                            let ad = aBuf.baseAddress!
-                            let acc = sumBuf.baseAddress!
-                            var i = 0
-                            while i < limit {
-                                let vPrev = SIMD8<Float>(
-                                    v[i+0], v[i+1], v[i+2], v[i+3],
-                                    v[i+4], v[i+5], v[i+6], v[i+7]
-                                )
-                                let sPrev = SIMD8<Float>(
-                                    sp[i+0], sp[i+1], sp[i+2], sp[i+3],
-                                    sp[i+4], sp[i+5], sp[i+6], sp[i+7]
-                                )
-                                let aPrev = SIMD8<Float>(
-                                    ad[i+0], ad[i+1], ad[i+2], ad[i+3],
-                                    ad[i+4], ad[i+5], ad[i+6], ad[i+7]
-                                )
-                                let inCur = SIMD8<Float>(
-                                    cur[i+0], cur[i+1], cur[i+2], cur[i+3],
-                                    cur[i+4], cur[i+5], cur[i+6], cur[i+7]
-                                )
+        var i = 0
+        while i < limit {
+            let vPrev = SIMD8<Float>(
+                vPtr[i+0], vPtr[i+1], vPtr[i+2], vPtr[i+3],
+                vPtr[i+4], vPtr[i+5], vPtr[i+6], vPtr[i+7]
+            )
+            let sPrev = SIMD8<Float>(
+                sPtr[i+0], sPtr[i+1], sPtr[i+2], sPtr[i+3],
+                sPtr[i+4], sPtr[i+5], sPtr[i+6], sPtr[i+7]
+            )
+            let aPrev = SIMD8<Float>(
+                aPtr[i+0], aPtr[i+1], aPtr[i+2], aPtr[i+3],
+                aPtr[i+4], aPtr[i+5], aPtr[i+6], aPtr[i+7]
+            )
+            let inCur = SIMD8<Float>(
+                curPtr[i+0], curPtr[i+1], curPtr[i+2], curPtr[i+3],
+                curPtr[i+4], curPtr[i+5], curPtr[i+6], curPtr[i+7]
+            )
 
-                                let vDecayed = betaVec * vPrev * (oneVec - sPrev)
-                                let vRaw = vDecayed + inCur
-                                // clamped() は NaN を境界に潰すため、スカラー版と同じく
-                                // 比較で置換して NaN をそのまま通す
-                                var vNext = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
-                                vNext = vNext.replacing(with: highVec, where: highVec .< vNext)
-                                let aNext = (rhoVec * aPrev) + (gammaVec * sPrev)
-                                let dynVTh = vThVec + aNext
-                                let sNext = zeroVec.replacing(with: oneVec, where: dynVTh .<= vNext)
+            let vDecayed = betaVec * vPrev * (oneVec - sPrev)
+            let vRaw = vDecayed + inCur
+            var vNext = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
+            vNext = vNext.replacing(with: highVec, where: highVec .< vNext)
+            let aNext = (rhoVec * aPrev) + (gammaVec * sPrev)
+            let dynVTh = vThVec + aNext
+            let sNext = zeroVec.replacing(with: oneVec, where: dynVTh .<= vNext)
 
-                                let sumPrev = SIMD8<Float>(
-                                    acc[i+0], acc[i+1], acc[i+2], acc[i+3],
-                                    acc[i+4], acc[i+5], acc[i+6], acc[i+7]
-                                )
-                                let sumNext = sumPrev + sNext
-
-                                var lane = 0
-                                while lane < 8 {
-                                    v[i+lane] = vNext[lane]
-                                    sp[i+lane] = sNext[lane]
-                                    ad[i+lane] = aNext[lane]
-                                    acc[i+lane] = sumNext[lane]
-                                    lane += 1
-                                }
-                                i += 8
-                            }
-                            while i < count {
-                                let res = stepScalarAdaptive(
-                                    config: config,
-                                    vPrev: v[i],
-                                    sPrev: sp[i],
-                                    aPrev: ad[i],
-                                    inputCurrent: cur[i]
-                                )
-                                v[i] = res.vNext
-                                sp[i] = res.sNext
-                                ad[i] = res.aNext
-                                acc[i] += res.sNext
-                                i += 1
-                            }
-                        }
-                    }
+            switch spikeSumPtr {
+            case .some(let sumPtr):
+                let sumPrev = SIMD8<Float>(
+                    sumPtr[i+0], sumPtr[i+1], sumPtr[i+2], sumPtr[i+3],
+                    sumPtr[i+4], sumPtr[i+5], sumPtr[i+6], sumPtr[i+7]
+                )
+                let sumNext = sumPrev + sNext
+                var lane = 0
+                while lane < 8 {
+                    sumPtr[i+lane] = sumNext[lane]
+                    lane += 1
                 }
+            case .none:
+                break
             }
+
+            var lane = 0
+            while lane < 8 {
+                vPtr[i+lane] = vNext[lane]
+                sPtr[i+lane] = sNext[lane]
+                aPtr[i+lane] = aNext[lane]
+                lane += 1
+            }
+            i += 8
+        }
+        while i < count {
+            let res = stepScalarAdaptive(
+                config: config,
+                vPrev: vPtr[i],
+                sPrev: sPtr[i],
+                aPrev: aPtr[i],
+                inputCurrent: curPtr[i]
+            )
+            vPtr[i] = res.vNext
+            sPtr[i] = res.sNext
+            aPtr[i] = res.aNext
+            switch spikeSumPtr {
+            case .some(let sumPtr):
+                sumPtr[i] += res.sNext
+            case .none:
+                break
+            }
+            i += 1
         }
     }
 

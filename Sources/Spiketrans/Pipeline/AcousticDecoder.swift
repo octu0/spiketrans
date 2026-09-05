@@ -12,11 +12,13 @@ public final class AcousticWorkspace: @unchecked Sendable {
     /// forwardSlice の中間バッファ (Hot Path ゼロアロケーション用)
     public let scratch: ForwardScratch
 
-    public init(maxHiddenDim: Int = 4096, outputDim: Int = 523, inputDim: Int = 64) {
+    public init(maxHiddenDim: Int = 4096, outputDim: Int = 523, inputDim: Int = 64, numLayers: Int = 1) {
+        // 膜電位・スパイク・適応閾値は層ごとに持つ (層 l は [l * maxHiddenDim, (l + 1) * maxHiddenDim))
+        let stateSize = max(1, numLayers) * maxHiddenDim
         self.scratch = ForwardScratch(maxHiddenDim: maxHiddenDim)
-        self.vPrev = [Float](repeating: 0.0, count: maxHiddenDim)
-        self.sPrev = [Float](repeating: 0.0, count: maxHiddenDim)
-        self.aPrev = [Float](repeating: 0.0, count: maxHiddenDim)
+        self.vPrev = [Float](repeating: 0.0, count: stateSize)
+        self.sPrev = [Float](repeating: 0.0, count: stateSize)
+        self.aPrev = [Float](repeating: 0.0, count: stateSize)
         self.spikeSum = [Float](repeating: 0.0, count: maxHiddenDim)
         self.logits = [Float](repeating: 0.0, count: outputDim)
         self.probabilities = [Float](repeating: 0.0, count: outputDim)
@@ -40,11 +42,9 @@ public final class AcousticWorkspace: @unchecked Sendable {
 
     @inline(__always)
     public func reset() {
+        resetHiddenState()
         var i = 0
-        while i < vPrev.count {
-            vPrev[i] = 0.0
-            sPrev[i] = 0.0
-            aPrev[i] = 0.0
+        while i < spikeSum.count {
             spikeSum[i] = 0.0
             i += 1
         }

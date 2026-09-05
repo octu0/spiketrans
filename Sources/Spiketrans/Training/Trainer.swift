@@ -200,7 +200,8 @@ extension Trainer {
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
             outputDim: acousticTrainer.network.outputDim,
-            inputDim: acousticTrainer.network.inputDim
+            inputDim: acousticTrainer.network.inputDim,
+            numLayers: acousticTrainer.network.numLayers
         )
 
         let lmDecoder = LanguageDecoder(
@@ -268,7 +269,8 @@ extension Trainer {
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
             outputDim: acousticTrainer.network.outputDim,
-            inputDim: acousticTrainer.network.inputDim
+            inputDim: acousticTrainer.network.inputDim,
+            numLayers: acousticTrainer.network.numLayers
         )
 
         let frameProbs = acDecoder.decodeSequence(
@@ -378,7 +380,8 @@ extension Trainer {
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
             outputDim: network.outputDim,
-            inputDim: network.inputDim
+            inputDim: network.inputDim,
+            numLayers: network.numLayers
         )
 
         let frameProbs = acDecoder.decodeSequence(

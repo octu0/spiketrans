@@ -146,7 +146,8 @@ public final class StreamingTranscriber: @unchecked Sendable {
         self.acousticWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticNetwork.maxHiddenDim,
             outputDim: acousticNetwork.outputDim,
-            inputDim: acousticNetwork.inputDim
+            inputDim: acousticNetwork.inputDim,
+            numLayers: acousticNetwork.numLayers
         )
 
         let lmConfig = LanguageDecoderConfig(

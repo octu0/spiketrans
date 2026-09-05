@@ -13,9 +13,17 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let rho: Float      // 適応閾値減衰率
     public let gamma: Float    // 発火時閾値上昇幅 (0.0 で固定閾値)
 
+    /// 層 0 (再帰 LIF 層)
     public let wIn: [Float]    // [maxHiddenDim * inputDim]
     public let wRec: [Float]   // [maxHiddenDim * maxHiddenDim]
     public let bH: [Float]     // [maxHiddenDim]
+
+    /// 層 1 以降 (前層スパイクを受けるフィードフォワード LIF 層)。
+    /// 各層は結合重み・バイアス・電流 RMSNorm ゲインを持つ。1 層構成では空
+    public let wLayers: [[Float]]    // [numLayers - 1][maxHiddenDim * maxHiddenDim]
+    public let bHLayers: [[Float]]   // [numLayers - 1][maxHiddenDim]
+    public let gammaRMS: [[Float]]   // [numLayers - 1][maxHiddenDim]
+
     public let wOut: [Float]   // [outputDim * maxHiddenDim]
     public let bOut: [Float]   // [outputDim]
 
@@ -28,15 +36,13 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         maxHiddenDim: Int,
         outputDim: Int,
         timeSteps: Int,
-        beta: Float,
-        vTh: Float,
-        vReset: Float,
-        alpha: Float,
-        rho: Float = 0.85,
-        gamma: Float = 0.0,
+        lifConfig: LIFConfig,
         wIn: [Float],
         wRec: [Float],
         bH: [Float],
+        wLayers: [[Float]] = [],
+        bHLayers: [[Float]] = [],
+        gammaRMS: [[Float]] = [],
         wOut: [Float],
         bOut: [Float],
         vocabularyCharacters: String? = nil
@@ -45,52 +51,26 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.maxHiddenDim = maxHiddenDim
         self.outputDim = outputDim
         self.timeSteps = timeSteps
-        self.beta = beta
-        self.vTh = vTh
-        self.vReset = vReset
-        self.alpha = alpha
-        self.rho = rho
-        self.gamma = gamma
+        self.beta = lifConfig.beta
+        self.vTh = lifConfig.vTh
+        self.vReset = lifConfig.vReset
+        self.alpha = lifConfig.alpha
+        self.rho = lifConfig.rho
+        self.gamma = lifConfig.gamma
         self.wIn = wIn
         self.wRec = wRec
         self.bH = bH
+        self.wLayers = wLayers
+        self.bHLayers = bHLayers
+        self.gammaRMS = gammaRMS
         self.wOut = wOut
         self.bOut = bOut
         self.vocabularyCharacters = vocabularyCharacters
     }
 
-    /// LIFConfig から直接構築
-    public init(
-        inputDim: Int,
-        maxHiddenDim: Int,
-        outputDim: Int,
-        timeSteps: Int,
-        lifConfig: LIFConfig,
-        wIn: [Float],
-        wRec: [Float],
-        bH: [Float],
-        wOut: [Float],
-        bOut: [Float],
-        vocabularyCharacters: String? = nil
-    ) {
-        self.init(
-            inputDim: inputDim,
-            maxHiddenDim: maxHiddenDim,
-            outputDim: outputDim,
-            timeSteps: timeSteps,
-            beta: lifConfig.beta,
-            vTh: lifConfig.vTh,
-            vReset: lifConfig.vReset,
-            alpha: lifConfig.alpha,
-            rho: lifConfig.rho,
-            gamma: lifConfig.gamma,
-            wIn: wIn,
-            wRec: wRec,
-            bH: bH,
-            wOut: wOut,
-            bOut: bOut,
-            vocabularyCharacters: vocabularyCharacters
-        )
+    /// 層数 (層 0 + 上位層)
+    public var numLayers: Int {
+        return 1 + wLayers.count
     }
 
     /// 保持している LIF / ALIF パラメータを LIFConfig として復元
