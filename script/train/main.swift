@@ -15,22 +15,29 @@ print("==================================================")
 
 // 学習・評価の既定パラメータ。
 // いずれも loanword128 での掃引で最良だった値を採用している。
-// 変更する場合はここを直接書き換える (CLI 引数にはしない)。
 enum Defaults {
     /// 連続フレームを束ねる倍率。10ms/フレームは CTC には細かすぎ、
     /// 逐次カーネル起動回数がそのまま学習時間に効く。4 で 40ms 相当。
     static let frameStack = 4
-    /// 1 フレームあたりの 3-tap Mel 次元
+    /// 1 フレームあたりの 3-tap Mel 次元 (従来モード)
     static let melFrameDim = 128
-    /// 音響 SNN への入力次元
+    /// 音響 SNN への入力次元 (従来モード)
     static var acousticInputDim: Int { return melFrameDim * frameStack }
+
+    /// Conv2DSubsampling フロントエンド (Phase 2)
+    static let melChannels = 64
+    static let convOutputDim = 128
+
+    /// 多層 SNN 既定層数
+    static let numLayers = 1
 
     /// 隠れ層の次元
     static let maxHiddenDim = 1024
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
-    /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
-    static let bpttWindow = 4
+    /// 40ms/フレーム換算で 8 フレーム = 320ms, 12 フレーム = 480ms。
+    /// 日本語の形態素・共調音結合 (250〜400ms) をカバーする適正窓幅。
+    static let bpttWindow = 8
 
     /// Cosine 学習率スケジュール
     static let lrMax: Float = 0.003
@@ -83,6 +90,11 @@ var datasetPath = ""
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
+var useConvSubsampling = false
+var numLayers = Defaults.numLayers
+var bpttWindow = Defaults.bpttWindow
+var hiddenDim = Defaults.maxHiddenDim
+var customLR: Float? = nil
 let reportPath = "/dev/stdout"
 
 var argIdx = 1
@@ -121,7 +133,7 @@ while argIdx < args.count {
             deviceArg = args[argIdx + 1].lowercased()
             argIdx += 1
         }
-    case "--export-weights":
+    case "-o", "--export-weights":
         if (argIdx + 1) < args.count {
             exportWeightsPath = args[argIdx + 1]
             argIdx += 1
@@ -129,6 +141,36 @@ while argIdx < args.count {
     case "--import-weights":
         if (argIdx + 1) < args.count {
             importWeightsPath = args[argIdx + 1]
+            argIdx += 1
+        }
+    case "--conv-subsampling", "--conv":
+        useConvSubsampling = true
+    case "-l", "--layers":
+        if (argIdx + 1) < args.count {
+            if let val = Int(args[argIdx + 1]) {
+                numLayers = max(1, val)
+            }
+            argIdx += 1
+        }
+    case "-w", "--bptt-window":
+        if (argIdx + 1) < args.count {
+            if let val = Int(args[argIdx + 1]) {
+                bpttWindow = max(1, val)
+            }
+            argIdx += 1
+        }
+    case "--hidden-dim":
+        if (argIdx + 1) < args.count {
+            if let val = Int(args[argIdx + 1]) {
+                hiddenDim = max(64, val)
+            }
+            argIdx += 1
+        }
+    case "--lr":
+        if (argIdx + 1) < args.count {
+            if let val = Float(args[argIdx + 1]) {
+                customLR = val
+            }
             argIdx += 1
         }
     default:
@@ -142,10 +184,31 @@ while argIdx < args.count {
 // データセットのパスは必須。特定コーパスを既定値に埋め込まない
 if datasetPath.isEmpty {
     print("エラー: 学習マニフェスト (JSONL) を指定してください。")
-    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数]")
+    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数] [--conv-subsampling] [--layers <N>] [-w <窓幅>]")
     print("  各行: {\"path\": \"/path/to/voice.wav\", \"text\": \"漢字かな混じりの発話テキスト\"}")
     print("  マニフェストは script/dataset/ の各コーパス用スクリプトで生成する")
     exit(1)
+}
+
+// 事前にインポート重みを読み込んで自動判定
+var preloadedWeights: SpikingNetworkWeights? = nil
+switch importWeightsPath {
+case .some(let impPath):
+    let impURL = URL(fileURLWithPath: impPath)
+    if let wData = try? SpikingNetworkWeights.load(from: impURL) {
+        preloadedWeights = wData
+        if 1 < wData.numLayers && numLayers == Defaults.numLayers {
+            numLayers = wData.numLayers
+        }
+        if wData.convSubsampling != nil && useConvSubsampling != true {
+            useConvSubsampling = true
+        }
+        if hiddenDim == Defaults.maxHiddenDim {
+            hiddenDim = wData.maxHiddenDim
+        }
+    }
+case .none:
+    break
 }
 
 let useGPU: Bool
@@ -162,10 +225,28 @@ default: // "auto"
     #endif
 }
 
+let deviceDesc: String
+switch useGPU {
+case true:
+    deviceDesc = "Apple Silicon GPU (MLX Swift)"
+case false:
+    deviceDesc = "CPU (Pure Swift)"
+}
 print("データセットパス: \(datasetPath)")
-print("実行デバイス   : \(useGPU ? "Apple Silicon GPU (MLX Swift)" : "CPU (Pure Swift)")")
+print("実行デバイス   : \(deviceDesc)")
 print("並列ワーカー数 (-p): \(numWorkers) スレッド")
 print("エポック数     (-e): \(epochs) エポック")
+print("SNN 層数       (-l): \(numLayers) 層")
+let frontendDesc: String
+switch useConvSubsampling {
+case true:
+    frontendDesc = "2D-Conv Subsampling (64ch Mel 入力 -> 4x 時間圧縮)"
+case false:
+    frontendDesc = "3-tap Mel × \(Defaults.frameStack) フレーム束ね (128次元)"
+}
+print("フロントエンド : \(frontendDesc)")
+print("BPTT 窓幅      (-w): \(bpttWindow) フレーム (\(bpttWindow * 40) ms 相当)")
+print("隠れ層次元     : \(hiddenDim) 次元")
 if let s = maxTrainSamples {
     print("学習サンプル数 (-s): \(s) 件 (指定)")
 } else {
@@ -186,34 +267,81 @@ struct ManifestEntry: Codable {
     let text: String
 }
 
-guard let manifestContent = try? String(contentsOfFile: datasetPath, encoding: .utf8) else {
+var effectiveManifestPath = datasetPath
+var isDir: ObjCBool = false
+if FileManager.default.fileExists(atPath: datasetPath, isDirectory: &isDir) {
+    switch isDir.boolValue {
+    case true:
+        let transcriptCandidate = (datasetPath as NSString).appendingPathComponent("transcript_utf8.txt")
+        if FileManager.default.fileExists(atPath: transcriptCandidate) {
+            effectiveManifestPath = transcriptCandidate
+        }
+    case false:
+        if (datasetPath as NSString).lastPathComponent == "recording_info.txt" {
+            let dir = (datasetPath as NSString).deletingLastPathComponent
+            let transcriptCandidate = (dir as NSString).appendingPathComponent("transcript_utf8.txt")
+            if FileManager.default.fileExists(atPath: transcriptCandidate) {
+                effectiveManifestPath = transcriptCandidate
+            }
+        }
+    }
+}
+
+guard let manifestContent = try? String(contentsOfFile: effectiveManifestPath, encoding: .utf8) else {
     print("エラー: マニフェスト \(datasetPath) が読み込めません。")
     exit(1)
 }
 
-let manifestDir = (datasetPath as NSString).deletingLastPathComponent
+let manifestDir = (effectiveManifestPath as NSString).deletingLastPathComponent
 let jsonDecoder = JSONDecoder()
 var textLines: [String] = []
 var rawPairs: [(path: String, fileId: String, text: String)] = []
 
-// JSONL は改行 (LF) 区切り。CharacterSet.newlines で分けると U+2028 等の
-// 行区切り文字でも切れてしまい、字幕由来のテキストを含む行が壊れる
+// JSONL または ID:テキスト (transcript_utf8.txt 等) をパース
 for line in manifestContent.components(separatedBy: "\n") {
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty != true {
-        guard let entry = try? jsonDecoder.decode(ManifestEntry.self, from: Data(trimmed.utf8)) else {
-            print("エラー: マニフェストの行を解釈できません: \(trimmed.prefix(120))")
-            exit(1)
+        let decodedEntry = try? jsonDecoder.decode(ManifestEntry.self, from: Data(trimmed.utf8))
+        switch decodedEntry {
+        case .some(let entry):
+            var wavPath = entry.path
+            if wavPath.hasPrefix("/") != true {
+                wavPath = (manifestDir as NSString).appendingPathComponent(wavPath)
+            }
+            let fileId = ((wavPath as NSString).lastPathComponent as NSString).deletingPathExtension
+            textLines.append(entry.text)
+            rawPairs.append((path: wavPath, fileId: fileId, text: entry.text))
+        case .none:
+            let colonIdx = trimmed.firstIndex(of: ":")
+            switch colonIdx {
+            case .some(let idx):
+                let fileId = String(trimmed[..<idx]).trimmingCharacters(in: .whitespaces)
+                let text = String(trimmed[trimmed.index(after: idx)...]).trimmingCharacters(in: .whitespaces)
+                let wavSubdir = (manifestDir as NSString).appendingPathComponent("wav")
+                let candidateWav1 = (wavSubdir as NSString).appendingPathComponent("\(fileId).wav")
+                let candidateWav2 = (manifestDir as NSString).appendingPathComponent("\(fileId).wav")
+                let wavPath: String
+                switch FileManager.default.fileExists(atPath: candidateWav1) {
+                case true:
+                    wavPath = candidateWav1
+                case false:
+                    wavPath = candidateWav2
+                }
+                if FileManager.default.fileExists(atPath: wavPath) {
+                    textLines.append(text)
+                    rawPairs.append((path: wavPath, fileId: fileId, text: text))
+                }
+            case .none:
+                print("エラー: マニフェストの行を解釈できません: \(trimmed.prefix(120))")
+                exit(1)
+            }
         }
-        // 相対パスはマニフェストのあるディレクトリ基準で解決する
-        var wavPath = entry.path
-        if wavPath.hasPrefix("/") != true {
-            wavPath = (manifestDir as NSString).appendingPathComponent(wavPath)
-        }
-        let fileId = ((wavPath as NSString).lastPathComponent as NSString).deletingPathExtension
-        textLines.append(entry.text)
-        rawPairs.append((path: wavPath, fileId: fileId, text: entry.text))
     }
+}
+
+if rawPairs.isEmpty {
+    print("エラー: 有効な発話データが見つかりませんでした: \(datasetPath)")
+    exit(1)
 }
 
 // 語彙・かな漢字辞書は学習セット (先頭 sampleLimit 件) のみから構築する。
@@ -242,10 +370,18 @@ let startTime = CFAbsoluteTimeGetCurrent()
 let manifestPairs: [(path: String, text: String)] = rawPairs.prefix(sampleLimit).map { pair in
     return (path: pair.path, text: pair.text)
 }
+let dsFrameStack: Int
+switch useConvSubsampling {
+case true:
+    dsFrameStack = 1
+case false:
+    dsFrameStack = Defaults.frameStack
+}
 let dataset = SpeechDataset.lazyFromManifest(
     pairs: manifestPairs,
     textVocabulary: textVocabulary,
-    frameStack: Defaults.frameStack,
+    frameStack: dsFrameStack,
+    useMel: useConvSubsampling,
     workers: numWorkers
 )
 
@@ -260,36 +396,86 @@ for i in 0..<min(3, dataset.count) {
     print("  [\(i+1)] 正解テキスト: \"\(sample.rawText)\"")
     print("      発音(かな): \"\(sample.hiraganaText)\" (\(sample.hiraganaText.count) 文字)")
     print("      PCM サンプル数 (16kHz リサンプル後): \(numSamples) サンプル (\(String(format: "%.2f", durSec)) 秒)")
-    print("      音響特徴量フレーム数: \(sample.acousticFeatures.count) フレーム (\(featDim)次元 3-tap Mel 特徴量)")
+    let featTypeDesc: String
+    switch useConvSubsampling {
+    case true:
+        featTypeDesc = "64ch Mel スペクトログラム (Conv2D Subsampling 前)"
+    case false:
+        featTypeDesc = "\(featDim)次元 3-tap Mel 特徴量"
+    }
+    print("      音響特徴量フレーム数: \(sample.acousticFeatures.count) フレーム (\(featTypeDesc))")
 }
 
 // 4. 第1段 音響 SNN (かな・音素) の学習実行
-print("\n--- 2. 第1段 音響 SNN (かな・音素) の学習実行 (デバイス: \(useGPU ? "GPU" : "CPU")) ---")
+let devShortDesc: String
+switch useGPU {
+case true:
+    devShortDesc = "GPU"
+case false:
+    devShortDesc = "CPU"
+}
+print("\n--- 2. 第1段 音響 SNN (かな・音素) の学習実行 (デバイス: \(devShortDesc)) ---")
+let effectiveLR: Float
+switch customLR {
+case .some(let lr):
+    effectiveLR = lr
+case .none:
+    switch useGPU {
+    case true:
+        effectiveLR = Defaults.lrMax
+    case false:
+        effectiveLR = 0.015
+    }
+}
 let trainConfig = TrainingConfig(
     epochs: epochs,
-    learningRate: useGPU ? 0.003 : 0.015,
+    learningRate: effectiveLR,
     logInterval: 2,
     clipNorm: 5.0
 )
 
-// 第1段 音響 SNN に ALIF (適応型発火閾値) を適用し、強い母音の過剰発火を抑えて
-// 微小な子音スパイクを分離しやすくする
-let acousticInputDim = Defaults.acousticInputDim
-print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
+let acousticInputDim: Int
+switch useConvSubsampling {
+case true:
+    acousticInputDim = Defaults.convOutputDim
+case false:
+    acousticInputDim = Defaults.acousticInputDim
+}
+switch useConvSubsampling {
+case true:
+    print("音響特徴量: 64ch Mel 入力 -> Conv2D Subsampling -> \(acousticInputDim) 次元 SNN 注入")
+case false:
+    print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
+}
 
-print("第1段 LIF: beta = \(Defaults.lifConfig.beta)")
+print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(numLayers), 隠れ層 = \(hiddenDim)")
+
+let convSubsampler: Conv2DSubsampling?
+let mlxConvSubsampler: MLXConv2DSubsampling?
+switch useConvSubsampling {
+case true:
+    convSubsampler = Conv2DSubsampling(melChannels: Defaults.melChannels, outputDim: Defaults.convOutputDim)
+    mlxConvSubsampler = MLXConv2DSubsampling(melChannels: Defaults.melChannels, outputDim: Defaults.convOutputDim)
+case false:
+    convSubsampler = nil
+    mlxConvSubsampler = nil
+}
+
+let acousticNetwork = SpikingNetwork(
+    numLayers: numLayers,
+    inputDim: acousticInputDim,
+    maxHiddenDim: hiddenDim,
+    outputDim: phoneticVocabulary.size,
+    timeSteps: 4,
+    lifConfig: Defaults.lifConfig,
+    convSubsampling: convSubsampler
+)
 
 let trainer = Trainer(
-    acousticNetwork: SpikingNetwork(
-        inputDim: acousticInputDim,
-        maxHiddenDim: Defaults.maxHiddenDim,
-        outputDim: phoneticVocabulary.size,
-        timeSteps: 4,
-        lifConfig: Defaults.lifConfig
-    ),
+    acousticNetwork: acousticNetwork,
     languageNetwork: SpikingNetwork(
         inputDim: 128,
-        maxHiddenDim: Defaults.maxHiddenDim,
+        maxHiddenDim: hiddenDim,
         outputDim: textVocabulary.size,
         timeSteps: 4
     ),
@@ -300,12 +486,20 @@ let trainer = Trainer(
 
 // 重みのインポート。-e 0 なら評価のみ、-e N なら読み込んだ重みから追加学習する
 var importedWeights: SpikingNetworkWeights? = nil
-if let impPath = importWeightsPath {
+switch importWeightsPath {
+case .some(let impPath):
     print("\n[重み読込] 外部ファイルからモデル重みをインポート中: \(impPath)")
-    let impURL = URL(fileURLWithPath: impPath)
-    guard let wData = try? SpikingNetworkWeights.load(from: impURL) else {
-        print("  ✕ 重みファイルの読み込みに失敗しました。")
-        exit(1)
+    let wData: SpikingNetworkWeights
+    switch preloadedWeights {
+    case .some(let pre):
+        wData = pre
+    case .none:
+        let impURL = URL(fileURLWithPath: impPath)
+        guard let loaded = try? SpikingNetworkWeights.load(from: impURL) else {
+            print("  ✕ 重みファイルの読み込みに失敗しました。")
+            exit(1)
+        }
+        wData = loaded
     }
     guard wData.outputDim == phoneticVocabulary.size,
           wData.inputDim == acousticInputDim else {
@@ -314,45 +508,75 @@ if let impPath = importWeightsPath {
     }
     trainer.acousticTrainer.network.importWeights(from: wData)
     importedWeights = wData
-    if epochs == 0 {
+    switch epochs {
+    case 0:
         print("  ✓ 音響モデル重みのインポート完了。評価のみ実行します (-e 0)。")
-    } else {
+    default:
         print("  ✓ 音響モデル重みのインポート完了。この重みから \(epochs) エポックの追加学習を行います。")
     }
+case .none:
+    break
 }
 
-if epochs == 0 {
+let mlxNet: MLXSpikingNetwork
+let mlxTrainer: MLXBPTTTrainer
+let scheduler: CosineLRScheduler
+
+switch (epochs == 0, useGPU) {
+case (true, _):
     // 追加学習なし。インポート済み重みで評価へ進む
-} else if useGPU {
+    mlxNet = MLXSpikingNetwork(
+        numLayers: numLayers,
+        inputDim: acousticInputDim,
+        maxHiddenDim: hiddenDim,
+        outputDim: phoneticVocabulary.size,
+        timeSteps: 4,
+        lifConfig: trainer.acousticTrainer.network.lifConfig,
+        convSubsampling: mlxConvSubsampler
+    )
+    mlxTrainer = MLXBPTTTrainer(network: mlxNet, config: trainConfig, bpttWindow: bpttWindow)
+    scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: 1)
+case (false, true):
     print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(Defaults.batchSize))...")
 
     // 教師はフレームに整列していないかな ID 列。アライメントは CTC が周辺化する。
-    // 発話フレームを文字数で等分する近似アライメント + 交差エントロピーでは、
-    // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
     print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
     let allTargets: [[Int]] = (0..<dataset.count).map { idx in
         return phoneticVocabulary.textToIds(dataset.hiraganaText(at: idx))
     }
 
-    let mlxNet = MLXSpikingNetwork(
+    mlxNet = MLXSpikingNetwork(
+        numLayers: numLayers,
         inputDim: acousticInputDim,
-        maxHiddenDim: Defaults.maxHiddenDim,
+        maxHiddenDim: hiddenDim,
         outputDim: phoneticVocabulary.size,
         timeSteps: 4,
-        lifConfig: trainer.acousticTrainer.network.lifConfig
+        lifConfig: trainer.acousticTrainer.network.lifConfig,
+        convSubsampling: mlxConvSubsampler
     )
-    if let wData = importedWeights {
+    switch importedWeights {
+    case .some(let wData):
         mlxNet.importWeights(from: wData)
         print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
+    case .none:
+        break
     }
-    let mlxTrainer = MLXBPTTTrainer(
+    mlxTrainer = MLXBPTTTrainer(
         network: mlxNet,
         config: trainConfig,
-        bpttWindow: Defaults.bpttWindow
+        bpttWindow: bpttWindow
     )
-    print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
-    let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
-    print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
+    print("  切り詰め BPTT 窓幅: \(bpttWindow) フレーム (\(bpttWindow * 40) ms 相当)")
+    let lrMax = customLR ?? Defaults.lrMax
+    let lrMin: Float
+    switch customLR {
+    case .some(let lr):
+        lrMin = lr / 6.0
+    case .none:
+        lrMin = Defaults.lrMin
+    }
+    scheduler = CosineLRScheduler(lrMax: lrMax, lrMin: lrMin, totalEpochs: epochs, warmupEpochs: 1)
+    print("  学習率: \(lrMax) → \(lrMin)")
     let trainStartTime = CFAbsoluteTimeGetCurrent()
 
     let batchSize = Defaults.batchSize
@@ -376,7 +600,15 @@ if epochs == 0 {
     var di = 0
     while di < dataset.count {
         let frames = dataset.frameCount(at: di)
-        if ctcMinimumFrames(allTargets[di]) <= frames {
+        let effectiveFrames: Int
+        switch useConvSubsampling {
+        case true:
+            let t1 = (frames + 1) / 2
+            effectiveFrames = (t1 + 1) / 2
+        case false:
+            effectiveFrames = frames
+        }
+        if ctcMinimumFrames(allTargets[di]) <= effectiveFrames {
             feasibleIndices.append(di)
         } else {
             infeasibleCount += 1
@@ -427,16 +659,28 @@ if epochs == 0 {
             self.items = [[[Float]]](repeating: [], count: count)
         }
     }
-    func buildBatchFeatures(_ indices: [Int]) -> [[[Float]]] {
+    let batchUseConv = useConvSubsampling
+    let batchFrameStack: Int
+    switch useConvSubsampling {
+    case true:
+        batchFrameStack = 1
+    case false:
+        batchFrameStack = Defaults.frameStack
+    }
+    let batchWorkers = numWorkers
+    let batchDataset = dataset
+
+    @Sendable func buildBatchFeatures(_ indices: [Int]) -> [[[Float]]] {
         let buffer = FeatureBatchBuffer(count: indices.count)
-        let workerCount = max(1, min(numWorkers, indices.count))
+        let workerCount = max(1, min(batchWorkers, indices.count))
         DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
             var i = worker
             while i < indices.count {
-                let meta = dataset.metaSamples[indices[i]]
+                let meta = batchDataset.metaSamples[indices[i]]
                 buffer.items[i] = SpeechDataset.loadFeatures(
                     path: meta.path,
-                    frameStack: Defaults.frameStack
+                    frameStack: batchFrameStack,
+                    useMel: batchUseConv
                 ).features
                 i += workerCount
             }
@@ -550,7 +794,7 @@ if epochs == 0 {
     #if canImport(MLX)
     MLX.Memory.clearCache()
     #endif
-} else {
+case (false, false):
     print("  CPU (Pure Swift \(numWorkers) スレッド) による SNN-CTC 損失並列学習を開始...")
     let trainStartTime = CFAbsoluteTimeGetCurrent()
     var acResults: [EpochResult] = []
@@ -709,8 +953,20 @@ if 0 < dataset.count {
             }
         }
         
-        let attenRatio = 0.0 < rawOutOfBandTotal ? (eqOutOfBandTotal / rawOutOfBandTotal) : 0.20
-        let attenDb = 0.0 < attenRatio ? -10.0 * log10(attenRatio) : 7.0
+        let attenRatio: Float
+        switch 0.0 < rawOutOfBandTotal {
+        case true:
+            attenRatio = eqOutOfBandTotal / rawOutOfBandTotal
+        case false:
+            attenRatio = 0.20
+        }
+        let attenDb: Float
+        switch 0.0 < attenRatio {
+        case true:
+            attenDb = -10.0 * log10(attenRatio)
+        case false:
+            attenDb = 7.0
+        }
         print("\n[0] フォルマント適応スペクトルイコライジング測定 (発話区間 \(measuredFrames) フレーム平均):")
         print("  200〜4000Hz 外 パワー (適用前): \(String(format: "%.6e", rawOutOfBandTotal))")
         print("  200〜4000Hz 外 パワー (適用後): \(String(format: "%.6e", eqOutOfBandTotal))")
@@ -731,12 +987,13 @@ if 0 < dataset.count {
     // 2. 音響 SNN のフレーム別予測
     let acDec = AcousticDecoder(
         network: trainer.acousticTrainer.network,
-        vocabulary: phoneticVocabulary,
+        vocabulary: phoneticVocabulary
     )
     let acWs = AcousticWorkspace(
         maxHiddenDim: trainer.acousticTrainer.network.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
-        inputDim: trainer.acousticTrainer.network.inputDim
+        inputDim: trainer.acousticTrainer.network.inputDim,
+        numLayers: trainer.acousticTrainer.network.numLayers
     )
     let frameProbs = acDec.decodeSequence(featuresSeq: feat0, workspace: acWs)
 
@@ -759,7 +1016,8 @@ if 0 < dataset.count {
         }
     }
 
-    let padRatio = Float(predPad) * 100.0 / Float(max(1, totalF))
+    let totalEvaluatedFrames = frameProbs.count
+    let padRatio = Float(predPad) * 100.0 / Float(max(1, totalEvaluatedFrames))
     print("\n[2] 音響 SNN 全フレーム予測集計:")
     print("  pad: \(predPad) (\(String(format: "%.1f", padRatio))%), eos: \(predEos), unk: \(predUnk), 文字: \(predChar)")
     print("  推論 pad 率: \(String(format: "%.2f", padRatio))%")
@@ -767,18 +1025,17 @@ if 0 < dataset.count {
 
     var correctFrameCount = 0
     var fIdx = 0
-    while fIdx < totalF {
-        if fIdx < frameProbs.count {
-            let pred = frameProbs[fIdx].topTokenId
-            let tgt = targets[fIdx]
-            if pred == tgt {
-                correctFrameCount += 1
-            }
+    let checkLimit = min(totalF, totalEvaluatedFrames)
+    while fIdx < checkLimit {
+        let pred = frameProbs[fIdx].topTokenId
+        let tgt = targets[fIdx]
+        if pred == tgt {
+            correctFrameCount += 1
         }
         fIdx += 1
     }
-    let frameAccuracy = Float(correctFrameCount) * 100.0 / Float(totalF)
-    print("  フレーム正解率 (alignTargets 対 argmax): \(String(format: "%.2f", frameAccuracy))% (\(correctFrameCount)/\(totalF))")
+    let frameAccuracy = Float(correctFrameCount) * 100.0 / Float(max(1, checkLimit))
+    print("  フレーム正解率 (alignTargets 対 argmax): \(String(format: "%.2f", frameAccuracy))% (\(correctFrameCount)/\(max(1, checkLimit)))")
 
     print("\n[3] 代表フレームの Top-1 予測:")
     let printFrame: (Int) -> Void = { idx in
@@ -798,18 +1055,18 @@ if 0 < dataset.count {
         print("  Frame [\(idx)]: topId=\(fp.topTokenId) (\(name)), prob=\(String(format: "%.4f", fp.topProbability))")
     }
 
-    let headEnd = min(20, totalF)
-    print("--- 先頭 20 フレーム (0..\(headEnd-1)) ---")
+    let headEnd = min(20, totalEvaluatedFrames)
+    print("--- 先頭 \(headEnd) フレーム (0..\(max(0, headEnd - 1))) ---")
     for i in 0..<headEnd { printFrame(i) }
 
-    let midStart = max(0, (totalF / 2) - 10)
-    let midEnd = min(totalF, midStart + 20)
-    print("--- 中間 20 フレーム (\(midStart)..\(midEnd-1)) ---")
+    let midStart = max(0, (totalEvaluatedFrames / 2) - 10)
+    let midEnd = min(totalEvaluatedFrames, midStart + 20)
+    print("--- 中間 \(max(0, midEnd - midStart)) フレーム (\(midStart)..\(max(midStart, midEnd - 1))) ---")
     for i in midStart..<midEnd { printFrame(i) }
 
-    let tailStart = max(0, totalF - 20)
-    print("--- 末尾 20 フレーム (\(tailStart)..\(totalF-1)) ---")
-    for i in tailStart..<totalF { printFrame(i) }
+    let tailStart = max(0, totalEvaluatedFrames - 20)
+    print("--- 末尾 \(max(0, totalEvaluatedFrames - tailStart)) フレーム (\(tailStart)..\(max(tailStart, totalEvaluatedFrames - 1))) ---")
+    for i in tailStart..<totalEvaluatedFrames { printFrame(i) }
 
     // 3. 音響直接文字起こしの実行
     let directText = trainer.transcribeAcousticDirect(
@@ -1085,6 +1342,7 @@ let evalPairs = evalIndices.map { rawPairs[$0] }
 let evalIsTrain = evalIndices.map { $0 < sampleLimit }
 let evalKanjiConverter = KanjiConverter()
 let evalFrameStack = Defaults.frameStack
+let evalUseConv = useConvSubsampling
 
 let evalWorkers = max(1, numWorkers)
 let unseenEvalCount = rawPairs.count - sampleLimit
@@ -1110,7 +1368,13 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
         }
 
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
-        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: evalFrameStack)
+        let features: [[Float]]
+        switch evalUseConv {
+        case true:
+            features = SpeechDataset.extractMelSpectrogram(pcmData: pcm16k)
+        case false:
+            features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: evalFrameStack)
+        }
         let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
         let isTrain = evalIsTrain[idx]
 
@@ -1378,7 +1642,12 @@ if 0 < rawPairs.count {
            let wavData = try? parser.parse(bytes: [UInt8](fileData)) {
             let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
             benchAudioSeconds += Double(pcm16k.count) / 16000.0
-            benchFeatures.append(SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: Defaults.frameStack))
+            switch useConvSubsampling {
+            case true:
+                benchFeatures.append(SpeechDataset.extractMelSpectrogram(pcmData: pcm16k))
+            case false:
+                benchFeatures.append(SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: Defaults.frameStack))
+            }
         }
         benchIdx += 1
     }
@@ -1397,7 +1666,8 @@ if 0 < rawPairs.count {
         let ws = AcousticWorkspace(
             maxHiddenDim: benchNetwork.maxHiddenDim,
             outputDim: benchNetwork.outputDim,
-            inputDim: benchNetwork.inputDim
+            inputDim: benchNetwork.inputDim,
+            numLayers: benchNetwork.numLayers
         )
 
         // 第1段 音響 SNN のみのフォワード時間
@@ -1507,10 +1777,10 @@ var reportContent = """
 
 ## 1. 概要
 - **評価対象**: `\(datasetPath)` \(evalPairs.count) 発話 (学習セットは間引き / 未学習セットは全件)
-- **モデル**: `-s \(sampleLimit) -e \(epochs)` で学習した直接漢字音響 SNN (学習セット \(sampleLimit) 発話)
+- **モデル**: `-s \(sampleLimit) -e \(epochs)` で学習した直接漢字音響 SNN (層数: \(numLayers), 隠れ層: \(hiddenDim), 学習セット \(sampleLimit) 発話)
 - **第1段 LIF**: beta = \(Defaults.lifConfig.beta), rho = \(Defaults.lifConfig.rho), gamma = \(Defaults.lifConfig.gamma)
-- **特徴量**: \(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね = \(Defaults.acousticInputDim) 次元
-- **学習**: CTC 損失, 切り詰め BPTT 窓 \(Defaults.bpttWindow), 学習率 \(Defaults.lrMax) → \(Defaults.lrMin)
+- **フロントエンド**: \(frontendDesc)
+- **学習**: CTC 損失, 切り詰め BPTT 窓 \(bpttWindow) フレーム (\(bpttWindow * 40)ms 相当)
 - **語彙・かな漢字辞書**: 学習セット \(trainTextLines.count) 件のみから構築 (未学習セットの正解テキストは不使用)
 - **サンプリング**: 48kHz $\to$ 16kHz リサンプリング (アンチエイリアス 3:1 間引き)
 - **デコーダ**: CTC Prefix Beam Search, 第2段 言語 SNN 加点 = \(Defaults.languageBonus)

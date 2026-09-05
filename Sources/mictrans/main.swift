@@ -339,14 +339,7 @@ if corpusLines.isEmpty != true {
     kanaKanjiDict.buildFromCorpus(rawTexts: corpusLines)
 }
 
-let network = SpikingNetwork(
-    inputDim: weights.inputDim,
-    maxHiddenDim: weights.maxHiddenDim,
-    outputDim: weights.outputDim,
-    timeSteps: weights.timeSteps,
-    lifConfig: weights.lifConfig
-)
-network.importWeights(from: weights)
+let network = SpikingNetwork(weights: weights)
 
 print("==================================================")
 print("=== マイク入力 文字起こし ===")
@@ -520,7 +513,8 @@ final class Transcriber: @unchecked Sendable {
         self.workspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
             outputDim: network.outputDim,
-            inputDim: network.inputDim
+            inputDim: network.inputDim,
+            numLayers: network.numLayers
         )
         self.acousticDecoder = AcousticDecoder(
             network: network,
@@ -808,9 +802,13 @@ final class Transcriber: @unchecked Sendable {
 // 端末に出しているときは固定行を書き換える表示にする。
 // --meter を付けると音量行が 1 行増える
 let isTerminal = (isatty(1) == 1)
-let statusDisplay: StatusDisplay? = isTerminal
-    ? StatusDisplay(live: true, hasLevel: showMeter)
-    : nil
+let statusDisplay: StatusDisplay?
+switch isTerminal {
+case true:
+    statusDisplay = StatusDisplay(live: true, hasLevel: showMeter)
+case false:
+    statusDisplay = nil
+}
 
 let transcriber = Transcriber(
     network: network,

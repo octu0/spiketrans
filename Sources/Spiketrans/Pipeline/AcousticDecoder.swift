@@ -205,24 +205,15 @@ public final class AcousticDecoder: @unchecked Sendable {
         boundaries: [Int]? = nil
     ) -> [AcousticFrameProbabilities] {
         let inputSeq: [[Float]]
-        let effectiveBoundaries: [Int]?
         switch convSubsampling {
         case .some(let subsampler):
             if featuresSeq.first?.count == subsampler.melChannels {
                 inputSeq = subsampler.forward(melSpectrogram: featuresSeq)
-                switch boundaries {
-                case .some(let b):
-                    effectiveBoundaries = FormantSegmenter.subsampleBoundaries(boundaries: b, factor: 4)
-                case .none:
-                    effectiveBoundaries = nil
-                }
             } else {
                 inputSeq = featuresSeq
-                effectiveBoundaries = boundaries
             }
         case .none:
             inputSeq = featuresSeq
-            effectiveBoundaries = boundaries
         }
 
         var results = [AcousticFrameProbabilities]()
@@ -247,19 +238,11 @@ public final class AcousticDecoder: @unchecked Sendable {
         boundaries: [Int]? = nil
     ) -> [AcousticFrameProbabilities] {
         let inputSeq: [[Float]]
-        let effectiveBoundaries: [Int]?
         switch convSubsampling {
         case .some(let subsampler):
             inputSeq = subsampler.forward(melSpectrogram: melFeaturesSeq)
-            switch boundaries {
-            case .some(let b):
-                effectiveBoundaries = FormantSegmenter.subsampleBoundaries(boundaries: b, factor: 4)
-            case .none:
-                effectiveBoundaries = nil
-            }
         case .none:
             inputSeq = melFeaturesSeq
-            effectiveBoundaries = boundaries
         }
 
         var results = [AcousticFrameProbabilities]()

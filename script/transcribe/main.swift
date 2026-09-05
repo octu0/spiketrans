@@ -170,14 +170,7 @@ if chunkSeconds <= 0.0 {
 print("分割: \(segments.count) チャンク" + chunkDesc)
 
 // 5. 文字起こし
-let network = SpikingNetwork(
-    inputDim: weights.inputDim,
-    maxHiddenDim: weights.maxHiddenDim,
-    outputDim: weights.outputDim,
-    timeSteps: weights.timeSteps,
-    lifConfig: weights.lifConfig
-)
-network.importWeights(from: weights)
+let network = SpikingNetwork(weights: weights)
 report("モデル読み込み後")
 
 let decoder = AcousticDecoder(
@@ -188,7 +181,8 @@ let decoder = AcousticDecoder(
 let workspace = AcousticWorkspace(
     maxHiddenDim: network.maxHiddenDim,
     outputDim: network.outputDim,
-    inputDim: network.inputDim
+    inputDim: network.inputDim,
+    numLayers: network.numLayers
 )
 let beamDecoder = CTCBeamDecoder(
     vocabulary: phoneticVocabulary,

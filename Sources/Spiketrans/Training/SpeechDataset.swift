@@ -46,19 +46,22 @@ public final class SpeechDataset: @unchecked Sendable {
     public let samples: [AudioTextSample]
     public let metaSamples: [SampleMeta]
     public let lazyFrameStack: Int
+    public let lazyUseMel: Bool
     private let isLazy: Bool
 
     public init(samples: [AudioTextSample]) {
         self.samples = samples
         self.metaSamples = []
         self.lazyFrameStack = 1
+        self.lazyUseMel = false
         self.isLazy = false
     }
 
-    public init(metaSamples: [SampleMeta], frameStack: Int) {
+    public init(metaSamples: [SampleMeta], frameStack: Int, useMel: Bool = false) {
         self.samples = []
         self.metaSamples = metaSamples
         self.lazyFrameStack = frameStack
+        self.lazyUseMel = useMel
         self.isLazy = true
     }
 
@@ -92,7 +95,7 @@ public final class SpeechDataset: @unchecked Sendable {
             return samples[index]
         }
         let meta = metaSamples[index]
-        let (pcm16k, features) = Self.loadFeatures(path: meta.path, frameStack: lazyFrameStack)
+        let (pcm16k, features) = Self.loadFeatures(path: meta.path, frameStack: lazyFrameStack, useMel: lazyUseMel)
         return AudioTextSample(
             audioPCM: pcm16k,
             rawText: meta.rawText,
@@ -104,13 +107,18 @@ public final class SpeechDataset: @unchecked Sendable {
     }
 
     /// WAV ファイルを読み込んで 16kHz PCM と音響特徴量を生成する
-    public static func loadFeatures(path: String, frameStack: Int) -> (pcm: [Float], features: [[Float]]) {
+    public static func loadFeatures(path: String, frameStack: Int = 1, useMel: Bool = false) -> (pcm: [Float], features: [[Float]]) {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let wav = try? WavParser().parse(bytes: [UInt8](data)) else {
             return ([], [])
         }
         let pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
-        return (pcm16k, extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack))
+        switch useMel {
+        case true:
+            return (pcm16k, extractMelSpectrogram(pcmData: pcm16k))
+        case false:
+            return (pcm16k, extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack))
+        }
     }
 
     /// マニフェストのペアから遅延データセットを構築する。
@@ -120,6 +128,7 @@ public final class SpeechDataset: @unchecked Sendable {
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         frameStack: Int = 1,
+        useMel: Bool = false,
         workers: Int = 8
     ) -> SpeechDataset {
         final class MetaBuffer: @unchecked Sendable {
@@ -135,7 +144,7 @@ public final class SpeechDataset: @unchecked Sendable {
             var i = worker
             while i < pairs.count {
                 let pair = pairs[i]
-                let (_, features) = loadFeatures(path: pair.path, frameStack: frameStack)
+                let (_, features) = loadFeatures(path: pair.path, frameStack: frameStack, useMel: useMel)
                 if 0 < features.count {
                     buffer.items[i] = SampleMeta(
                         path: pair.path,
@@ -156,7 +165,7 @@ public final class SpeechDataset: @unchecked Sendable {
                 metas.append(meta)
             }
         }
-        return SpeechDataset(metaSamples: metas, frameStack: frameStack)
+        return SpeechDataset(metaSamples: metas, frameStack: frameStack, useMel: useMel)
     }
 
     /// テキスト中の全発音から音素トークン ID 列を抽出

@@ -115,6 +115,27 @@ public final class SpikingNetwork: @unchecked Sendable {
         rebuildInferenceLayout()
     }
 
+    /// 保存済み重みから完全に復元して初期化
+    public convenience init(weights: SpikingNetworkWeights) {
+        let subsampler: Conv2DSubsampling?
+        switch weights.convSubsampling {
+        case .some(let cWeights):
+            subsampler = Conv2DSubsampling(weights: cWeights)
+        case .none:
+            subsampler = nil
+        }
+        self.init(
+            numLayers: weights.numLayers,
+            inputDim: weights.inputDim,
+            maxHiddenDim: weights.maxHiddenDim,
+            outputDim: weights.outputDim,
+            timeSteps: weights.timeSteps,
+            lifConfig: weights.lifConfig,
+            convSubsampling: subsampler
+        )
+        self.importWeights(from: weights)
+    }
+
     public var parameters: [Parameter] {
         var params: [Parameter] = [pWIn, pWRec, pBH]
         var l = 0

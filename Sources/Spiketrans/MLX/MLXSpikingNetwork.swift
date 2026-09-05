@@ -74,6 +74,27 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         super.init()
     }
 
+    /// 保存済み重みから完全に復元して初期化
+    public convenience init(weights: SpikingNetworkWeights) {
+        let subsampler: MLXConv2DSubsampling?
+        switch weights.convSubsampling {
+        case .some(let cWeights):
+            subsampler = MLXConv2DSubsampling(weights: cWeights)
+        case .none:
+            subsampler = nil
+        }
+        self.init(
+            numLayers: weights.numLayers,
+            inputDim: weights.inputDim,
+            maxHiddenDim: weights.maxHiddenDim,
+            outputDim: weights.outputDim,
+            timeSteps: weights.timeSteps,
+            lifConfig: weights.lifConfig,
+            convSubsampling: subsampler
+        )
+        self.importWeights(from: weights)
+    }
+
     /// Pure Swift の SpikingNetworkWeights から重みをインポート
     public func importWeights(from data: SpikingNetworkWeights) {
         let wInArr = MLXArray(data.wIn, [data.maxHiddenDim, data.inputDim]).transposed()

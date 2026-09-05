@@ -200,7 +200,8 @@ extension Trainer {
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
             outputDim: acousticTrainer.network.outputDim,
-            inputDim: acousticTrainer.network.inputDim
+            inputDim: acousticTrainer.network.inputDim,
+            numLayers: acousticTrainer.network.numLayers
         )
 
         let lmDecoder = LanguageDecoder(
@@ -209,20 +210,10 @@ extension Trainer {
             fallbackVocabulary: phonemeVocabulary
         )
 
-        var acousticProbs: [AcousticFrameProbabilities] = []
-        acousticProbs.reserveCapacity(featuresSeq.count)
-
-        var f = 0
-        while f < featuresSeq.count {
-            let feat = featuresSeq[f]
-            let frame = acDecoder.decodeFrame(
-                features: feat,
-                workspace: acWorkspace,
-                frameIndex: f
-            )
-            acousticProbs.append(frame)
-            f += 1
-        }
+        let acousticProbs = acDecoder.decodeSequence(
+            featuresSeq: featuresSeq,
+            workspace: acWorkspace
+        )
 
         let greedyRes = lmDecoder.decodeGreedy(
             acousticProbs: acousticProbs,
@@ -268,7 +259,8 @@ extension Trainer {
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
             outputDim: acousticTrainer.network.outputDim,
-            inputDim: acousticTrainer.network.inputDim
+            inputDim: acousticTrainer.network.inputDim,
+            numLayers: acousticTrainer.network.numLayers
         )
 
         let frameProbs = acDecoder.decodeSequence(
@@ -378,7 +370,8 @@ extension Trainer {
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
             outputDim: network.outputDim,
-            inputDim: network.inputDim
+            inputDim: network.inputDim,
+            numLayers: network.numLayers
         )
 
         let frameProbs = acDecoder.decodeSequence(
