@@ -790,19 +790,34 @@ public final class BPTTTrainer: @unchecked Sendable {
                 while j < hSize {
                     let decayFactor = network.lifConfig.beta * (1.0 - sPrevT0[j])
                     dVTime0[j] = dVList0[j] * decayFactor
+                    dSTime0[j] = -network.lifConfig.beta * vPrevT0[j] * dVList0[j]
+                    j += 1
+                }
 
-                    var dS_j = -network.lifConfig.beta * vPrevT0[j] * dVList0[j]
+                if 1 < numLayers {
                     var iRec = 0
                     while iRec < hSize {
-                        var dIn = dVList0[iRec]
-                        if 1 < numLayers {
-                            dIn += dShortcutToPrev[iRec]
+                        let dIn = dVList0[iRec] + dShortcutToPrev[iRec]
+                        let rowOffset = iRec * network.maxHiddenDim
+                        var j = 0
+                        while j < hSize {
+                            dSTime0[j] += network.pWRec.data[rowOffset + j] * dIn
+                            j += 1
                         }
-                        dS_j += network.pWRec.data[iRec * network.maxHiddenDim + j] * dIn
                         iRec += 1
                     }
-                    dSTime0[j] = dS_j
-                    j += 1
+                } else {
+                    var iRec = 0
+                    while iRec < hSize {
+                        let dIn = dVList0[iRec]
+                        let rowOffset = iRec * network.maxHiddenDim
+                        var j = 0
+                        while j < hSize {
+                            dSTime0[j] += network.pWRec.data[rowOffset + j] * dIn
+                            j += 1
+                        }
+                        iRec += 1
+                    }
                 }
 
                 t -= 1

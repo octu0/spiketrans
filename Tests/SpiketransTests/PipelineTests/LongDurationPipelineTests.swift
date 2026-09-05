@@ -362,6 +362,122 @@ final class LongDurationPipelineTests: XCTestCase {
         XCTAssertTrue(2 <= counter.value, "2回以上の発話セグメントが最終認識結果として出力されていること")
     }
 
+    // MARK: - 5. 多層 SNN + Conv2D 20,000フレーム長時間ストレステスト (O(1) 定数メモリ & RTF <= 0.005)
+
+    func testMultiLayerConv2DStreaming20000FramesConstantMemoryAndRTF() {
+        let subsampler = Conv2DSubsampling(melChannels: 64, outputDim: 128)
+        let net = SpikingNetwork(
+            numLayers: 2,
+            inputDim: 128,
+            maxHiddenDim: 256,
+            outputDim: 85,
+            convSubsampling: subsampler
+        )
+        let decoder = AcousticDecoder(network: net, convSubsampling: subsampler)
+        let workspace = AcousticWorkspace(maxHiddenDim: 256, outputDim: 85, inputDim: 128, numLayers: 2)
+
+        var streamingState = Conv2DStreamingState()
+        let totalFrames = 20000
+        let warmupFrames = 2000
+
+        var dummyMelFrame = [Float](repeating: 0.05, count: 64)
+        var emittedFrames = 0
+        var invalidProbCount = 0
+
+        // 1. ウォームアップ (2,000 フレーム)
+        var f = 0
+        while f < warmupFrames {
+            dummyMelFrame[f % 64] = Float(f % 10) * 0.05
+            let result = decoder.decodeStreaming(
+                melFrame: dummyMelFrame,
+                state: &streamingState,
+                workspace: workspace,
+                frameIndex: f
+            )
+            switch result {
+            case .some(let probs):
+                emittedFrames += 1
+                if probs.topProbability < 0.0 || 1.0 < probs.topProbability || probs.topProbability.isNaN {
+                    invalidProbCount += 1
+                }
+            case .none:
+                break
+            }
+            f += 1
+        }
+
+        // 2,000フレーム時点でのメモリと開始時刻を記録
+        let initialRSS = residentMemoryMB()
+        let startTime = DispatchTime.now()
+
+        // 2. 本計測 (2,000 -> 20,000 フレーム)
+        while f < totalFrames {
+            dummyMelFrame[f % 64] = Float(f % 10) * 0.05
+            let result = decoder.decodeStreaming(
+                melFrame: dummyMelFrame,
+                state: &streamingState,
+                workspace: workspace,
+                frameIndex: f
+            )
+            switch result {
+            case .some(let probs):
+                emittedFrames += 1
+                if probs.topProbability < 0.0 || 1.0 < probs.topProbability || probs.topProbability.isNaN {
+                    invalidProbCount += 1
+                }
+            case .none:
+                break
+            }
+            f += 1
+        }
+
+        let endTime = DispatchTime.now()
+        let finalRSS = residentMemoryMB()
+        let durationNs = endTime.uptimeNanoseconds - startTime.uptimeNanoseconds
+        let durationSec = Double(durationNs) / 1_000_000_000.0
+
+        // 計測対象音声相当時間: (20,000 - 2,000) フレーム * 10ms = 180.0 秒
+        let measuredFrames = totalFrames - warmupFrames
+        let audioSec = Double(measuredFrames) * 0.010
+        let rtf = durationSec / audioSec
+
+        // 1. RTF 高速性検証: SNN + Conv2D は Release で 0.005 以下、Debug で 0.25 以下であること
+        #if DEBUG
+        XCTAssertTrue(rtf <= 0.25, "多層 SNN + Conv2D ストリーミング推論の RTF は Debug ビルドでも 0.25 以下であること (実績値: \(rtf))")
+        #else
+        XCTAssertTrue(rtf <= 0.005, "多層 SNN + Conv2D ストリーミング推論の RTF は 0.005 以下であること (実績値: \(rtf))")
+        #endif
+
+        // 2. O(1) 定数メモリ検証: 2,000フレームから20,000フレームまでのメモリ増加量が 1.0MB 以下であること
+        let rssDelta = finalRSS - initialRSS
+        XCTAssertTrue(rssDelta <= 1.0, "2,000フレームから20,000フレームまでのメモリ増加量が 1.0MB 以下であること (実績値: \(rssDelta) MB)")
+
+        // 3. 出力フレーム数検証: 20,000 フレーム入力で期待値 5,000 フレーム (4x サブサンプリング)
+        let expectedFrames = totalFrames / 4
+        XCTAssertEqual(emittedFrames, expectedFrames, "出力フレーム数が期待値 5,000 フレームであること")
+
+        // 4. ストリーミング推論中の確率妥当性検証 (NaN や [0, 1] 逸脱がゼロ件であること)
+        XCTAssertEqual(invalidProbCount, 0, "推論出力された topProbability に NaN や [0, 1] 範囲外の値が含まれないこと")
+
+        // 5. 数値安定性検証: 最終ワークスペースの確率および膜電位に NaN や発散がないこと
+        var pIdx = 0
+        while pIdx < workspace.probabilities.count {
+            let p = workspace.probabilities[pIdx]
+            XCTAssertFalse(p.isNaN, "出力確率に NaN が含まれないこと")
+            XCTAssertTrue(0.0 <= p && p <= 1.0, "出力確率が [0, 1] 範囲内であること")
+            pIdx += 1
+        }
+
+        var vIdx = 0
+        while vIdx < workspace.vPrev.count {
+            let v = workspace.vPrev[vIdx]
+            XCTAssertFalse(v.isNaN, "膜電位に NaN が含まれないこと")
+            XCTAssertFalse(v.isInfinite, "膜電位が発散していないこと")
+            XCTAssertTrue(abs(v) <= 20.0, "膜電位が健全な有界値 [-20.0, 20.0] に留まっていること")
+            vIdx += 1
+        }
+    }
+
     private func createTestNetworks() -> (acoustic: SpikingNetwork, language: SpikingNetwork, vocab: TextVocabulary) {
         let vocab = TextVocabulary()
         let ac = SpikingNetwork(numLayers: 2, inputDim: 64, maxHiddenDim: 128, outputDim: vocab.size, timeSteps: 4)

@@ -352,6 +352,8 @@ final class M1ChallengerStressTests: XCTestCase {
             
             let rootsPtr = workspace.durandKernerCurr.withUnsafeBufferPointer { $0.baseAddress! }
             let formantRes = formantExtractor.extractFormants(roots: rootsPtr, count: 12)
+            XCTAssertFalse(formantRes.f1.isNaN)
+            XCTAssertLessThanOrEqual(0.0, formantRes.f1)
             
             let features = filterbank.extractFeatures(
                 pcmPtr: base,
@@ -501,6 +503,7 @@ final class M1ChallengerStressTests: XCTestCase {
             
             let rootsPtr = workspace.durandKernerCurr.withUnsafeBufferPointer { $0.baseAddress! }
             let formantRes = formantExtractor.extractFormants(roots: rootsPtr, count: 12)
+            XCTAssertFalse(formantRes.f1.isNaN)
             
             let features = filterbank.extractFeatures(
                 pcmPtr: base,
@@ -545,17 +548,21 @@ final class M1ChallengerStressTests: XCTestCase {
             XCTAssertTrue(pitchRes.isVoiced || pitchRes.isVoiced != true)
             
             // LPC
-            lpc.computeCoefficients(ptr: base, count: frameSize, workspace: workspace)
+            let lpcSuccess = lpc.computeCoefficients(ptr: base, count: frameSize, workspace: workspace)
+            XCTAssertTrue(lpcSuccess)
             
             // DurandKerner with NaN coefficients
             var nanCoeffs = [Float](repeating: Float.nan, count: 13)
             nanCoeffs[0] = 1.0
-            nanCoeffs.withUnsafeBufferPointer { cPtr in
-                dkSolver.solve(coefficients: cPtr.baseAddress!, order: 12, workspace: workspace)
+            let dkSuccess = nanCoeffs.withUnsafeBufferPointer { cPtr in
+                let solved = dkSolver.solve(coefficients: cPtr.baseAddress!, order: 12, workspace: workspace)
+                XCTAssertTrue(solved)
+                return solved
             }
+            XCTAssertTrue(dkSuccess)
             
             // FormantExtractor with NaN roots
-            var nanRoots = [Complex](repeating: Complex(real: Float.nan, imag: Float.infinity), count: 12)
+            let nanRoots = [Complex](repeating: Complex(real: Float.nan, imag: Float.infinity), count: 12)
             nanRoots.withUnsafeBufferPointer { rPtr in
                 let formantRes = formantExtractor.extractFormants(roots: rPtr.baseAddress!, count: 12)
                 XCTAssertEqual(formantRes.count, 0)
@@ -683,7 +690,7 @@ final class M1ChallengerStressTests: XCTestCase {
     func testDurandKernerInvalidOrder() {
         let solver = DurandKernerSolver()
         let workspace = DSPWorkspace()
-        var coeffs: [Float] = [1.0, 0.5]
+        let coeffs: [Float] = [1.0, 0.5]
         
         coeffs.withUnsafeBufferPointer { cPtr in
             let r0 = solver.solve(coefficients: cPtr.baseAddress!, order: 0, workspace: workspace)
@@ -701,8 +708,8 @@ final class M1ChallengerStressTests: XCTestCase {
         let counts = [0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 319, 320]
         
         for count in counts {
-            var srcA = [Float](repeating: 1.5, count: max(count, 1))
-            var srcB = [Float](repeating: 2.0, count: max(count, 1))
+            let srcA = [Float](repeating: 1.5, count: max(count, 1))
+            let srcB = [Float](repeating: 2.0, count: max(count, 1))
             var dst = [Float](repeating: 0.0, count: max(count, 1))
             
             srcA.withUnsafeBufferPointer { aPtr in
@@ -782,9 +789,11 @@ final class M1ChallengerStressTests: XCTestCase {
                 let lpcSuccess = lpc.computeCoefficients(ptr: base, count: frameSize, workspace: workspace)
                 if lpcSuccess {
                     let coeffPtr = workspace.lpcCoeffs.withUnsafeBufferPointer { $0.baseAddress! }
-                    dkSolver.solve(coefficients: coeffPtr, order: 12, workspace: workspace)
+                    let solved = dkSolver.solve(coefficients: coeffPtr, order: 12, workspace: workspace)
+                    XCTAssertTrue(solved)
                     let rootsPtr = workspace.durandKernerCurr.withUnsafeBufferPointer { $0.baseAddress! }
                     let formantRes = formantExtractor.extractFormants(roots: rootsPtr, count: 12)
+                    XCTAssertFalse(formantRes.f1.isNaN)
                     
                     let features = filterbank.extractFeatures(
                         pcmPtr: base,
@@ -1011,8 +1020,6 @@ final class M1ChallengerStressTests: XCTestCase {
         let filterbank = Filterbank()
         let workspace = DSPWorkspace()
         let frameSize = 512
-        let dummyPitch = PitchResult(f0: 0.0, hnr: 0.0, isVoiced: false)
-        let dummyFormants = FormantResult(f1: 0.0, f2: 0.0, f3: 0.0, b1: 0.0, b2: 0.0, b3: 0.0, count: 0)
         
         let testFrequencies: [Float] = [0.0, 10.0, 50.0, 100.0, 300.0, 1000.0, 2500.0, 4000.0, 7000.0, 7999.0, 8000.0]
         
