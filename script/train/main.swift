@@ -27,6 +27,8 @@ enum Defaults {
 
     /// 隠れ層の次元
     static let maxHiddenDim = 1024
+    /// 音響 SNN の層数。層 0 が再帰層、層 1 以降は電流残差付きフィードフォワード層
+    static let numLayers = 2
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
@@ -277,10 +279,11 @@ let trainConfig = TrainingConfig(
 let acousticInputDim = Defaults.acousticInputDim
 print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
 
-print("第1段 LIF: beta = \(Defaults.lifConfig.beta)")
+print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers)")
 
 let trainer = Trainer(
     acousticNetwork: SpikingNetwork(
+        numLayers: Defaults.numLayers,
         inputDim: acousticInputDim,
         maxHiddenDim: Defaults.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
@@ -335,6 +338,7 @@ if epochs == 0 {
     }
 
     let mlxNet = MLXSpikingNetwork(
+        numLayers: Defaults.numLayers,
         inputDim: acousticInputDim,
         maxHiddenDim: Defaults.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
@@ -736,7 +740,8 @@ if 0 < dataset.count {
     let acWs = AcousticWorkspace(
         maxHiddenDim: trainer.acousticTrainer.network.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
-        inputDim: trainer.acousticTrainer.network.inputDim
+        inputDim: trainer.acousticTrainer.network.inputDim,
+        numLayers: trainer.acousticTrainer.network.numLayers
     )
     let frameProbs = acDec.decodeSequence(featuresSeq: feat0, workspace: acWs)
 
@@ -1397,7 +1402,8 @@ if 0 < rawPairs.count {
         let ws = AcousticWorkspace(
             maxHiddenDim: benchNetwork.maxHiddenDim,
             outputDim: benchNetwork.outputDim,
-            inputDim: benchNetwork.inputDim
+            inputDim: benchNetwork.inputDim,
+            numLayers: benchNetwork.numLayers
         )
 
         // 第1段 音響 SNN のみのフォワード時間
