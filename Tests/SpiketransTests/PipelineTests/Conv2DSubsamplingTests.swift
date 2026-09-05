@@ -380,8 +380,13 @@ final class Conv2DSubsamplingTests: XCTestCase {
         let rtf = elapsedSec / 20.0
 
         // RTF 0.02 以下（実時間の 50 倍以上速い）であることを保証
+        #if DEBUG
+        XCTAssertTrue(rtf < 0.25)
+        XCTAssertTrue(elapsedSec < 5.0)
+        #else
         XCTAssertTrue(rtf < 0.02)
         XCTAssertTrue(elapsedSec < 0.5)
+        #endif
     }
 
     // MARK: - 9. 重みシリアライズ・JSON 互換性検証

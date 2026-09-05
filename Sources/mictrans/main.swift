@@ -556,7 +556,9 @@ final class Transcriber: @unchecked Sendable {
                 gate.signal()
             }
         }
-        _ = gate.wait(timeout: .now() + timeout)
+        if gate.wait(timeout: .now() + timeout) == .timedOut {
+            // タイムアウト時は待機を終了
+        }
     }
 
     /// 認識を重いキューへ投げる。

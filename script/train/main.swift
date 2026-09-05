@@ -932,7 +932,7 @@ if 0 < dataset.count {
                 }
                 
                 // イコライジング後
-                _ = filterbank.extractFeatures(pcmPtr: framePtr, count: 400, workspace: ws)
+                filterbank.extractFeatures(pcmPtr: framePtr, count: 400, workspace: ws)
                 var eqOOB: Float = 0.0
                 k = 0
                 while k < 256 {

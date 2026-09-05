@@ -447,7 +447,7 @@ if 0 < showExamples {
         print("  正解漢字: \"\(r.target)\"")
         print("  出力:     \"\(r.produced)\"")
         let traceDecoder = KanaKanjiDecoder(dictionary: dictionary, languageBonus: 0.0)
-        _ = traceDecoder.decode(kanaText: converter.convertToHiragana(r.target))
+        traceDecoder.decode(kanaText: converter.convertToHiragana(r.target))
         for seg in traceDecoder.lastTrace {
             print("    \(seg.kanaRange) → \(seg.emitted)  [\(seg.kind)] \(String(format: "%+.2f", seg.stepScore))")
         }

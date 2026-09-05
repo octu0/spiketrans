@@ -79,7 +79,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var i = 0
         while i < 1000 {
             frame.withUnsafeBufferPointer { buf in
-                let _ = vad.processFrame(ptr: buf.baseAddress!, count: config.frameSize, workspace: workspace)
+                vad.processFrame(ptr: buf.baseAddress!, count: config.frameSize, workspace: workspace)
             }
             i += 1
         }
@@ -302,7 +302,7 @@ final class Tier2BoundaryTests: XCTestCase {
 
         let dcSignal = [Float](repeating: 0.5, count: config.frameSize)
         dcSignal.withUnsafeBufferPointer { buf in
-            let _ = lpc.computeCoefficients(ptr: buf.baseAddress!, count: config.frameSize, workspace: workspace)
+            lpc.computeCoefficients(ptr: buf.baseAddress!, count: config.frameSize, workspace: workspace)
             var k = 0
             while k < config.lpcOrder {
                 XCTAssertFalse(workspace.lpcCoeffs[k].isNaN)
@@ -459,7 +459,7 @@ final class Tier2BoundaryTests: XCTestCase {
         }
 
         waveNyquist.withUnsafeBufferPointer { buf in
-            let _ = lpc.computeCoefficients(ptr: buf.baseAddress!, count: config.frameSize, workspace: workspace)
+            lpc.computeCoefficients(ptr: buf.baseAddress!, count: config.frameSize, workspace: workspace)
             var k = 0
             while k < config.lpcOrder {
                 XCTAssertFalse(workspace.lpcCoeffs[k].isNaN)

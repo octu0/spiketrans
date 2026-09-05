@@ -59,8 +59,10 @@ public struct Conv2DStreamingState: Sendable {
 
     public init() {
         self.pastMelFrames = []
+        self.pastMelFrames.reserveCapacity(8)
         self.totalMelFrames = 0
         self.pastConv1Frames = []
+        self.pastConv1Frames.reserveCapacity(8)
         self.totalConv1Frames = 0
     }
 
@@ -91,6 +93,11 @@ public final class Conv2DSubsampling: @unchecked Sendable {
     public private(set) var conv2Bias: [Float]
     public private(set) var projWeight: [Float]
     public private(set) var projBias: [Float]
+
+    private var conv1SIMD0: [SIMD8<Float>] = []
+    private var conv1SIMD1: [SIMD8<Float>] = []
+    private var conv1BiasSIMD0: SIMD8<Float> = .zero
+    private var conv1BiasSIMD1: SIMD8<Float> = .zero
 
     public init(
         inChannels: Int = 1,
@@ -139,6 +146,7 @@ public final class Conv2DSubsampling: @unchecked Sendable {
         }
         self.projWeight = wp
         self.projBias = [Float](repeating: 0.0, count: outputDim)
+        rebuildSIMDWeights()
     }
 
     public init(weights: Conv2DSubsamplingWeights) {
@@ -153,6 +161,7 @@ public final class Conv2DSubsampling: @unchecked Sendable {
         self.conv2Bias = weights.conv2Bias
         self.projWeight = weights.projWeight
         self.projBias = weights.projBias
+        rebuildSIMDWeights()
     }
 
     public func exportWeights() -> Conv2DSubsamplingWeights {
@@ -178,6 +187,34 @@ public final class Conv2DSubsampling: @unchecked Sendable {
         self.conv2Bias = weights.conv2Bias
         self.projWeight = weights.projWeight
         self.projBias = weights.projBias
+        rebuildSIMDWeights()
+    }
+
+    private func rebuildSIMDWeights() {
+        var s0 = [SIMD8<Float>](repeating: .zero, count: 9)
+        var s1 = [SIMD8<Float>](repeating: .zero, count: 9)
+        conv1Weight.withUnsafeBufferPointer { wBuf in
+            let wPtr = wBuf.baseAddress!
+            var k = 0
+            while k < 9 {
+                s0[k] = SIMD8<Float>(
+                    wPtr[0 * 9 + k], wPtr[1 * 9 + k], wPtr[2 * 9 + k], wPtr[3 * 9 + k],
+                    wPtr[4 * 9 + k], wPtr[5 * 9 + k], wPtr[6 * 9 + k], wPtr[7 * 9 + k]
+                )
+                s1[k] = SIMD8<Float>(
+                    wPtr[8 * 9 + k], wPtr[9 * 9 + k], wPtr[10 * 9 + k], wPtr[11 * 9 + k],
+                    wPtr[12 * 9 + k], wPtr[13 * 9 + k], wPtr[14 * 9 + k], wPtr[15 * 9 + k]
+                )
+                k += 1
+            }
+        }
+        self.conv1SIMD0 = s0
+        self.conv1SIMD1 = s1
+        conv1Bias.withUnsafeBufferPointer { bBuf in
+            let bPtr = bBuf.baseAddress!
+            self.conv1BiasSIMD0 = SIMD8<Float>(bPtr[0], bPtr[1], bPtr[2], bPtr[3], bPtr[4], bPtr[5], bPtr[6], bPtr[7])
+            self.conv1BiasSIMD1 = SIMD8<Float>(bPtr[8], bPtr[9], bPtr[10], bPtr[11], bPtr[12], bPtr[13], bPtr[14], bPtr[15])
+        }
     }
 
     /// 64ch Mel スペクトログラム系列 [T][64] から 1/4 時間圧縮された特徴量系列 [T/4][outputDim] を抽出
@@ -224,74 +261,69 @@ public final class Conv2DSubsampling: @unchecked Sendable {
             }
         }
 
-        conv1Weight.withUnsafeBufferPointer { wBuf in
-            let wPtr = wBuf.baseAddress!
-            conv1Bias.withUnsafeBufferPointer { bBuf in
-                let bPtr = bBuf.baseAddress!
-                flatMel.withUnsafeBufferPointer { inBuf in
-                    let inPtr = inBuf.baseAddress!
-                    output.withUnsafeMutableBufferPointer { outBuf in
-                        let outPtr = outBuf.baseAddress!
+        let b0 = conv1BiasSIMD0
+        let b1 = conv1BiasSIMD1
+        let w0 = conv1SIMD0
+        let w1 = conv1SIMD1
 
-                        var t = 0
-                        while t < t1 {
-                            // 時間軸因果パディング: 過去2フレーム参照、未来0フレーム
-                            let tSrc0 = 2 * t - 2
-                            let tSrc1 = 2 * t - 1
-                            let tSrc2 = 2 * t
+        flatMel.withUnsafeBufferPointer { inBuf in
+            let inPtr = inBuf.baseAddress!
+            output.withUnsafeMutableBufferPointer { outBuf in
+                let outPtr = outBuf.baseAddress!
 
-                            let ptr0: UnsafePointer<Float>?
-                            if 0 <= tSrc0 && tSrc0 < tTotal {
-                                ptr0 = inPtr.advanced(by: tSrc0 * 64)
-                            } else {
-                                ptr0 = nil
-                            }
-
-                            let ptr1: UnsafePointer<Float>?
-                            if 0 <= tSrc1 && tSrc1 < tTotal {
-                                ptr1 = inPtr.advanced(by: tSrc1 * 64)
-                            } else {
-                                ptr1 = nil
-                            }
-
-                            let ptr2: UnsafePointer<Float>?
-                            if 0 <= tSrc2 && tSrc2 < tTotal {
-                                ptr2 = inPtr.advanced(by: tSrc2 * 64)
-                            } else {
-                                ptr2 = nil
-                            }
-
-                            let tOutOffset = t * fOutCount * cOutCount
-
-                            // 境界セル: f = 0 (fSrc0 = -1 でゼロパディング)
-                            computeConv1CellBoundary(
-                                f: 0,
-                                ptr0: ptr0,
-                                ptr1: ptr1,
-                                ptr2: ptr2,
-                                wPtr: wPtr,
-                                bPtr: bPtr,
-                                dst: outPtr.advanced(by: tOutOffset)
-                            )
-
-                            // 内部セル: f = 1..<32 (周波数境界外なし)
-                            var f = 1
-                            while f < fOutCount {
-                                computeConv1CellInner(
-                                    f: f,
-                                    ptr0: ptr0,
-                                    ptr1: ptr1,
-                                    ptr2: ptr2,
-                                    wPtr: wPtr,
-                                    bPtr: bPtr,
-                                    dst: outPtr.advanced(by: tOutOffset + (f * cOutCount))
-                                )
-                                f += 1
-                            }
-
-                            t += 1
-                        }
+                // 1. 時間境界: t = 0 (tSrc0, tSrc1 はパディング、tSrc2 = 0 のみ有効)
+                if 0 < t1 {
+                    let ptr2 = inPtr
+                    computeConv1CellT0Boundary(ptr2: ptr2, b0: b0, b1: b1, w0: w0, w1: w1, dst: outPtr)
+                    var f = 1
+                    while f < fOutCount {
+                        computeConv1CellT0Inner(ptr2: ptr2, f: f, b0: b0, b1: b1, w0: w0, w1: w1, dst: outPtr.advanced(by: f * cOutCount))
+                        f += 1
                     }
+                }
+
+                // 2. 時間内部: 1 <= t < t1 (ptr0, ptr1, ptr2 すべて非 nil)
+                var t = 1
+                while t < t1 {
+                    let tSrc0 = 2 * t - 2
+                    let tSrc1 = 2 * t - 1
+                    let tSrc2 = 2 * t
+
+                    let ptr0 = inPtr.advanced(by: tSrc0 * 64)
+                    let ptr1 = inPtr.advanced(by: tSrc1 * 64)
+                    let ptr2 = inPtr.advanced(by: tSrc2 * 64)
+                    let tOutOffset = t * fOutCount * cOutCount
+
+                    // f = 0 (周波数境界: fSrc0 = -1 でゼロパディング)
+                    computeConv1CellTimeInnerBoundaryF0(
+                        ptr0: ptr0,
+                        ptr1: ptr1,
+                        ptr2: ptr2,
+                        b0: b0,
+                        b1: b1,
+                        w0: w0,
+                        w1: w1,
+                        dst: outPtr.advanced(by: tOutOffset)
+                    )
+
+                    // f = 1..<32 (周波数内部: 境界外なし、完全アンロール)
+                    var f = 1
+                    while f < fOutCount {
+                        computeConv1CellTimeInnerPure(
+                            ptr0: ptr0,
+                            ptr1: ptr1,
+                            ptr2: ptr2,
+                            f: f,
+                            b0: b0,
+                            b1: b1,
+                            w0: w0,
+                            w1: w1,
+                            dst: outPtr.advanced(by: tOutOffset + (f * cOutCount))
+                        )
+                        f += 1
+                    }
+
+                    t += 1
                 }
             }
         }
@@ -300,158 +332,155 @@ public final class Conv2DSubsampling: @unchecked Sendable {
     }
 
     @inline(__always)
-    private func computeConv1CellInner(
+    private func computeConv1CellTimeInnerPure(
+        ptr0: UnsafePointer<Float>,
+        ptr1: UnsafePointer<Float>,
+        ptr2: UnsafePointer<Float>,
         f: Int,
-        ptr0: UnsafePointer<Float>?,
-        ptr1: UnsafePointer<Float>?,
-        ptr2: UnsafePointer<Float>?,
-        wPtr: UnsafePointer<Float>,
-        bPtr: UnsafePointer<Float>,
+        b0: SIMD8<Float>,
+        b1: SIMD8<Float>,
+        w0: [SIMD8<Float>],
+        w1: [SIMD8<Float>],
         dst: UnsafeMutablePointer<Float>
     ) {
-        let fSrc0 = 2 * f - 1
-        let fSrc1 = 2 * f
-        let fSrc2 = 2 * f + 1
+        let f0 = 2 * f - 1
+        let f1 = 2 * f
+        let f2 = 2 * f + 1
 
-        var acc0 = SIMD8<Float>(bPtr[0], bPtr[1], bPtr[2], bPtr[3], bPtr[4], bPtr[5], bPtr[6], bPtr[7])
-        var acc1 = SIMD8<Float>(bPtr[8], bPtr[9], bPtr[10], bPtr[11], bPtr[12], bPtr[13], bPtr[14], bPtr[15])
+        let p0_0 = ptr0[f0]
+        let p0_1 = ptr0[f1]
+        let p0_2 = ptr0[f2]
 
-        switch ptr0 {
-        case .some(let p):
-            accumulateConv1Point(val: p[fSrc0], kt: 0, kf: 0, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc1], kt: 0, kf: 1, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc2], kt: 0, kf: 2, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-        case .none:
-            break
-        }
+        let p1_0 = ptr1[f0]
+        let p1_1 = ptr1[f1]
+        let p1_2 = ptr1[f2]
 
-        switch ptr1 {
-        case .some(let p):
-            accumulateConv1Point(val: p[fSrc0], kt: 1, kf: 0, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc1], kt: 1, kf: 1, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc2], kt: 1, kf: 2, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-        case .none:
-            break
-        }
+        let p2_0 = ptr2[f0]
+        let p2_1 = ptr2[f1]
+        let p2_2 = ptr2[f2]
 
-        switch ptr2 {
-        case .some(let p):
-            accumulateConv1Point(val: p[fSrc0], kt: 2, kf: 0, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc1], kt: 2, kf: 1, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc2], kt: 2, kf: 2, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-        case .none:
-            break
-        }
+        var acc0 = b0
+        var acc1 = b1
 
-        // ReLU 活性化関数 (SIMD8 ベクトル化)
-        let zero = SIMD8<Float>(repeating: 0.0)
-        let r0 = acc0.replacing(with: zero, where: acc0 .< zero)
-        let r1 = acc1.replacing(with: zero, where: acc1 .< zero)
+        acc0 += w0[0] * p0_0 + w0[1] * p0_1 + w0[2] * p0_2
+        acc0 += w0[3] * p1_0 + w0[4] * p1_1 + w0[5] * p1_2
+        acc0 += w0[6] * p2_0 + w0[7] * p2_1 + w0[8] * p2_2
 
-        dst[0] = r0[0]
-        dst[1] = r0[1]
-        dst[2] = r0[2]
-        dst[3] = r0[3]
-        dst[4] = r0[4]
-        dst[5] = r0[5]
-        dst[6] = r0[6]
-        dst[7] = r0[7]
-
-        dst[8] = r1[0]
-        dst[9] = r1[1]
-        dst[10] = r1[2]
-        dst[11] = r1[3]
-        dst[12] = r1[4]
-        dst[13] = r1[5]
-        dst[14] = r1[6]
-        dst[15] = r1[7]
-    }
-
-    @inline(__always)
-    private func computeConv1CellBoundary(
-        f: Int,
-        ptr0: UnsafePointer<Float>?,
-        ptr1: UnsafePointer<Float>?,
-        ptr2: UnsafePointer<Float>?,
-        wPtr: UnsafePointer<Float>,
-        bPtr: UnsafePointer<Float>,
-        dst: UnsafeMutablePointer<Float>
-    ) {
-        let fSrc1 = 2 * f
-        let fSrc2 = 2 * f + 1
-
-        var acc0 = SIMD8<Float>(bPtr[0], bPtr[1], bPtr[2], bPtr[3], bPtr[4], bPtr[5], bPtr[6], bPtr[7])
-        var acc1 = SIMD8<Float>(bPtr[8], bPtr[9], bPtr[10], bPtr[11], bPtr[12], bPtr[13], bPtr[14], bPtr[15])
-
-        switch ptr0 {
-        case .some(let p):
-            accumulateConv1Point(val: p[fSrc1], kt: 0, kf: 1, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc2], kt: 0, kf: 2, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-        case .none:
-            break
-        }
-
-        switch ptr1 {
-        case .some(let p):
-            accumulateConv1Point(val: p[fSrc1], kt: 1, kf: 1, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc2], kt: 1, kf: 2, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-        case .none:
-            break
-        }
-
-        switch ptr2 {
-        case .some(let p):
-            accumulateConv1Point(val: p[fSrc1], kt: 2, kf: 1, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-            accumulateConv1Point(val: p[fSrc2], kt: 2, kf: 2, wPtr: wPtr, acc0: &acc0, acc1: &acc1)
-        case .none:
-            break
-        }
+        acc1 += w1[0] * p0_0 + w1[1] * p0_1 + w1[2] * p0_2
+        acc1 += w1[3] * p1_0 + w1[4] * p1_1 + w1[5] * p1_2
+        acc1 += w1[6] * p2_0 + w1[7] * p2_1 + w1[8] * p2_2
 
         let zero = SIMD8<Float>(repeating: 0.0)
         let r0 = acc0.replacing(with: zero, where: acc0 .< zero)
         let r1 = acc1.replacing(with: zero, where: acc1 .< zero)
 
-        dst[0] = r0[0]
-        dst[1] = r0[1]
-        dst[2] = r0[2]
-        dst[3] = r0[3]
-        dst[4] = r0[4]
-        dst[5] = r0[5]
-        dst[6] = r0[6]
-        dst[7] = r0[7]
-
-        dst[8] = r1[0]
-        dst[9] = r1[1]
-        dst[10] = r1[2]
-        dst[11] = r1[3]
-        dst[12] = r1[4]
-        dst[13] = r1[5]
-        dst[14] = r1[6]
-        dst[15] = r1[7]
+        dst[0] = r0[0]; dst[1] = r0[1]; dst[2] = r0[2]; dst[3] = r0[3]
+        dst[4] = r0[4]; dst[5] = r0[5]; dst[6] = r0[6]; dst[7] = r0[7]
+        dst[8] = r1[0]; dst[9] = r1[1]; dst[10] = r1[2]; dst[11] = r1[3]
+        dst[12] = r1[4]; dst[13] = r1[5]; dst[14] = r1[6]; dst[15] = r1[7]
     }
 
     @inline(__always)
-    private func accumulateConv1Point(
-        val: Float,
-        kt: Int,
-        kf: Int,
-        wPtr: UnsafePointer<Float>,
-        acc0: inout SIMD8<Float>,
-        acc1: inout SIMD8<Float>
+    private func computeConv1CellTimeInnerBoundaryF0(
+        ptr0: UnsafePointer<Float>,
+        ptr1: UnsafePointer<Float>,
+        ptr2: UnsafePointer<Float>,
+        b0: SIMD8<Float>,
+        b1: SIMD8<Float>,
+        w0: [SIMD8<Float>],
+        w1: [SIMD8<Float>],
+        dst: UnsafeMutablePointer<Float>
     ) {
-        // conv1Weight shape: [16, 3, 3, 1]
-        // offset: cOut * 9 + kt * 3 + kf
-        let kOffset = kt * 3 + kf
-        let w0 = SIMD8<Float>(
-            wPtr[0 * 9 + kOffset], wPtr[1 * 9 + kOffset], wPtr[2 * 9 + kOffset], wPtr[3 * 9 + kOffset],
-            wPtr[4 * 9 + kOffset], wPtr[5 * 9 + kOffset], wPtr[6 * 9 + kOffset], wPtr[7 * 9 + kOffset]
-        )
-        let w1 = SIMD8<Float>(
-            wPtr[8 * 9 + kOffset], wPtr[9 * 9 + kOffset], wPtr[10 * 9 + kOffset], wPtr[11 * 9 + kOffset],
-            wPtr[12 * 9 + kOffset], wPtr[13 * 9 + kOffset], wPtr[14 * 9 + kOffset], wPtr[15 * 9 + kOffset]
-        )
-        acc0 += w0 * val
-        acc1 += w1 * val
+        let p0_1 = ptr0[0]
+        let p0_2 = ptr0[1]
+
+        let p1_1 = ptr1[0]
+        let p1_2 = ptr1[1]
+
+        let p2_1 = ptr2[0]
+        let p2_2 = ptr2[1]
+
+        var acc0 = b0
+        var acc1 = b1
+
+        acc0 += w0[1] * p0_1 + w0[2] * p0_2
+        acc0 += w0[4] * p1_1 + w0[5] * p1_2
+        acc0 += w0[7] * p2_1 + w0[8] * p2_2
+
+        acc1 += w1[1] * p0_1 + w1[2] * p0_2
+        acc1 += w1[4] * p1_1 + w1[5] * p1_2
+        acc1 += w1[7] * p2_1 + w1[8] * p2_2
+
+        let zero = SIMD8<Float>(repeating: 0.0)
+        let r0 = acc0.replacing(with: zero, where: acc0 .< zero)
+        let r1 = acc1.replacing(with: zero, where: acc1 .< zero)
+
+        dst[0] = r0[0]; dst[1] = r0[1]; dst[2] = r0[2]; dst[3] = r0[3]
+        dst[4] = r0[4]; dst[5] = r0[5]; dst[6] = r0[6]; dst[7] = r0[7]
+        dst[8] = r1[0]; dst[9] = r1[1]; dst[10] = r1[2]; dst[11] = r1[3]
+        dst[12] = r1[4]; dst[13] = r1[5]; dst[14] = r1[6]; dst[15] = r1[7]
+    }
+
+    @inline(__always)
+    private func computeConv1CellT0Inner(
+        ptr2: UnsafePointer<Float>,
+        f: Int,
+        b0: SIMD8<Float>,
+        b1: SIMD8<Float>,
+        w0: [SIMD8<Float>],
+        w1: [SIMD8<Float>],
+        dst: UnsafeMutablePointer<Float>
+    ) {
+        let f0 = 2 * f - 1
+        let f1 = 2 * f
+        let f2 = 2 * f + 1
+
+        let p2_0 = ptr2[f0]
+        let p2_1 = ptr2[f1]
+        let p2_2 = ptr2[f2]
+
+        var acc0 = b0
+        var acc1 = b1
+
+        acc0 += w0[6] * p2_0 + w0[7] * p2_1 + w0[8] * p2_2
+        acc1 += w1[6] * p2_0 + w1[7] * p2_1 + w1[8] * p2_2
+
+        let zero = SIMD8<Float>(repeating: 0.0)
+        let r0 = acc0.replacing(with: zero, where: acc0 .< zero)
+        let r1 = acc1.replacing(with: zero, where: acc1 .< zero)
+
+        dst[0] = r0[0]; dst[1] = r0[1]; dst[2] = r0[2]; dst[3] = r0[3]
+        dst[4] = r0[4]; dst[5] = r0[5]; dst[6] = r0[6]; dst[7] = r0[7]
+        dst[8] = r1[0]; dst[9] = r1[1]; dst[10] = r1[2]; dst[11] = r1[3]
+        dst[12] = r1[4]; dst[13] = r1[5]; dst[14] = r1[6]; dst[15] = r1[7]
+    }
+
+    @inline(__always)
+    private func computeConv1CellT0Boundary(
+        ptr2: UnsafePointer<Float>,
+        b0: SIMD8<Float>,
+        b1: SIMD8<Float>,
+        w0: [SIMD8<Float>],
+        w1: [SIMD8<Float>],
+        dst: UnsafeMutablePointer<Float>
+    ) {
+        let p2_1 = ptr2[0]
+        let p2_2 = ptr2[1]
+
+        var acc0 = b0
+        var acc1 = b1
+
+        acc0 += w0[7] * p2_1 + w0[8] * p2_2
+        acc1 += w1[7] * p2_1 + w1[8] * p2_2
+
+        let zero = SIMD8<Float>(repeating: 0.0)
+        let r0 = acc0.replacing(with: zero, where: acc0 .< zero)
+        let r1 = acc1.replacing(with: zero, where: acc1 .< zero)
+
+        dst[0] = r0[0]; dst[1] = r0[1]; dst[2] = r0[2]; dst[3] = r0[3]
+        dst[4] = r0[4]; dst[5] = r0[5]; dst[6] = r0[6]; dst[7] = r0[7]
+        dst[8] = r1[0]; dst[9] = r1[1]; dst[10] = r1[2]; dst[11] = r1[3]
+        dst[12] = r1[4]; dst[13] = r1[5]; dst[14] = r1[6]; dst[15] = r1[7]
     }
 
     // MARK: - Hot Path 内部処理: Conv2
@@ -476,38 +505,31 @@ public final class Conv2DSubsampling: @unchecked Sendable {
                     output.withUnsafeMutableBufferPointer { outBuf in
                         let outPtr = outBuf.baseAddress!
 
-                        var t = 0
+                        // 1. 時間境界: t = 0 (tSrc0, tSrc1 はパディング、tSrc2 = 0 のみ有効)
+                        if 0 < t2 {
+                            let ptr2 = inPtr
+                            computeConv2CellT0Boundary(ptr2: ptr2, wPtr: wPtr, bPtr: bPtr, dst: outPtr)
+                            var f = 1
+                            while f < f2Count {
+                                computeConv2CellT0Inner(ptr2: ptr2, f: f, wPtr: wPtr, bPtr: bPtr, dst: outPtr.advanced(by: f * c2Count))
+                                f += 1
+                            }
+                        }
+
+                        // 2. 時間内部: 1 <= t < t2 (ptr0, ptr1, ptr2 すべて非 nil)
+                        var t = 1
                         while t < t2 {
                             let tSrc0 = 2 * t - 2
                             let tSrc1 = 2 * t - 1
                             let tSrc2 = 2 * t
 
-                            let ptr0: UnsafePointer<Float>?
-                            if 0 <= tSrc0 && tSrc0 < t1 {
-                                ptr0 = inPtr.advanced(by: tSrc0 * f1Count * c1Count)
-                            } else {
-                                ptr0 = nil
-                            }
-
-                            let ptr1: UnsafePointer<Float>?
-                            if 0 <= tSrc1 && tSrc1 < t1 {
-                                ptr1 = inPtr.advanced(by: tSrc1 * f1Count * c1Count)
-                            } else {
-                                ptr1 = nil
-                            }
-
-                            let ptr2: UnsafePointer<Float>?
-                            if 0 <= tSrc2 && tSrc2 < t1 {
-                                ptr2 = inPtr.advanced(by: tSrc2 * f1Count * c1Count)
-                            } else {
-                                ptr2 = nil
-                            }
-
+                            let ptr0 = inPtr.advanced(by: tSrc0 * f1Count * c1Count)
+                            let ptr1 = inPtr.advanced(by: tSrc1 * f1Count * c1Count)
+                            let ptr2 = inPtr.advanced(by: tSrc2 * f1Count * c1Count)
                             let tOutOffset = t * f2Count * c2Count
 
-                            // 境界セル: f = 0 (fSrc0 = -1 でゼロパディング)
-                            computeConv2CellBoundary(
-                                f: 0,
+                            // f = 0 (周波数境界: fSrc0 = -1 でゼロパディング)
+                            computeConv2CellTimeInnerBoundaryF0(
                                 ptr0: ptr0,
                                 ptr1: ptr1,
                                 ptr2: ptr2,
@@ -516,17 +538,17 @@ public final class Conv2DSubsampling: @unchecked Sendable {
                                 dst: outPtr.advanced(by: tOutOffset)
                             )
 
-                            // 内部セル: f = 1..<16
+                            // f = 1..<16 (周波数内部: 境界外なし、完全アンロール)
                             var f = 1
                             while f < f2Count {
-                                computeConv2CellInner(
-                                f: f,
-                                ptr0: ptr0,
-                                ptr1: ptr1,
-                                ptr2: ptr2,
-                                wPtr: wPtr,
-                                bPtr: bPtr,
-                                dst: outPtr.advanced(by: tOutOffset + (f * c2Count))
+                                computeConv2CellTimeInnerPure(
+                                    ptr0: ptr0,
+                                    ptr1: ptr1,
+                                    ptr2: ptr2,
+                                    f: f,
+                                    wPtr: wPtr,
+                                    bPtr: bPtr,
+                                    dst: outPtr.advanced(by: tOutOffset + (f * c2Count))
                                 )
                                 f += 1
                             }
@@ -542,133 +564,155 @@ public final class Conv2DSubsampling: @unchecked Sendable {
     }
 
     @inline(__always)
-    private func computeConv2CellInner(
+    private func computeConv2CellTimeInnerPure(
+        ptr0: UnsafePointer<Float>,
+        ptr1: UnsafePointer<Float>,
+        ptr2: UnsafePointer<Float>,
         f: Int,
-        ptr0: UnsafePointer<Float>?,
-        ptr1: UnsafePointer<Float>?,
-        ptr2: UnsafePointer<Float>?,
         wPtr: UnsafePointer<Float>,
         bPtr: UnsafePointer<Float>,
         dst: UnsafeMutablePointer<Float>
     ) {
-        let fSrc0 = 2 * f - 1
-        let fSrc1 = 2 * f
-        let fSrc2 = 2 * f + 1
-        let c1Count = 16
+        let f0 = (2 * f - 1) * 16
+        let f1 = (2 * f) * 16
+        let f2 = (2 * f + 1) * 16
 
-        let p0_0 = ptr0?.advanced(by: fSrc0 * c1Count)
-        let p0_1 = ptr0?.advanced(by: fSrc1 * c1Count)
-        let p0_2 = ptr0?.advanced(by: fSrc2 * c1Count)
+        let p0_0 = ptr0.advanced(by: f0)
+        let p0_1 = ptr0.advanced(by: f1)
+        let p0_2 = ptr0.advanced(by: f2)
 
-        let p1_0 = ptr1?.advanced(by: fSrc0 * c1Count)
-        let p1_1 = ptr1?.advanced(by: fSrc1 * c1Count)
-        let p1_2 = ptr1?.advanced(by: fSrc2 * c1Count)
+        let p1_0 = ptr1.advanced(by: f0)
+        let p1_1 = ptr1.advanced(by: f1)
+        let p1_2 = ptr1.advanced(by: f2)
 
-        let p2_0 = ptr2?.advanced(by: fSrc0 * c1Count)
-        let p2_1 = ptr2?.advanced(by: fSrc1 * c1Count)
-        let p2_2 = ptr2?.advanced(by: fSrc2 * c1Count)
+        let p2_0 = ptr2.advanced(by: f0)
+        let p2_1 = ptr2.advanced(by: f1)
+        let p2_2 = ptr2.advanced(by: f2)
 
         var cOut = 0
         while cOut < 16 {
             var sum = bPtr[cOut]
-            let wBase = cOut * 3 * 3 * c1Count
+            let wBase = cOut * 144
 
-            switch p0_0 {
-            case .some(let p0):
-                sum += dotProduct16(input: p0, weight: wPtr.advanced(by: wBase + (0 * 3 + 0) * c1Count))
-                sum += dotProduct16(input: p0_1!, weight: wPtr.advanced(by: wBase + (0 * 3 + 1) * c1Count))
-                sum += dotProduct16(input: p0_2!, weight: wPtr.advanced(by: wBase + (0 * 3 + 2) * c1Count))
-            case .none:
-                break
-            }
+            sum += dotProduct16(input: p0_0, weight: wPtr.advanced(by: wBase + 0))
+            sum += dotProduct16(input: p0_1, weight: wPtr.advanced(by: wBase + 16))
+            sum += dotProduct16(input: p0_2, weight: wPtr.advanced(by: wBase + 32))
 
-            switch p1_0 {
-            case .some(let p1):
-                sum += dotProduct16(input: p1, weight: wPtr.advanced(by: wBase + (1 * 3 + 0) * c1Count))
-                sum += dotProduct16(input: p1_1!, weight: wPtr.advanced(by: wBase + (1 * 3 + 1) * c1Count))
-                sum += dotProduct16(input: p1_2!, weight: wPtr.advanced(by: wBase + (1 * 3 + 2) * c1Count))
-            case .none:
-                break
-            }
+            sum += dotProduct16(input: p1_0, weight: wPtr.advanced(by: wBase + 48))
+            sum += dotProduct16(input: p1_1, weight: wPtr.advanced(by: wBase + 64))
+            sum += dotProduct16(input: p1_2, weight: wPtr.advanced(by: wBase + 80))
 
-            switch p2_0 {
-            case .some(let p2):
-                sum += dotProduct16(input: p2, weight: wPtr.advanced(by: wBase + (2 * 3 + 0) * c1Count))
-                sum += dotProduct16(input: p2_1!, weight: wPtr.advanced(by: wBase + (2 * 3 + 1) * c1Count))
-                sum += dotProduct16(input: p2_2!, weight: wPtr.advanced(by: wBase + (2 * 3 + 2) * c1Count))
-            case .none:
-                break
-            }
+            sum += dotProduct16(input: p2_0, weight: wPtr.advanced(by: wBase + 96))
+            sum += dotProduct16(input: p2_1, weight: wPtr.advanced(by: wBase + 112))
+            sum += dotProduct16(input: p2_2, weight: wPtr.advanced(by: wBase + 128))
 
-            // ReLU
             if sum < 0.0 {
                 dst[cOut] = 0.0
             } else {
                 dst[cOut] = sum
             }
-
             cOut += 1
         }
     }
 
     @inline(__always)
-    private func computeConv2CellBoundary(
-        f: Int,
-        ptr0: UnsafePointer<Float>?,
-        ptr1: UnsafePointer<Float>?,
-        ptr2: UnsafePointer<Float>?,
+    private func computeConv2CellTimeInnerBoundaryF0(
+        ptr0: UnsafePointer<Float>,
+        ptr1: UnsafePointer<Float>,
+        ptr2: UnsafePointer<Float>,
         wPtr: UnsafePointer<Float>,
         bPtr: UnsafePointer<Float>,
         dst: UnsafeMutablePointer<Float>
     ) {
-        let fSrc1 = 2 * f
-        let fSrc2 = 2 * f + 1
-        let c1Count = 16
+        let p0_1 = ptr0
+        let p0_2 = ptr0.advanced(by: 16)
 
-        let p0_1 = ptr0?.advanced(by: fSrc1 * c1Count)
-        let p0_2 = ptr0?.advanced(by: fSrc2 * c1Count)
+        let p1_1 = ptr1
+        let p1_2 = ptr1.advanced(by: 16)
 
-        let p1_1 = ptr1?.advanced(by: fSrc1 * c1Count)
-        let p1_2 = ptr1?.advanced(by: fSrc2 * c1Count)
-
-        let p2_1 = ptr2?.advanced(by: fSrc1 * c1Count)
-        let p2_2 = ptr2?.advanced(by: fSrc2 * c1Count)
+        let p2_1 = ptr2
+        let p2_2 = ptr2.advanced(by: 16)
 
         var cOut = 0
         while cOut < 16 {
             var sum = bPtr[cOut]
-            let wBase = cOut * 3 * 3 * c1Count
+            let wBase = cOut * 144
 
-            switch p0_1 {
-            case .some(let p):
-                sum += dotProduct16(input: p, weight: wPtr.advanced(by: wBase + (0 * 3 + 1) * c1Count))
-                sum += dotProduct16(input: p0_2!, weight: wPtr.advanced(by: wBase + (0 * 3 + 2) * c1Count))
-            case .none:
-                break
-            }
+            sum += dotProduct16(input: p0_1, weight: wPtr.advanced(by: wBase + 16))
+            sum += dotProduct16(input: p0_2, weight: wPtr.advanced(by: wBase + 32))
 
-            switch p1_1 {
-            case .some(let p):
-                sum += dotProduct16(input: p, weight: wPtr.advanced(by: wBase + (1 * 3 + 1) * c1Count))
-                sum += dotProduct16(input: p1_2!, weight: wPtr.advanced(by: wBase + (1 * 3 + 2) * c1Count))
-            case .none:
-                break
-            }
+            sum += dotProduct16(input: p1_1, weight: wPtr.advanced(by: wBase + 64))
+            sum += dotProduct16(input: p1_2, weight: wPtr.advanced(by: wBase + 80))
 
-            switch p2_1 {
-            case .some(let p):
-                sum += dotProduct16(input: p, weight: wPtr.advanced(by: wBase + (2 * 3 + 1) * c1Count))
-                sum += dotProduct16(input: p2_2!, weight: wPtr.advanced(by: wBase + (2 * 3 + 2) * c1Count))
-            case .none:
-                break
-            }
+            sum += dotProduct16(input: p2_1, weight: wPtr.advanced(by: wBase + 112))
+            sum += dotProduct16(input: p2_2, weight: wPtr.advanced(by: wBase + 128))
 
             if sum < 0.0 {
                 dst[cOut] = 0.0
             } else {
                 dst[cOut] = sum
             }
+            cOut += 1
+        }
+    }
 
+    @inline(__always)
+    private func computeConv2CellT0Inner(
+        ptr2: UnsafePointer<Float>,
+        f: Int,
+        wPtr: UnsafePointer<Float>,
+        bPtr: UnsafePointer<Float>,
+        dst: UnsafeMutablePointer<Float>
+    ) {
+        let f0 = (2 * f - 1) * 16
+        let f1 = (2 * f) * 16
+        let f2 = (2 * f + 1) * 16
+
+        let p2_0 = ptr2.advanced(by: f0)
+        let p2_1 = ptr2.advanced(by: f1)
+        let p2_2 = ptr2.advanced(by: f2)
+
+        var cOut = 0
+        while cOut < 16 {
+            var sum = bPtr[cOut]
+            let wBase = cOut * 144
+
+            sum += dotProduct16(input: p2_0, weight: wPtr.advanced(by: wBase + 96))
+            sum += dotProduct16(input: p2_1, weight: wPtr.advanced(by: wBase + 112))
+            sum += dotProduct16(input: p2_2, weight: wPtr.advanced(by: wBase + 128))
+
+            if sum < 0.0 {
+                dst[cOut] = 0.0
+            } else {
+                dst[cOut] = sum
+            }
+            cOut += 1
+        }
+    }
+
+    @inline(__always)
+    private func computeConv2CellT0Boundary(
+        ptr2: UnsafePointer<Float>,
+        wPtr: UnsafePointer<Float>,
+        bPtr: UnsafePointer<Float>,
+        dst: UnsafeMutablePointer<Float>
+    ) {
+        let p2_1 = ptr2
+        let p2_2 = ptr2.advanced(by: 16)
+
+        var cOut = 0
+        while cOut < 16 {
+            var sum = bPtr[cOut]
+            let wBase = cOut * 144
+
+            sum += dotProduct16(input: p2_1, weight: wPtr.advanced(by: wBase + 112))
+            sum += dotProduct16(input: p2_2, weight: wPtr.advanced(by: wBase + 128))
+
+            if sum < 0.0 {
+                dst[cOut] = 0.0
+            } else {
+                dst[cOut] = sum
+            }
             cOut += 1
         }
     }
@@ -733,14 +777,8 @@ public final class Conv2DSubsampling: @unchecked Sendable {
 
         // Conv1 出力を計算
         let t1Idx = state.totalConv1Frames
-        let tSrc0 = 2 * t1Idx - 2
-        let tSrc1 = 2 * t1Idx - 1
-        let tSrc2 = 2 * t1Idx
-
         let c1Out = computeStreamingConv1Frame(
-            tSrc0: tSrc0,
-            tSrc1: tSrc1,
-            tSrc2: tSrc2,
+            t1Idx: t1Idx,
             frames: state.pastMelFrames
         )
 
@@ -760,14 +798,8 @@ public final class Conv2DSubsampling: @unchecked Sendable {
 
         // Conv2 出力を計算
         let t2Idx = tConv1 / 2
-        let ctSrc0 = 2 * t2Idx - 2
-        let ctSrc1 = 2 * t2Idx - 1
-        let ctSrc2 = 2 * t2Idx
-
         let c2Out = computeStreamingConv2Frame(
-            ctSrc0: ctSrc0,
-            ctSrc1: ctSrc1,
-            ctSrc2: ctSrc2,
+            t2Idx: t2Idx,
             frames: state.pastConv1Frames
         )
 
@@ -798,78 +830,66 @@ public final class Conv2DSubsampling: @unchecked Sendable {
         return projOut
     }
 
-    @inline(__always)
-    private func withOptionalPointer<R>(
-        _ array: [Float]?,
-        _ body: (UnsafePointer<Float>?) -> R
-    ) -> R {
-        switch array {
-        case .some(let a):
-            return a.withUnsafeBufferPointer { buf in
-                body(buf.baseAddress)
-            }
-        case .none:
-            return body(nil)
-        }
-    }
-
     private func computeStreamingConv1Frame(
-        tSrc0: Int,
-        tSrc1: Int,
-        tSrc2: Int,
+        t1Idx: Int,
         frames: [[Float]]
     ) -> [Float] {
         let fOutCount = 32
         let cOutCount = 16
         var output = [Float](repeating: 0.0, count: fOutCount * cOutCount)
-
         let count = frames.count
-        var frame0: [Float]? = nil
-        if 0 <= tSrc0 && 3 <= count {
-            frame0 = frames[count - 3]
-        }
-        var frame1: [Float]? = nil
-        if 0 <= tSrc1 && 2 <= count {
-            frame1 = frames[count - 2]
-        }
-        var frame2: [Float]? = nil
-        if 0 <= tSrc2 && 1 <= count {
-            frame2 = frames[count - 1]
-        }
 
-        withOptionalPointer(frame0) { ptr0 in
-            withOptionalPointer(frame1) { ptr1 in
-                withOptionalPointer(frame2) { ptr2 in
-                    conv1Weight.withUnsafeBufferPointer { wBuf in
-                        let wPtr = wBuf.baseAddress!
-                        conv1Bias.withUnsafeBufferPointer { bBuf in
-                            let bPtr = bBuf.baseAddress!
-                            output.withUnsafeMutableBufferPointer { outBuf in
-                                let outPtr = outBuf.baseAddress!
+        let b0 = conv1BiasSIMD0
+        let b1 = conv1BiasSIMD1
+        let w0 = conv1SIMD0
+        let w1 = conv1SIMD1
 
-                                computeConv1CellBoundary(
-                                    f: 0,
+        output.withUnsafeMutableBufferPointer { outBuf in
+            let outPtr = outBuf.baseAddress!
+
+            if 0 == t1Idx {
+                frames[count - 1].withUnsafeBufferPointer { p2Buf in
+                    let ptr2 = p2Buf.baseAddress!
+                    computeConv1CellT0Boundary(ptr2: ptr2, b0: b0, b1: b1, w0: w0, w1: w1, dst: outPtr)
+                    var f = 1
+                    while f < fOutCount {
+                        computeConv1CellT0Inner(ptr2: ptr2, f: f, b0: b0, b1: b1, w0: w0, w1: w1, dst: outPtr.advanced(by: f * cOutCount))
+                        f += 1
+                    }
+                }
+            } else {
+                frames[count - 3].withUnsafeBufferPointer { p0Buf in
+                    let ptr0 = p0Buf.baseAddress!
+                    frames[count - 2].withUnsafeBufferPointer { p1Buf in
+                        let ptr1 = p1Buf.baseAddress!
+                        frames[count - 1].withUnsafeBufferPointer { p2Buf in
+                            let ptr2 = p2Buf.baseAddress!
+
+                            computeConv1CellTimeInnerBoundaryF0(
+                                ptr0: ptr0,
+                                ptr1: ptr1,
+                                ptr2: ptr2,
+                                b0: b0,
+                                b1: b1,
+                                w0: w0,
+                                w1: w1,
+                                dst: outPtr
+                            )
+
+                            var f = 1
+                            while f < fOutCount {
+                                computeConv1CellTimeInnerPure(
                                     ptr0: ptr0,
                                     ptr1: ptr1,
                                     ptr2: ptr2,
-                                    wPtr: wPtr,
-                                    bPtr: bPtr,
-                                    dst: outPtr
+                                    f: f,
+                                    b0: b0,
+                                    b1: b1,
+                                    w0: w0,
+                                    w1: w1,
+                                    dst: outPtr.advanced(by: f * cOutCount)
                                 )
-
-                                var f = 1
-                                while f < fOutCount {
-                                    computeConv1CellInner(
-                                        f: f,
-                                        ptr0: ptr0,
-                                        ptr1: ptr1,
-                                        ptr2: ptr2,
-                                        wPtr: wPtr,
-                                        bPtr: bPtr,
-                                        dst: outPtr.advanced(by: f * cOutCount)
-                                    )
-                                    f += 1
-                                }
+                                f += 1
                             }
                         }
                     }
@@ -881,61 +901,61 @@ public final class Conv2DSubsampling: @unchecked Sendable {
     }
 
     private func computeStreamingConv2Frame(
-        ctSrc0: Int,
-        ctSrc1: Int,
-        ctSrc2: Int,
+        t2Idx: Int,
         frames: [[Float]]
     ) -> [Float] {
         let f2Count = 16
         let c2Count = 16
         var output = [Float](repeating: 0.0, count: f2Count * c2Count)
-
         let count = frames.count
-        var frame0: [Float]? = nil
-        if 0 <= ctSrc0 && 3 <= count {
-            frame0 = frames[count - 3]
-        }
-        var frame1: [Float]? = nil
-        if 0 <= ctSrc1 && 2 <= count {
-            frame1 = frames[count - 2]
-        }
-        var frame2: [Float]? = nil
-        if 0 <= ctSrc2 && 1 <= count {
-            frame2 = frames[count - 1]
-        }
 
-        withOptionalPointer(frame0) { ptr0 in
-            withOptionalPointer(frame1) { ptr1 in
-                withOptionalPointer(frame2) { ptr2 in
-                    conv2Weight.withUnsafeBufferPointer { wBuf in
-                        let wPtr = wBuf.baseAddress!
-                        conv2Bias.withUnsafeBufferPointer { bBuf in
-                            let bPtr = bBuf.baseAddress!
-                            output.withUnsafeMutableBufferPointer { outBuf in
-                                let outPtr = outBuf.baseAddress!
+        conv2Weight.withUnsafeBufferPointer { wBuf in
+            let wPtr = wBuf.baseAddress!
+            conv2Bias.withUnsafeBufferPointer { bBuf in
+                let bPtr = bBuf.baseAddress!
+                output.withUnsafeMutableBufferPointer { outBuf in
+                    let outPtr = outBuf.baseAddress!
 
-                                computeConv2CellBoundary(
-                                    f: 0,
-                                    ptr0: ptr0,
-                                    ptr1: ptr1,
-                                    ptr2: ptr2,
-                                    wPtr: wPtr,
-                                    bPtr: bPtr,
-                                    dst: outPtr
-                                )
+                    if 0 == t2Idx {
+                        frames[count - 1].withUnsafeBufferPointer { p2Buf in
+                            let ptr2 = p2Buf.baseAddress!
+                            computeConv2CellT0Boundary(ptr2: ptr2, wPtr: wPtr, bPtr: bPtr, dst: outPtr)
+                            var f = 1
+                            while f < f2Count {
+                                computeConv2CellT0Inner(ptr2: ptr2, f: f, wPtr: wPtr, bPtr: bPtr, dst: outPtr.advanced(by: f * c2Count))
+                                f += 1
+                            }
+                        }
+                    } else {
+                        frames[count - 3].withUnsafeBufferPointer { p0Buf in
+                            let ptr0 = p0Buf.baseAddress!
+                            frames[count - 2].withUnsafeBufferPointer { p1Buf in
+                                let ptr1 = p1Buf.baseAddress!
+                                frames[count - 1].withUnsafeBufferPointer { p2Buf in
+                                    let ptr2 = p2Buf.baseAddress!
 
-                                var f = 1
-                                while f < f2Count {
-                                    computeConv2CellInner(
-                                        f: f,
+                                    computeConv2CellTimeInnerBoundaryF0(
                                         ptr0: ptr0,
                                         ptr1: ptr1,
                                         ptr2: ptr2,
                                         wPtr: wPtr,
                                         bPtr: bPtr,
-                                        dst: outPtr.advanced(by: f * c2Count)
+                                        dst: outPtr
                                     )
-                                    f += 1
+
+                                    var f = 1
+                                    while f < f2Count {
+                                        computeConv2CellTimeInnerPure(
+                                            ptr0: ptr0,
+                                            ptr1: ptr1,
+                                            ptr2: ptr2,
+                                            f: f,
+                                            wPtr: wPtr,
+                                            bPtr: bPtr,
+                                            dst: outPtr.advanced(by: f * c2Count)
+                                        )
+                                        f += 1
+                                    }
                                 }
                             }
                         }

@@ -895,6 +895,7 @@ public final class KanaKanjiDecoder: @unchecked Sendable {
     }
 
     /// 音響 SNN の出力かな文字列から漢字かな混じり文を復元する
+    @discardableResult
     public func decode(kanaText: String) -> String {
         let hyp = AcousticHypothesis(text: kanaText, tokens: [], acousticScore: 0.0, score: 0.0)
         let candidates = rescoreNBest(hypotheses: [hyp], kanjiBeamWidth: Self.defaultBeamWidth)

@@ -296,7 +296,7 @@ final class Tier3CombinationTests: XCTestCase {
                     let solverSuccess = solver.solve(coefficients: cPtr.baseAddress!, order: config.lpcOrder, workspace: workspace)
                     if solverSuccess {
                         workspace.durandKernerCurr.withUnsafeBufferPointer { rPtr in
-                            _ = extractor.extractFormants(roots: rPtr.baseAddress!, count: config.lpcOrder)
+                            extractor.extractFormants(roots: rPtr.baseAddress!, count: config.lpcOrder)
                             filterbank.extractFeatures(pcmPtr: buf.baseAddress!, count: config.frameSize, workspace: workspace)
                             XCTAssertEqual(workspace.featureBuffer.count, 64)
                         }

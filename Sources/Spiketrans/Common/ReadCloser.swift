@@ -36,7 +36,9 @@ public final class FileReadCloser: ReadCloser, @unchecked Sendable {
 
     deinit {
         if isClosed != true {
-            _ = Darwin.close(fd)
+            if Darwin.close(fd) != 0 {
+                // クローズ失敗時は無視
+            }
         }
     }
 

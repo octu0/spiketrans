@@ -85,7 +85,11 @@ final class CTCLossTests: XCTestCase {
             let peak = (t / 5) % vocab.size
             frame[peak] = -0.2
             frame[(peak + 1) % vocab.size] = -1.5
-            frame[0] = (t % 3 == 0) ? -0.5 : -3.0
+            if t % 3 == 0 {
+                frame[0] = -0.5
+            } else {
+                frame[0] = -3.0
+            }
             logProbs.append(frame)
             t += 1
         }
