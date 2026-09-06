@@ -347,8 +347,8 @@ final class MLXCompileBPTTTests: XCTestCase {
         // Warmup 2 回
         var w = 0
         while w < 2 {
-            _ = trainerEager.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: false)
-            _ = trainerCompiled.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: true)
+            trainerEager.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: false)
+            trainerCompiled.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: true)
             w += 1
         }
 
@@ -357,7 +357,7 @@ final class MLXCompileBPTTTests: XCTestCase {
         var i = 0
         while i < 5 {
             let t0 = CFAbsoluteTimeGetCurrent()
-            _ = trainerEager.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: false)
+            trainerEager.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: false)
             let t1 = CFAbsoluteTimeGetCurrent()
             eagerTimes.append((t1 - t0) * 1000.0)
             i += 1
@@ -368,7 +368,7 @@ final class MLXCompileBPTTTests: XCTestCase {
         i = 0
         while i < 5 {
             let t0 = CFAbsoluteTimeGetCurrent()
-            _ = trainerCompiled.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: true)
+            trainerCompiled.trainBatchCTC(featuresBatch: batch, targetsBatch: targets, compiled: true)
             let t1 = CFAbsoluteTimeGetCurrent()
             compiledTimes.append((t1 - t0) * 1000.0)
             i += 1

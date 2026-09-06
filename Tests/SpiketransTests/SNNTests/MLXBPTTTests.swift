@@ -5,7 +5,6 @@ import MLX
 final class MLXBPTTTests: XCTestCase {
     override func setUp() {
         super.setUp()
-        Device.setDefault(device: .cpu)
     }
 
     func testMLXNetworkForwardAndExportImport() throws {

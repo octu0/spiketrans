@@ -49,7 +49,19 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
     public private(set) var sentenceFinalPunctuation: Character? = nil
     public private(set) var sentenceFinalRate: Float = 0.0
 
-    public init() {}
+    public init(includeSeed: Bool = true) {
+        if includeSeed {
+            loadSeedVocabulary()
+        }
+    }
+
+    /// 静的シード辞書テーブルを辞書にロードして統合
+    public func loadSeedVocabulary() {
+        for entry in SeedVocabulary.entries {
+            addEntry(entry)
+        }
+        vocabularySize = surfaceTotals.count
+    }
 
     public var count: Int {
         return entriesByReading.count
@@ -407,9 +419,14 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
             return 0.35
         }
 
-        // 促音・長音・撥音・重複母音のゆらぎ
-        let specialChars: Set<Character> = ["っ", "ー", "ん", "う", "い"]
-        if specialChars.contains(c1) || specialChars.contains(c2) {
+        // 促音・長音・撥音・重複母音のゆらぎ (長音と母音、またはっ-つ、ん-む等)
+        let vowels: Set<Character> = ["あ", "い", "う", "え", "お"]
+        let isProlongedVowel = (c1 == "ー" && vowels.contains(c2)) || (c2 == "ー" && vowels.contains(c1))
+        let specialPairs: Set<String> = [
+            "ーう", "ーお", "ーい", "ーえ", "ーあ",
+            "っつ", "んむ", "んう"
+        ]
+        if isProlongedVowel || specialPairs.contains(pairStr) || specialPairs.contains(revPairStr) {
             return 0.40
         }
 

@@ -172,7 +172,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     ) -> MLXArray {
         let logits = logitsBatch(network: network, features: features)
 
-        // 重み: targets == -1 (パディング) は 0.0, targets == 0 (padId) は 0.3, targets > 0 は 1.0
+        // 重み: targets == -1 (パディング) は 0.0, targets == 0 (padId) は 0.3, 0 < targets は 1.0
         let weights = which(targets .== -1, MLXArray(0.0), which(targets .== 0, MLXArray(0.3), MLXArray(1.0)))
         let totalWeight = sum(weights) + 1e-6
         let cleanTargets = clip(targets, min: 0, max: Float(network.outputDim - 1)).asType(.int32)
@@ -253,6 +253,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// ロジットを CPU へ取り出す必要もない。
     ///
     /// - Parameter targetsBatch: フレームに整列していないラベル列 (かな ID 列)。
+    @discardableResult
     public func trainBatchCTC(
         featuresBatch: [[[Float]]],
         targetsBatch: [[Int]],
