@@ -91,7 +91,7 @@ public struct InverseTextNormalizer: Sendable {
     /// 漢数字文字を数値に変換 (0〜9、それ以外は nil)
     private static func kanjiDigitValue(_ ch: Character) -> Int? {
         switch ch {
-        case "零", "0", "０":
+        case "〇", "零", "0", "０":
             return 0
         case "一", "壱", "1", "１":
             return 1

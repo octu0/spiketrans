@@ -41,24 +41,51 @@ public final class SpeechDataset: @unchecked Sendable {
         public let textIds: [Int]
         public let phonemeIds: [Int]
         public let frameCount: Int
+
+        public init(
+            path: String,
+            rawText: String,
+            hiraganaText: String,
+            textIds: [Int],
+            phonemeIds: [Int],
+            frameCount: Int
+        ) {
+            self.path = (path as NSString).standardizingPath
+            self.rawText = rawText
+            self.hiraganaText = hiraganaText
+            self.textIds = textIds
+            self.phonemeIds = phonemeIds
+            self.frameCount = frameCount
+        }
     }
 
     public let samples: [AudioTextSample]
     public let metaSamples: [SampleMeta]
     public let lazyFrameStack: Int
+    public let cache: FeatureDiskCache?
+    public let maxCacheGigabytes: Double
     private let isLazy: Bool
 
     public init(samples: [AudioTextSample]) {
         self.samples = samples
         self.metaSamples = []
         self.lazyFrameStack = 1
+        self.cache = nil
+        self.maxCacheGigabytes = 0.0
         self.isLazy = false
     }
 
-    public init(metaSamples: [SampleMeta], frameStack: Int) {
+    public init(
+        metaSamples: [SampleMeta],
+        frameStack: Int,
+        cache: FeatureDiskCache? = nil,
+        maxCacheGigabytes: Double = 0.0
+    ) {
         self.samples = []
         self.metaSamples = metaSamples
         self.lazyFrameStack = frameStack
+        self.cache = cache
+        self.maxCacheGigabytes = maxCacheGigabytes
         self.isLazy = true
     }
 
@@ -85,14 +112,35 @@ public final class SpeechDataset: @unchecked Sendable {
         return samples[index].hiraganaText
     }
 
+    /// 特徴量を生成せずに漢字テキストトークン ID 列を返す (言語 SNN 学習用)
+    public func textIds(at index: Int) -> [Int] {
+        if isLazy {
+            return metaSamples[index].textIds
+        }
+        return samples[index].textIds
+    }
+
     /// 遅延モードでは呼び出しごとに WAV を読み特徴量を生成する。
-    /// 返り値を保持しない限りメモリには残らない
+    /// キャッシュが存在する場合はディスクから特徴量を直読する (PCM はオンデマンドでのみ生成)
     public subscript(index: Int) -> AudioTextSample {
+        return sample(at: index, loadPCM: false)
+    }
+
+    /// インデックス指定でサンプルを取得する。
+    /// - Parameter loadPCM: キャッシュヒット時でも PCM データをデコードするかどうか。
+    ///   通常の学習（SNN / CTC）では特徴量のみが必要なため `false` を推奨し、
+    ///   フォルマント境界検出等の診断処理でのみ `true` を指定する。
+    public func sample(at index: Int, loadPCM: Bool = false) -> AudioTextSample {
         if isLazy != true {
             return samples[index]
         }
         let meta = metaSamples[index]
-        let (pcm16k, features) = Self.loadFeatures(path: meta.path, frameStack: lazyFrameStack)
+        let (pcm16k, features) = Self.loadFeatures(
+            path: meta.path,
+            frameStack: lazyFrameStack,
+            cache: cache,
+            loadPCM: loadPCM
+        )
         return AudioTextSample(
             audioPCM: pcm16k,
             rawText: meta.rawText,
@@ -103,24 +151,107 @@ public final class SpeechDataset: @unchecked Sendable {
         )
     }
 
-    /// WAV ファイルを読み込んで 16kHz PCM と音響特徴量を生成する
-    public static func loadFeatures(path: String, frameStack: Int) -> (pcm: [Float], features: [[Float]]) {
+    /// WAV ファイルまたはディスクキャッシュから音響特徴量をロードする
+    public static func loadFeatures(
+        path: String,
+        frameStack: Int,
+        cache: FeatureDiskCache? = nil,
+        loadPCM: Bool = false
+    ) -> (pcm: [Float], features: [[Float]]) {
+        if let c = cache, let cached = c.load(path: path, frameStack: frameStack) {
+            var pcm16k: [Float] = []
+            if loadPCM {
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                   let wav = try? WavParser().parse(bytes: [UInt8](data)) {
+                    pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
+                }
+            }
+            return (pcm16k, cached)
+        }
+
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let wav = try? WavParser().parse(bytes: [UInt8](data)) else {
             return ([], [])
         }
         let pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
-        return (pcm16k, extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack))
+        let features = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack)
+        if let c = cache {
+            if 0 < features.count {
+                c.save(path: path, frameStack: frameStack, features: features)
+            }
+        }
+        return (pcm16k, features)
+    }
+
+    /// サンプル一覧からフレーム数の降順（長い順）に、指定容量（GB）に収まる長尺音声をキャッシュ対象として選別する
+    public static func selectQuotaPaths(
+        metas: [SampleMeta],
+        frameStack: Int,
+        maxGigabytes: Double
+    ) -> Set<String> {
+        if maxGigabytes <= 0.0 {
+            var allPaths = Set<String>()
+            allPaths.reserveCapacity(metas.count)
+            for m in metas {
+                allPaths.insert(m.path)
+            }
+            return allPaths
+        }
+
+        let maxBytesDouble = maxGigabytes * 1024.0 * 1024.0 * 1024.0
+        let maxBytes: Int64
+        if Double(Int64.max) < maxBytesDouble {
+            maxBytes = Int64.max
+        } else {
+            maxBytes = Int64(maxBytesDouble)
+        }
+
+        // 長尺（frameCount が大きい）順にソート (比較演算子は < のみ使用)
+        let sorted = metas.sorted { a, b in
+            if a.frameCount < b.frameCount {
+                return false
+            }
+            if b.frameCount < a.frameCount {
+                return true
+            }
+            return a.path < b.path
+        }
+
+        var seenPaths = Set<String>()
+        seenPaths.reserveCapacity(sorted.count)
+        var accumulatedBytes: Int64 = 0
+        var selected = Set<String>()
+
+        for item in sorted {
+            if seenPaths.insert(item.path).inserted != true {
+                continue
+            }
+            let itemBytes = FeatureDiskCache.estimateFileBytes(frameCount: item.frameCount, frameStack: frameStack)
+            if itemBytes <= 0 {
+                continue
+            }
+            let (nextTotal, overflow) = accumulatedBytes.addingReportingOverflow(itemBytes)
+            if overflow != true {
+                if nextTotal <= maxBytes {
+                    accumulatedBytes = nextTotal
+                    selected.insert(item.path)
+                }
+            }
+        }
+
+        return selected
     }
 
     /// マニフェストのペアから遅延データセットを構築する。
-    /// 並列に全 WAV を一度読んでフレーム数を確定し、特徴量は破棄する
+    /// キャッシュが存在する場合は 32 バイトヘッダーのみを読みフレーム数を瞬時に確定する
     public static func lazyFromManifest(
         pairs: [(path: String, text: String)],
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         frameStack: Int = 1,
-        workers: Int = 8
+        workers: Int = 8,
+        cache: FeatureDiskCache? = nil,
+        maxCacheGigabytes: Double = 0.0
     ) -> SpeechDataset {
         final class MetaBuffer: @unchecked Sendable {
             var items: [SampleMeta?]
@@ -130,20 +261,44 @@ public final class SpeechDataset: @unchecked Sendable {
         }
         let buffer = MetaBuffer(count: pairs.count)
         let workerCount = max(1, workers)
+
+        // 容量制限（クォータ）が有効な場合、初期メタデータ走査時はキャッシュ保存を行わない
+        // （全サンプルのフレーム数が確定した後に、長尺上位のみを選別してキャッシュするため）
+        // また、過去のホワイトリストによってヘッダー読み込みが拒絶されないよう allowedPaths をリセットする
+        let initialCache: FeatureDiskCache?
+        if 0.0 < maxCacheGigabytes {
+            cache?.allowedPaths = nil
+            initialCache = nil
+        } else {
+            initialCache = cache
+        }
+
         DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
             let converter = KanjiConverter(vocabulary: phonemeVocabulary)
             var i = worker
             while i < pairs.count {
                 let pair = pairs[i]
-                let (_, features) = loadFeatures(path: pair.path, frameStack: frameStack)
-                if 0 < features.count {
+                var frameCount = 0
+                if let c = cache, let cachedFrames = c.getFrameCount(path: pair.path, frameStack: frameStack) {
+                    frameCount = cachedFrames
+                } else {
+                    let (_, features) = loadFeatures(
+                        path: pair.path,
+                        frameStack: frameStack,
+                        cache: initialCache,
+                        loadPCM: false
+                    )
+                    frameCount = features.count
+                }
+
+                if 0 < frameCount {
                     buffer.items[i] = SampleMeta(
                         path: pair.path,
                         rawText: pair.text,
                         hiraganaText: converter.convertToHiragana(pair.text),
                         textIds: textVocabulary.textToIds(pair.text),
                         phonemeIds: converter.toPhonemeTokenIds(pair.text),
-                        frameCount: features.count
+                        frameCount: frameCount
                     )
                 }
                 i += workerCount
@@ -156,7 +311,38 @@ public final class SpeechDataset: @unchecked Sendable {
                 metas.append(meta)
             }
         }
-        return SpeechDataset(metaSamples: metas, frameStack: frameStack)
+
+        if let c = cache {
+            if 0.0 < maxCacheGigabytes {
+                let allowed = selectQuotaPaths(
+                    metas: metas,
+                    frameStack: frameStack,
+                    maxGigabytes: maxCacheGigabytes
+                )
+                c.allowedPaths = allowed
+
+                // クォータ対象外となったサンプルの旧キャッシュが存在する場合はディスクから削除し、
+                // 指定された最大容量制約を確実に遵守する (同一パスの重複削除を防止)
+                var checkedPaths = Set<String>()
+                checkedPaths.reserveCapacity(metas.count)
+                for meta in metas {
+                    if checkedPaths.insert(meta.path).inserted {
+                        if allowed.contains(meta.path) != true {
+                            c.remove(path: meta.path, frameStack: frameStack)
+                        }
+                    }
+                }
+            } else {
+                c.allowedPaths = nil
+            }
+        }
+
+        return SpeechDataset(
+            metaSamples: metas,
+            frameStack: frameStack,
+            cache: cache,
+            maxCacheGigabytes: maxCacheGigabytes
+        )
     }
 
     /// テキスト中の全発音から音素トークン ID 列を抽出
@@ -178,8 +364,18 @@ public final class SpeechDataset: @unchecked Sendable {
             while m < outCount {
                 let srcIdx = m * 3
                 let s0 = pcmData[srcIdx]
-                let s1 = (srcIdx + 1 < pcmData.count) ? pcmData[srcIdx + 1] : s0
-                let s2 = (srcIdx + 2 < pcmData.count) ? pcmData[srcIdx + 2] : s1
+                let s1: Float
+                if (srcIdx + 1) < pcmData.count {
+                    s1 = pcmData[srcIdx + 1]
+                } else {
+                    s1 = s0
+                }
+                let s2: Float
+                if (srcIdx + 2) < pcmData.count {
+                    s2 = pcmData[srcIdx + 2]
+                } else {
+                    s2 = s1
+                }
                 // 3 サンプル平均ローパスフィルタによるエイリアシング防止
                 out[m] = (s0 + s1 + s2) / 3.0
                 m += 1
@@ -348,9 +544,19 @@ public final class SpeechDataset: @unchecked Sendable {
 
         var t = 0
         while t < numFrames {
-            let prevIdx = (t == 0) ? 0 : t - 1
+            let prevIdx: Int
+            if t == 0 {
+                prevIdx = 0
+            } else {
+                prevIdx = t - 1
+            }
             let currIdx = t
-            let nextIdx = (t == numFrames - 1) ? (numFrames - 1) : t + 1
+            let nextIdx: Int
+            if t == (numFrames - 1) {
+                nextIdx = numFrames - 1
+            } else {
+                nextIdx = t + 1
+            }
 
             let prevMel = rawMelSeq[prevIdx]
             let currMel = rawMelSeq[currIdx]
