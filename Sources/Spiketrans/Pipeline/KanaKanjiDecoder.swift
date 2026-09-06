@@ -396,6 +396,22 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
         return dp[m][n]
     }
 
+    // MARK: - 調音類似度判定用静的定数テーブル
+    private static let voicedPairs: Set<String> = [
+        "かが", "きぎ", "くぐ", "けげ", "こご",
+        "さざ", "しじ", "すず", "せぜ", "そぞ",
+        "ただ", "ちぢ", "つづ", "てで", "とど",
+        "はば", "ひび", "ふぶ", "へべ", "ほぼ",
+        "はぱ", "ひぴ", "ふぷ", "へぺ", "ほぽ",
+        "ばぱ", "びぴ", "ぶぷ", "べぺ", "ぼぽ"
+    ]
+    private static let vowels: Set<Character> = ["あ", "い", "う", "え", "お"]
+    private static let specialPairs: Set<String> = [
+        "ーう", "ーお", "ーい", "ーえ", "ーあ",
+        "っつ", "んむ", "んう"
+    ]
+    private static let vowelPairs: Set<String> = ["おう", "うお", "えい", "いえ", "あお", "おあ"]
+
     /// 2文字間の調音位置類似コスト
     private func charSubstitutionCost(_ c1: Character, _ c2: Character) -> Float {
         if c1 == c2 {
@@ -406,33 +422,18 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
         let pairStr = "\(c1)\(c2)"
         let revPairStr = "\(c2)\(c1)"
 
-        let voicedPairs: Set<String> = [
-            "かが", "きぎ", "くぐ", "けげ", "こご",
-            "さざ", "しじ", "すず", "せぜ", "そぞ",
-            "ただ", "ちぢ", "つづ", "てで", "とど",
-            "はば", "ひび", "ふぶ", "へべ", "ほぼ",
-            "はぱ", "ひぴ", "ふぷ", "へぺ", "ほぽ",
-            "ばぱ", "びぴ", "ぶぷ", "べぺ", "ぼぽ"
-        ]
-
-        if voicedPairs.contains(pairStr) || voicedPairs.contains(revPairStr) {
+        if Self.voicedPairs.contains(pairStr) || Self.voicedPairs.contains(revPairStr) {
             return 0.35
         }
 
         // 促音・長音・撥音・重複母音のゆらぎ (長音と母音、またはっ-つ、ん-む等)
-        let vowels: Set<Character> = ["あ", "い", "う", "え", "お"]
-        let isProlongedVowel = (c1 == "ー" && vowels.contains(c2)) || (c2 == "ー" && vowels.contains(c1))
-        let specialPairs: Set<String> = [
-            "ーう", "ーお", "ーい", "ーえ", "ーあ",
-            "っつ", "んむ", "んう"
-        ]
-        if isProlongedVowel || specialPairs.contains(pairStr) || specialPairs.contains(revPairStr) {
+        let isProlongedVowel = (c1 == "ー" && Self.vowels.contains(c2)) || (c2 == "ー" && Self.vowels.contains(c1))
+        if isProlongedVowel || Self.specialPairs.contains(pairStr) || Self.specialPairs.contains(revPairStr) {
             return 0.40
         }
 
         // 類似母音ペア
-        let vowelPairs: Set<String> = ["おう", "うお", "えい", "いえ", "あお", "おあ"]
-        if vowelPairs.contains(pairStr) || vowelPairs.contains(revPairStr) {
+        if Self.vowelPairs.contains(pairStr) || Self.vowelPairs.contains(revPairStr) {
             return 0.45
         }
 

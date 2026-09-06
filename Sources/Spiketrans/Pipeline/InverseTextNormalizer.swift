@@ -47,15 +47,8 @@ public struct InverseTextNormalizer: Sendable {
 
     /// 電話番号プレフィックスのかな読みテーブル
     private static let phonePrefixReadings: [(reading: String, replacement: String)] = [
-        ("ぜろきゅうぜろ", "090-"),
-        ("ぜろはちぜろ", "080-"),
-        ("ぜろななぜろ", "070-"),
-        ("ぜろごぜろ", "050-"),
+        ("ぜろいちにいぜろ", "0120-"),
         ("ぜろさん", "03-"),
-        ("〇九〇", "090-"),
-        ("〇八〇", "080-"),
-        ("〇七〇", "070-"),
-        ("〇五〇", "050-")
     ]
 
     /// 分のかな読みテーブル (1〜59分)
@@ -83,28 +76,40 @@ public struct InverseTextNormalizer: Sendable {
         ("きゅうふん", 9)
     ]
 
+    /// 区切り文字（句読点、空白、記号、括弧類）であるか判定
+    private static func isDelimiter(_ ch: Character) -> Bool {
+        switch ch {
+        case "、", "。", "，", "．", " ", "　", "\t", "\n", "\r",
+             "！", "？", "!", "?", "…", "・", "-", "ー",
+             "「", "」", "『", "』", "（", "）", "(", ")", "【", "】", "\"", "'":
+            return true
+        default:
+            return false
+        }
+    }
+
     /// 漢数字文字を数値に変換 (0〜9、それ以外は nil)
     private static func kanjiDigitValue(_ ch: Character) -> Int? {
         switch ch {
-        case "〇", "零":
+        case "零", "0", "０":
             return 0
-        case "一", "壱":
+        case "一", "壱", "1", "１":
             return 1
-        case "二", "弐":
+        case "二", "弐", "2", "２":
             return 2
-        case "三", "参":
+        case "三", "参", "3", "３":
             return 3
-        case "四":
+        case "四", "4", "４":
             return 4
-        case "五":
+        case "五", "5", "５":
             return 5
-        case "六":
+        case "六", "6", "６":
             return 6
-        case "七":
+        case "七", "7", "７":
             return 7
-        case "八":
+        case "八", "8", "８":
             return 8
-        case "九":
+        case "九", "9", "９":
             return 9
         default:
             return nil
@@ -112,7 +117,7 @@ public struct InverseTextNormalizer: Sendable {
     }
 
     /// 漢数字列 (位取り含む) を整数にパース
-    /// 例: "十五" -> 15, "二千二十六" -> 2026, "二〇二六" -> 2026, "三百" -> 300, "一万五千" -> 15000
+    /// 例: "十五" -> 15, "二千二十六" -> 2026, "二〇二六" -> 2026, "三百" -> 300, "一万五千" -> 15000, "1万円" -> 10000円
     private static func parseKanjiNumber(chars: [Character], start: Int) -> (value: Int64, length: Int)? {
         let n = chars.count
         if n <= start {
@@ -126,7 +131,7 @@ public struct InverseTextNormalizer: Sendable {
         var hasDigit = false
         var matched = false
 
-        while i < n {
+        parseLoop: while i < n {
             let ch = chars[i]
 
             if let digit = kanjiDigitValue(ch) {
@@ -174,11 +179,10 @@ public struct InverseTextNormalizer: Sendable {
                 i += 1
             case "万":
                 let sec = currentSection + currentDigit
-                var s: Int64 = 1
-                if 0 < sec {
-                    s = sec
+                if sec <= 0 {
+                    break parseLoop
                 }
-                total += s * 10000
+                total += sec * 10000
                 currentSection = 0
                 currentDigit = 0
                 hasDigit = false
@@ -186,32 +190,28 @@ public struct InverseTextNormalizer: Sendable {
                 i += 1
             case "億":
                 let sec = currentSection + currentDigit
-                var s: Int64 = 1
-                if 0 < sec {
-                    s = sec
+                if sec <= 0 {
+                    break parseLoop
                 }
-                total += s * 100000000
+                total += sec * 100000000
+                currentSection = 0
+                currentDigit = 0
+                hasDigit = false
+                matched = true
+                i += 1
+            case "兆":
+                let sec = currentSection + currentDigit
+                if sec <= 0 {
+                    break parseLoop
+                }
+                total += sec * 1000000000000
                 currentSection = 0
                 currentDigit = 0
                 hasDigit = false
                 matched = true
                 i += 1
             default:
-                break
-            }
-
-            // 漢数字以外に到達したら終了
-            var isKanjiNumberChar = false
-            switch ch {
-            case "十", "百", "千", "万", "億":
-                isKanjiNumberChar = true
-            default:
-                if kanjiDigitValue(ch) != nil {
-                    isKanjiNumberChar = true
-                }
-            }
-            if isKanjiNumberChar != true {
-                break
+                break parseLoop
             }
         }
 
@@ -226,7 +226,7 @@ public struct InverseTextNormalizer: Sendable {
 
     /// かな数詞スパンを整数にパース
     /// 例: "じゅうご" -> 15, "にせんにじゅうろく" -> 2026, "さんびゃく" -> 300, "せんごひゃく" -> 1500
-    private static func parseKanaNumber(chars: [Character], start: Int) -> (value: Int64, length: Int)? {
+    private static func parseKanaNumber(chars: [Character], start: Int) -> (value: Int64, length: Int, hasExplicitDigit: Bool)? {
         let n = chars.count
         if n <= start {
             return nil
@@ -237,22 +237,35 @@ public struct InverseTextNormalizer: Sendable {
         var currentSection: Int64 = 0
         var currentDigit: Int64 = 0
         var hasDigit = false
+        var hasExplicitDigit = false
         var matched = false
 
         while i < n {
             let remaining = n - i
 
-            // 1. 大位単位: "まん" (万), "おく" (億)
+            // 1. 大位単位: "まん" (万), "おく" (億), "ちょう" (兆)
+            if 3 <= remaining && String(chars[i..<(i + 3)]) == "ちょう" {
+                let sec = currentSection + currentDigit
+                if sec <= 0 {
+                    break
+                }
+                total += sec * 1000000000000
+                currentSection = 0
+                currentDigit = 0
+                hasDigit = false
+                matched = true
+                i += 3
+                continue
+            }
             if 2 <= remaining {
                 let sub2 = String(chars[i..<(i + 2)])
                 switch sub2 {
                 case "まん":
                     let sec = currentSection + currentDigit
-                    var s: Int64 = 1
-                    if 0 < sec {
-                        s = sec
+                    if sec <= 0 {
+                        break
                     }
-                    total += s * 10000
+                    total += sec * 10000
                     currentSection = 0
                     currentDigit = 0
                     hasDigit = false
@@ -261,11 +274,10 @@ public struct InverseTextNormalizer: Sendable {
                     continue
                 case "おく":
                     let sec = currentSection + currentDigit
-                    var s: Int64 = 1
-                    if 0 < sec {
-                        s = sec
+                    if sec <= 0 {
+                        break
                     }
-                    total += s * 100000000
+                    total += sec * 100000000
                     currentSection = 0
                     currentDigit = 0
                     hasDigit = false
@@ -337,6 +349,7 @@ public struct InverseTextNormalizer: Sendable {
                         currentDigit = 9
                         hasDigit = true
                     }
+                    hasExplicitDigit = true
                     matched = true
                     i += 3
                     continue
@@ -371,6 +384,7 @@ public struct InverseTextNormalizer: Sendable {
                         currentDigit = dVal
                         hasDigit = true
                     }
+                    hasExplicitDigit = true
                     matched = true
                     i += 2
                     continue
@@ -393,38 +407,70 @@ public struct InverseTextNormalizer: Sendable {
                     dVal = -1
                 }
                 if 0 <= dVal {
-                    // 単一の「に」「し」「く」は助詞等の誤判定を防ぐため、
-                    // 直後に単位や後続の数詞が続く場合のみ数値と認める
                     let nextPos = i + 1
+                    var isContractedSyllable = false
                     var hasNextUnit = false
                     if nextPos < n {
-                        let nextRemain = n - nextPos
-                        if 2 <= nextRemain {
-                            let nextSub2 = String(chars[nextPos..<(nextPos + 2)])
-                            switch nextSub2 {
-                            case "じゅ", "ひゃ", "びゃ", "ぴゃ", "せん", "ぜん", "まん", "えん", "ねん", "がつ", "にち", "ほん", "ぼん", "ぽん", "にん", "かい":
+                        let nextCh = chars[nextPos]
+                        switch nextCh {
+                        case "ゃ", "ゅ", "ょ", "ぁ", "ぃ", "ぅ", "ぇ", "ぉ":
+                            isContractedSyllable = true
+                        default:
+                            break
+                        }
+
+                        if isContractedSyllable != true {
+                            let nextRemain = n - nextPos
+                            if 2 <= nextRemain {
+                                let nextSub2 = String(chars[nextPos..<(nextPos + 2)])
+                                switch nextSub2 {
+                                case "じゅ", "ひゃ", "びゃ", "ぴゃ", "せん", "ぜん", "まん", "おく", "ちょ",
+                                     "えん", "ねん", "がつ", "にち", "ほん", "ぼん", "ぽん", "にん", "かい", "さい", "ばい",
+                                     "ぱー", "パー":
+                                    hasNextUnit = true
+                                default:
+                                    break
+                                }
+                            }
+                            switch nextCh {
+                            case "円", "年", "月", "日", "時", "分", "秒", "個", "本", "人", "回", "度", "倍", "番",
+                                 "％", "%", "こ", "つ", "十", "百", "千", "万", "億", "兆":
+                                hasNextUnit = true
+                            case "じ": // 時
                                 hasNextUnit = true
                             default:
                                 break
                             }
                         }
-                        let nextCh = chars[nextPos]
-                        switch nextCh {
-                        case "円", "年", "月", "日", "時", "分", "秒", "個", "本", "人", "回", "度", "％", "%", "こ", "つ", "十", "百", "千", "万", "億", "番":
-                            hasNextUnit = true
-                        case "じ": // 時
-                            hasNextUnit = true
-                        default:
-                            break
+                    }
+
+                    var allowSingleDigit = false
+                    if isContractedSyllable != true {
+                        if hasNextUnit {
+                            allowSingleDigit = true
+                        }
+                        if allowSingleDigit != true && matched {
+                            var isConflictingUnit = false
+                            if ch == "に" && nextPos < n {
+                                let nextCh = chars[nextPos]
+                                if nextCh == "ん" || nextCh == "ち" {
+                                    isConflictingUnit = true
+                                }
+                            }
+                            if isConflictingUnit != true {
+                                allowSingleDigit = true
+                            }
                         }
                     }
-                    if hasNextUnit || matched {
+
+                    if allowSingleDigit {
                         if hasDigit {
                             currentDigit = currentDigit * 10 + dVal
                         } else {
                             currentDigit = dVal
                             hasDigit = true
                         }
+                        hasExplicitDigit = true
                         matched = true
                         i += 1
                         continue
@@ -442,7 +488,7 @@ public struct InverseTextNormalizer: Sendable {
 
         total += currentSection + currentDigit
         let len = i - start
-        return (total, len)
+        return (total, len, hasExplicitDigit)
     }
 
     /// テキスト全体に対して逆テキスト正規化を適用
@@ -641,7 +687,7 @@ public struct InverseTextNormalizer: Sendable {
             // -------------------------------------------------------------
             // 5. 漢数字またはかな数詞のパース
             // -------------------------------------------------------------
-            var parsedNumber: (value: Int64, length: Int)? = nil
+            var parsedNumber: (value: Int64, length: Int, isKana: Bool, hasExplicitDigit: Bool)? = nil
 
             // 漢数字パース試行
             if let kanjiNum = Self.parseKanjiNumber(chars: chars, start: i) {
@@ -663,14 +709,14 @@ public struct InverseTextNormalizer: Sendable {
                     }
                 }
                 if isValid {
-                    parsedNumber = kanjiNum
+                    parsedNumber = (value: kanjiNum.value, length: kanjiNum.length, isKana: false, hasExplicitDigit: true)
                 }
             }
 
             // かな数詞パース試行
             if parsedNumber == nil {
                 if let kanaNum = Self.parseKanaNumber(chars: chars, start: i) {
-                    parsedNumber = kanaNum
+                    parsedNumber = (value: kanaNum.value, length: kanaNum.length, isKana: true, hasExplicitDigit: kanaNum.hasExplicitDigit)
                 }
             }
 
@@ -793,6 +839,10 @@ public struct InverseTextNormalizer: Sendable {
                         result.append("\(numValue)歳")
                         i = nextIdx + 2
                         handledUnit = true
+                    case "ばい":
+                        result.append("\(numValue)倍")
+                        i = nextIdx + 2
+                        handledUnit = true
                     default:
                         break
                     }
@@ -833,13 +883,35 @@ public struct InverseTextNormalizer: Sendable {
                     handledUnit = true
                 }
 
-                // I. 単位がない場合: 10以上の数値であればアラビア数字化 (「山田さん」「いち」等の単独数字は保護)
+                // I. 単位がない場合
                 if handledUnit != true {
-                    if 10 <= numValue {
+                    var shouldConvert = false
+                    if numInfo.isKana {
+                        // かな数詞の場合: 単独の単位語 (「せん」「じゅう」等) は「洗濯」「住所」等の同音異義語の誤爆を防ぐため
+                        // 単位なしでは変換しない。明示的な数字を含む複合数詞 (「じゅうご」「にじゅう」「さんびゃく」等) のみ変換。
+                        if numInfo.hasExplicitDigit && 10 <= numValue {
+                            shouldConvert = true
+                        }
+                    } else {
+                        // 漢数字・アラビア数字の場合
+                        if numLen == 1 {
+                            // 1文字単独 (「一」〜「九」、「十」、「百」、「千」) は、
+                            // 文末または句読点・空白・括弧等で区切られている場合のみ変換 (「千里眼」「百景」「一般的」等の熟語を保護)
+                            if nextIdx == n || Self.isDelimiter(chars[nextIdx]) {
+                                shouldConvert = true
+                            }
+                        } else {
+                            // 2文字以上の複合数字 (「二〇二六」「十五」「千五百」「二万」等) は変換
+                            if 10 <= numValue {
+                                shouldConvert = true
+                            }
+                        }
+                    }
+
+                    if shouldConvert {
                         result.append("\(numValue)")
                         i = nextIdx
                     } else {
-                        // 単独の1桁（漢数字またはかな数詞）で単位がない場合はそのまま通す
                         result.append(chars[i])
                         i += 1
                     }

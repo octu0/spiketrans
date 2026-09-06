@@ -205,7 +205,7 @@ public struct KanjiConverter: Sendable {
             switch v {
             case 0x41...0x5A, 0x61...0x7A, 0xFF21...0xFF3A, 0xFF41...0xFF5A:
                 letterCount += 1
-            case 0x2D: // '-'
+            case 0x2D, 0xFF0D, 0x2010...0x2015:
                 ()
             default:
                 return false
@@ -234,7 +234,7 @@ public struct KanjiConverter: Sendable {
                 switch v {
                 case 0x41...0x5A, 0xFF21...0xFF3A:
                     letterCount += 1
-                case 0x2D:
+                case 0x2D, 0xFF0D, 0x2010...0x2015:
                     ()
                 default:
                     isAllUpper = false

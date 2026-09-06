@@ -38,11 +38,12 @@ public struct FillerWordFilter: Sendable {
         return result
     }
 
-    /// 区切り文字（句読点、空白、記号）であるか判定
+    /// 区切り文字（句読点、空白、記号、括弧類）であるか判定
     private static func isDelimiter(_ ch: Character) -> Bool {
         switch ch {
         case "、", "。", "，", "．", " ", "　", "\t", "\n", "\r",
-             "！", "？", "!", "?", "…", "・", "-", "ー":
+             "！", "？", "!", "?", "…", "・",
+             "「", "」", "『", "』", "（", "）", "(", ")", "【", "】", "\"", "'":
             return true
         default:
             return false
@@ -70,21 +71,14 @@ public struct FillerWordFilter: Sendable {
         }
 
         switch normalized {
-        case "えー", "えーー", "えーーー", "ええと", "えっと", "えっとー", "えーと", "えーっと", "ええ":
-            return true
-        case "あー", "あーー", "あーーー", "あのー", "あのーー", "あのね", "あのーっ", "あーっと", "あっ":
-            return true
-        case "そのー", "そのーー", "そのう", "そのーっ":
-            return true
-        case "うーん", "うーーん", "うーんと", "うむ", "んー", "んーと":
-            return true
-        case "まあ", "まー", "まーっ":
-            return true
-        case "なんか", "なんかー", "なんというか":
-            return true
-        case "あの", "その":
-            return true
-        case "ほら", "ほらー":
+        case "えー", "えーー", "えーーー", "ええと", "えっと", "えっとー", "えーと", "えーっと", "ええ",
+             "あー", "あーー", "あーーー", "あのー", "あのーー", "あのね", "あのーっ", "あーっと", "あっ",
+             "そのー", "そのーー", "そのーっ",
+             "うーん", "うーーん", "うーんと", "うむ", "んー", "んーと",
+             "まあ", "まー", "まーっ",
+             "なんか", "なんかー", "なんというか",
+             "あの", "その",
+             "ほら", "ほらー":
             return true
         default:
             return false
@@ -126,22 +120,15 @@ public struct FillerWordFilter: Sendable {
                 var requireDelimiterOrEnd = false
 
                 switch subStr {
-                case "なんというか", "えーっと", "あーっと", "うーんと", "えっとー", "あのねー":
-                    isCandidate = true
-                case "えーと", "ええと", "えっと", "あのー", "そのー", "うーん", "なんかー", "ほらー":
-                    isCandidate = true
-                case "えー", "あー", "そのう", "まーっ", "あのーっ", "そのーっ":
-                    isCandidate = true
-                case "うむ", "んー":
+                case "なんというか", "えーっと", "あーっと", "うーんと", "えっとー", "あのねー",
+                     "えーと", "ええと", "えっと", "あのー", "そのー", "うーん", "なんかー", "ほらー",
+                     "えー", "あー", "まーっ", "あのーっ", "そのーっ",
+                     "うむ", "んー", "まあ", "まー", "なんか":
                     isCandidate = true
                 case "あの", "その":
                     // 「あの」「その」は直後に句読点・空白・文末がある場合のみフィラーとみなす (「あの人」等の誤消去防止)
                     isCandidate = true
                     requireDelimiterOrEnd = true
-                case "まあ", "まー":
-                    isCandidate = true
-                case "なんか":
-                    isCandidate = true
                 default:
                     isCandidate = false
                 }
@@ -154,7 +141,21 @@ public struct FillerWordFilter: Sendable {
                         if nextIdx < n {
                             let nextCh = chars[nextIdx]
                             if Self.isDelimiter(nextCh) != true {
-                                isValid = false
+                                // ただし「あのえー」「そのうーん」のように後続が別のフィラーである場合は許容
+                                let nextRemain = n - nextIdx
+                                var followedByFiller = false
+                                if 2 <= nextRemain {
+                                    let nextSub2 = String(chars[nextIdx..<(nextIdx + 2)])
+                                    switch nextSub2 {
+                                    case "えっ", "えー", "うー", "あー", "その", "あの", "まー":
+                                        followedByFiller = true
+                                    default:
+                                        break
+                                    }
+                                }
+                                if followedByFiller != true {
+                                    isValid = false
+                                }
                             }
                         }
                     }
@@ -233,8 +234,8 @@ public struct FillerWordFilter: Sendable {
             if 0 < matchedLength {
                 switch mode {
                 case .remove:
-                    // 除去モード: もし直前の文字が読点「、」なら、フィラーに先行する読点も削除
-                    if output.hasSuffix("、") {
+                    // 除去モード: もし直前の文字が読点「、」や空白なら、フィラーに先行する区切りも削除
+                    while let last = output.last, last == "、" || last == " " || last == "　" {
                         output.removeLast()
                     }
                 case .mark:
@@ -247,12 +248,12 @@ public struct FillerWordFilter: Sendable {
                 i += matchedLength
 
                 // フィラー直後の読点「、」や空白もスキップして自然に接続
-                while i < n {
-                    let c = chars[i]
-                    if c == "、" || c == " " || c == "　" {
+                skipDelimiters: while i < n {
+                    switch chars[i] {
+                    case "、", " ", "　":
                         i += 1
-                    } else {
-                        break
+                    default:
+                        break skipDelimiters
                     }
                 }
             } else {
@@ -261,27 +262,17 @@ public struct FillerWordFilter: Sendable {
             }
         }
 
-        // 先頭に残った不要な読点「、」のサニタイズ
-        var trimmed = output
-        while trimmed.isEmpty != true {
-            switch trimmed.first {
-            case .some(let ch):
-                if ch == "、" || ch == " " || ch == "　" {
-                    trimmed.removeFirst()
-                } else {
-                    break
-                }
-            case .none:
-                break
-            }
-            // 削除が行われなかった場合は脱出
-            if let first = trimmed.first {
-                if first != "、" && first != " " && first != "　" {
-                    break
-                }
+        // 先頭に残った不要な読点・句点・空白のサニタイズ (O(1) サブストリングトリミング)
+        var slice = output[...]
+        trimLeading: while let first = slice.first {
+            switch first {
+            case "、", "。", " ", "　", "\t":
+                slice = slice.dropFirst()
+            default:
+                break trimLeading
             }
         }
 
-        return trimmed
+        return String(slice)
     }
 }

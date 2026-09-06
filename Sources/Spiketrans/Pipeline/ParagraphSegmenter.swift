@@ -87,8 +87,6 @@ public final class ParagraphSegmenter: @unchecked Sendable {
             return nil
         }
 
-        var completedParagraph: ParagraphSegment? = nil
-
         if hasActiveParagraph {
             // 直前の発話終了から今回の発話開始までの無音時間 (ポーズ)
             let pauseDuration = startSeconds - currentEnd
@@ -107,16 +105,18 @@ public final class ParagraphSegmenter: @unchecked Sendable {
             }
 
             if shouldSplit {
-                completedParagraph = buildCurrentParagraph()
+                let completed = buildCurrentParagraph()
                 currentStart = startSeconds
                 currentEnd = endSeconds
                 currentTextParts = [trimmed]
                 hasActiveParagraph = true
-                return completedParagraph
+                return completed
             }
 
             // 同一段落内に結合
-            currentEnd = endSeconds
+            if currentEnd < endSeconds {
+                currentEnd = endSeconds
+            }
             currentTextParts.append(trimmed)
         } else {
             // 初回段落の開始
@@ -165,9 +165,7 @@ public final class ParagraphSegmenter: @unchecked Sendable {
         let segmenter = ParagraphSegmenter(pauseThresholdSeconds: pauseThresholdSeconds)
         var paragraphs: [ParagraphSegment] = []
 
-        var i = 0
-        while i < results.count {
-            let res = results[i]
+        for res in results {
             if let completed = segmenter.appendSegment(
                 text: res.text,
                 startSeconds: res.startTimeSeconds,
@@ -175,7 +173,6 @@ public final class ParagraphSegmenter: @unchecked Sendable {
             ) {
                 paragraphs.append(completed)
             }
-            i += 1
         }
 
         if let finalParagraph = segmenter.flush() {

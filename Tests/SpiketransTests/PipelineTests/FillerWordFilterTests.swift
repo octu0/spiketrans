@@ -122,4 +122,22 @@ final class FillerWordFilterTests: XCTestCase {
         XCTAssertEqual(filter.filter("えー田中です"), "田中です")
         XCTAssertEqual(filter.filter("まあ良いでしょう"), "良いでしょう")
     }
+
+    // MARK: - 8. 括弧境界・連続フィラー・単独フィラー句点クリーンアップ
+
+    func testBracketAndConsecutiveFillers() {
+        let filter = FillerWordFilter(mode: .remove)
+
+        // 括弧内での指示詞フィラー
+        XCTAssertEqual(filter.filter("「あの、ちょっといいですか」"), "「ちょっといいですか」")
+        XCTAssertEqual(filter.filter("「あの」"), "「」")
+
+        // 読点なしの連続フィラー
+        XCTAssertEqual(filter.filter("あのえーっと、本日は晴天です"), "本日は晴天です")
+        XCTAssertEqual(filter.filter("そのうーん、難しいです"), "難しいです")
+
+        // フィラー直後の句点サニタイズ
+        XCTAssertEqual(filter.filter("えー。"), "")
+        XCTAssertEqual(filter.filter("えー。本日は晴天です"), "本日は晴天です")
+    }
 }

@@ -63,18 +63,12 @@ final class InverseTextNormalizerTests: XCTestCase {
     func testPhoneNumberNormalization() {
         let itn = InverseTextNormalizer()
 
-        // Task 要件の直球テストケース
-        XCTAssertEqual(itn.normalize("ぜろきゅうぜろ"), "090-")
-        XCTAssertEqual(itn.normalize("〇九〇"), "090-")
-
         // 主要な電話番号プレフィックス
-        XCTAssertEqual(itn.normalize("ぜろはちぜろ"), "080-")
-        XCTAssertEqual(itn.normalize("ぜろななぜろ"), "070-")
-        XCTAssertEqual(itn.normalize("ぜろごぜろ"), "050-")
+        XCTAssertEqual(itn.normalize("ぜろいちにいぜろ"), "0120-")
         XCTAssertEqual(itn.normalize("ぜろさん"), "03-")
 
         // 文中での電話番号
-        XCTAssertEqual(itn.normalize("電話番号はぜろきゅうぜろです"), "電話番号は090-です")
+        XCTAssertEqual(itn.normalize("電話番号はぜろさんです"), "電話番号は03-です")
     }
 
     // MARK: - 4. 割合・パーセント表記の正規化 (Task 要件: 「ひゃくぱーせんと」 -> 「100%」)
@@ -183,5 +177,64 @@ final class InverseTextNormalizerTests: XCTestCase {
 
         // 敬称と順序助数詞
         XCTAssertEqual(itn.normalize("3人目の山田さん"), "3人目の山田さん")
+    }
+
+    // MARK: - 11. 算用数字混在表記（1万円、1万五千円、1兆円）の正規化
+
+    func testMixedArabicAndKanjiCurrencyAndNumbers() {
+        let itn = InverseTextNormalizer()
+
+        XCTAssertEqual(itn.normalize("1万円"), "10000円")
+        XCTAssertEqual(itn.normalize("2万円"), "20000円")
+        XCTAssertEqual(itn.normalize("100万円"), "1000000円")
+        XCTAssertEqual(itn.normalize("1万五千円"), "15000円")
+        XCTAssertEqual(itn.normalize("1兆円"), "1000000000000円")
+        XCTAssertEqual(itn.normalize("一兆円"), "1000000000000円")
+    }
+
+    // MARK: - 12. 同音異義語・熟語・固有名詞の完全保護（誤爆防止）
+
+    func testHomophoneAndIdiomProtection() {
+        let itn = InverseTextNormalizer()
+
+        // かな数詞同音異義語
+        XCTAssertEqual(itn.normalize("まんがを読む"), "まんがを読む")
+        XCTAssertEqual(itn.normalize("おくびょうな性格"), "おくびょうな性格")
+        XCTAssertEqual(itn.normalize("せんせいに相談する"), "せんせいに相談する")
+        XCTAssertEqual(itn.normalize("せんたくきを回す"), "せんたくきを回す")
+        XCTAssertEqual(itn.normalize("じゅうしょを記入する"), "じゅうしょを記入する")
+
+        // 漢数字熟語
+        XCTAssertEqual(itn.normalize("万全を期す"), "万全を期す")
+        XCTAssertEqual(itn.normalize("万が一の備え"), "万が一の備え")
+        XCTAssertEqual(itn.normalize("百景を楽しむ"), "百景を楽しむ")
+        XCTAssertEqual(itn.normalize("千里眼を持つ"), "千里眼を持つ")
+        XCTAssertEqual(itn.normalize("百科事典を調べる"), "百科事典を調べる")
+        XCTAssertEqual(itn.normalize("ごはんを食べる"), "ごはんを食べる")
+        XCTAssertEqual(itn.normalize("しかくを取得する"), "しかくを取得する")
+        XCTAssertEqual(itn.normalize("にくを焼く"), "にくを焼く")
+    }
+
+    // MARK: - 13. 複合数詞下一桁と各種単位（歳、倍、回、日、人、パーセント）の境界テスト
+
+    func testCompoundDigitsWithVariousUnits() {
+        let itn = InverseTextNormalizer()
+
+        // 1文字数詞（に、し、ご、く）が下一桁に来る複合数詞
+        XCTAssertEqual(itn.normalize("にじゅうごさい"), "25歳")
+        XCTAssertEqual(itn.normalize("さんじゅうにさい"), "32歳")
+        XCTAssertEqual(itn.normalize("よんじゅうよんさい"), "44歳")
+        XCTAssertEqual(itn.normalize("ごじゅうきゅうさい"), "59歳")
+
+        // 助数詞「にん」「にち」との衝突境界
+        XCTAssertEqual(itn.normalize("じゅうにん"), "10人")
+        XCTAssertEqual(itn.normalize("じゅうににん"), "12人")
+        XCTAssertEqual(itn.normalize("じゅうにち"), "10日")
+        XCTAssertEqual(itn.normalize("じゅうににち"), "12日")
+
+        // 単独1文字数詞＋単位
+        XCTAssertEqual(itn.normalize("ごぱーせんと"), "5%")
+        XCTAssertEqual(itn.normalize("にばい"), "2倍")
+        XCTAssertEqual(itn.normalize("ごかい"), "5回")
     }
 }

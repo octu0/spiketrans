@@ -247,94 +247,58 @@ print(String(format: "  ピークメモリ: %.0f MB", peakMemory))
 
 // 6. 第2段 (辞書がある場合)
 if 0 < kanaText.count {
+    var outputParts = kanaParts
     if 0 < kanaKanjiDict.count {
         let stage2Start = CFAbsoluteTimeGetCurrent()
         let kanaDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
         var kanjiParts: [String] = []
-        var pIdx = 0
-        while pIdx < kanaParts.count {
-            kanjiParts.append(kanaDecoder.decode(kanaText: kanaParts[pIdx]))
-            pIdx += 1
+        kanjiParts.reserveCapacity(kanaParts.count)
+        for part in kanaParts {
+            kanjiParts.append(kanaDecoder.decode(kanaText: part))
         }
-        var kanjiText = kanjiParts.joined()
-        if usePostProcess {
-            let fillerFilter = FillerWordFilter()
-            let normalizer = InverseTextNormalizer()
-            kanjiText = fillerFilter.filter(kanjiText)
-            kanjiText = normalizer.normalize(kanjiText)
-        }
+        outputParts = kanjiParts
         let stage2Elapsed = CFAbsoluteTimeGetCurrent() - stage2Start
-        print(String(format: "第2段 完了: %.1f 秒 (漢字 %d 文字)", stage2Elapsed, kanjiText.count))
+        let totalKanjiChars = kanjiParts.reduce(0) { $0 + $1.count }
+        print(String(format: "第2段 完了: %.1f 秒 (漢字 %d 文字)", stage2Elapsed, totalKanjiChars))
         let mem = residentMemoryMB()
         if peakMemory < mem {
             peakMemory = mem
         }
         print(String(format: "  ピークメモリ: %.0f MB", peakMemory))
         print("")
+    }
 
-        if usePostProcess {
-            print("=== 整形結果 (フィラー除去・ITN・段落タイムスタンプ) ===")
-            var results: [TranscriptionResult] = []
-            let fillerFilter = FillerWordFilter()
-            let normalizer = InverseTextNormalizer()
-            var kIdx = 0
-            while kIdx < segments.count {
-                let seg = segments[kIdx]
-                let sSec = Float(seg.start) / 16000.0
-                let eSec = Float(seg.start + seg.count) / 16000.0
-                var text = kanjiParts[kIdx]
-                text = fillerFilter.filter(text)
-                text = normalizer.normalize(text)
-                results.append(TranscriptionResult(
-                    text: text,
-                    phonemes: [],
-                    tokenIds: [],
-                    startTimeSeconds: sSec,
-                    endTimeSeconds: eSec,
-                    confidence: 1.0,
-                    isFinal: true
-                ))
-                kIdx += 1
-            }
-            let paragraphs = ParagraphSegmenter.segment(results: results)
-            for p in paragraphs {
-                print(p.formattedLine)
-            }
-            print("==================================================")
-        } else {
-            print("--- 冒頭 300 文字 ---")
-            print(String(kanjiText.prefix(300)))
+    if usePostProcess {
+        print("=== 整形結果 (フィラー除去・ITN・段落タイムスタンプ) ===")
+        let fillerFilter = FillerWordFilter()
+        let normalizer = InverseTextNormalizer()
+        var results: [TranscriptionResult] = []
+        results.reserveCapacity(segments.count)
+        for (idx, seg) in segments.enumerated() {
+            let sSec = Float(seg.start) / 16000.0
+            let eSec = Float(seg.start + seg.count) / 16000.0
+            var text = outputParts[idx]
+            text = fillerFilter.filter(text)
+            text = normalizer.normalize(text)
+            results.append(TranscriptionResult(
+                text: text,
+                phonemes: [],
+                tokenIds: [],
+                startTimeSeconds: sSec,
+                endTimeSeconds: eSec,
+                confidence: 1.0,
+                isFinal: true
+            ))
         }
+        let paragraphs = ParagraphSegmenter.segment(results: results)
+        for p in paragraphs {
+            print(p.formattedLine)
+        }
+        print("==================================================")
     } else {
-        if usePostProcess {
-            print("=== 整形結果 (フィラー除去・ITN・段落タイムスタンプ) ===")
-            var results: [TranscriptionResult] = []
-            let fillerFilter = FillerWordFilter()
-            let normalizer = InverseTextNormalizer()
-            var kIdx = 0
-            while kIdx < segments.count {
-                let seg = segments[kIdx]
-                let sSec = Float(seg.start) / 16000.0
-                let eSec = Float(seg.start + seg.count) / 16000.0
-                var text = kanaParts[kIdx]
-                text = fillerFilter.filter(text)
-                text = normalizer.normalize(text)
-                results.append(TranscriptionResult(
-                    text: text,
-                    phonemes: [],
-                    tokenIds: [],
-                    startTimeSeconds: sSec,
-                    endTimeSeconds: eSec,
-                    confidence: 1.0,
-                    isFinal: true
-                ))
-                kIdx += 1
-            }
-            let paragraphs = ParagraphSegmenter.segment(results: results)
-            for p in paragraphs {
-                print(p.formattedLine)
-            }
-            print("==================================================")
+        if 0 < kanaKanjiDict.count {
+            print("--- 冒頭 300 文字 ---")
+            print(String(outputParts.joined().prefix(300)))
         }
     }
 }
