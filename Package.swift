@@ -34,6 +34,10 @@ let package = Package(
         .executable(
             name: "screen",
             targets: ["screen"]
+        ),
+        .executable(
+            name: "segment",
+            targets: ["segment"]
         )
     ],
     dependencies: [
@@ -86,6 +90,11 @@ let package = Package(
             name: "screen",
             dependencies: ["Spiketrans"],
             path: "script/screen"
+        ),
+        .executableTarget(
+            name: "segment",
+            dependencies: ["Spiketrans"],
+            path: "script/segment"
         ),
         .testTarget(
             name: "SpiketransTests",
