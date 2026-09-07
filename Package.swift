@@ -30,6 +30,10 @@ let package = Package(
         .executable(
             name: "mictrans",
             targets: ["mictrans"]
+        ),
+        .executable(
+            name: "screen",
+            targets: ["screen"]
         )
     ],
     dependencies: [
@@ -77,6 +81,11 @@ let package = Package(
             name: "mictrans",
             dependencies: ["Spiketrans"],
             path: "Sources/mictrans"
+        ),
+        .executableTarget(
+            name: "screen",
+            dependencies: ["Spiketrans"],
+            path: "script/screen"
         ),
         .testTarget(
             name: "SpiketransTests",
