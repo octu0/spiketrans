@@ -432,7 +432,7 @@ final class Transcriber: @unchecked Sendable {
     private let showKana: Bool
     private let showMeter: Bool
     private let display: StatusDisplay?
-    private let frameStack = 4
+    private let frameStack = StreamingFeatureFrontEnd.defaultStack
 
     private let workspace: AcousticWorkspace
     private let acousticDecoder: AcousticDecoder

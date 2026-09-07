@@ -151,7 +151,7 @@ if corpusLines.isEmpty != true {
 }
 
 // 4. 分割単位の決定
-let frameStack = 4
+let frameStack = StreamingFeatureFrontEnd.defaultStack
 var segments: [(start: Int, count: Int)] = []
 if chunkSeconds <= 0.0 {
     segments.append((start: 0, count: pcm.count))

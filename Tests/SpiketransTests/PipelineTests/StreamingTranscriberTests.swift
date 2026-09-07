@@ -77,7 +77,7 @@ final class StreamingTranscriberTests: XCTestCase {
 
     private func createTestNetworks() -> (acoustic: SpikingNetwork, language: SpikingNetwork, vocab: TextVocabulary) {
         let vocab = TextVocabulary()
-        let ac = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let ac = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lm = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         return (acoustic: ac, language: lm, vocab: vocab)
     }
@@ -347,5 +347,58 @@ final class StreamingTranscriberTests: XCTestCase {
         transcriber.flush()
 
         XCTAssertEqual(collector.count, 1, "Quantized transcriber must process speech stream correctly")
+    }
+
+    // MARK: - 7. 配信フロントエンドが学習 extractFeaturesFromPCM と一致すること
+
+    func testStreamingFrontEndMatchesOfflineExtract() {
+        let pcm = synthesizeSpeech(sampleRate: 16000, durationSeconds: 1.0, amplitude: 0.4)
+        let stack = SpeechDataset.defaultFrameStack
+        let offline = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm, frameStack: stack)
+        XCTAssertTrue(0 < offline.count)
+        XCTAssertEqual(offline[0].count, SpeechDataset.acousticInputDim(frameStack: stack))
+
+        var sumSquares: Float = 0.0
+        var s = 0
+        while s < pcm.count {
+            sumSquares += pcm[s] * pcm[s]
+            s += 1
+        }
+        let rms = sqrtf(sumSquares / Float(pcm.count))
+        let front = StreamingFeatureFrontEnd(frameStack: stack)
+        front.setGain(StreamingFeatureFrontEnd.gainForRMS(rms))
+        front.beginUtterance()
+
+        let dsp = DSPConfig()
+        var online: [[Float]] = []
+        var offset = 0
+        while (offset + dsp.frameSize) <= pcm.count {
+            pcm.withUnsafeBufferPointer { buf in
+                let ptr = buf.baseAddress!.advanced(by: offset)
+                if let stacked = front.pushRawFrame(pcmPtr: ptr, count: dsp.frameSize) {
+                    online.append(Array(stacked))
+                }
+            }
+            offset += dsp.hopSize
+        }
+        if let last = front.flush() {
+            online.append(Array(last))
+        }
+
+        XCTAssertEqual(online.count, offline.count, "stacked frame count must match offline extract")
+        var maxAbs: Float = 0.0
+        var i = 0
+        while i < online.count {
+            var d = 0
+            while d < online[i].count {
+                let diff = abs(online[i][d] - offline[i][d])
+                if maxAbs < diff {
+                    maxAbs = diff
+                }
+                d += 1
+            }
+            i += 1
+        }
+        XCTAssertLessThan(maxAbs, 1e-4, "streaming 3-tap+stack must match extractFeaturesFromPCM (maxAbs=\(maxAbs))")
     }
 }

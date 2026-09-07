@@ -474,20 +474,21 @@ public final class SpeechDataset: @unchecked Sendable {
         return SpeechDataset(samples: sampleList)
     }
 
-    /// PCM 配列から 128次元音響特徴量系列 (Preemphasis + 64ch Mel + 3-tap 平滑/差分) を抽出
-    /// 発話単位のレベル正規化の目標 RMS。JSUT (スタジオ正規化済み) の実測値に合わせ、
-    /// 録音レベルがバラバラな実録音 (Common Voice・配信音声) を同じ入力電流レンジへ揃える
-    static let targetRMS: Float = 0.05
-    /// 正規化ゲインの上限。ほぼ無音の音声でノイズだけを増幅しないための歯止め
-    static let maxGain: Float = 20.0
+    /// 学習スクリプトとストリーミングの既定束ね数。SNN `inputDim` は `acousticInputDim()`。
+    public static let defaultFrameStack = StreamingFeatureFrontEnd.defaultStack
 
+    public static func acousticInputDim(frameStack: Int = defaultFrameStack) -> Int {
+        return StreamingFeatureFrontEnd.acousticInputDim(stack: frameStack)
+    }
+
+    /// クリップ全体の RMS でゲインを固定し、`StreamingFeatureFrontEnd` で特徴化する。
+    /// データセット・`transcribe`・`mictrans` の入口。ストリーミングと Mel / 3-tap / 束ねを共有する。
     public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = 1) -> [[Float]] {
         let totalSamples = pcmData.count
         if totalSamples < 400 {
             return []
         }
 
-        // 0. 発話単位の RMS 正規化。静かな録音は入力電流が不足してスパイクが立たない
         var sumSquares: Float = 0.0
         var rIdx = 0
         while rIdx < totalSamples {
@@ -495,142 +496,28 @@ public final class SpeechDataset: @unchecked Sendable {
             rIdx += 1
         }
         let rms = sqrtf(sumSquares / Float(totalSamples))
-        var gain: Float = 1.0
-        if 1e-6 < rms {
-            gain = min(Self.targetRMS / rms, Self.maxGain)
-        }
+        let front = StreamingFeatureFrontEnd(frameStack: max(1, frameStack))
+        front.setGain(StreamingFeatureFrontEnd.gainForRMS(rms))
+        front.beginUtterance()
 
-        // 1. PCM プリエンファシス (2-tap, coeff: 0.97)
-        var preemph = [Float](repeating: 0.0, count: totalSamples)
-        preemph[0] = pcmData[0] * gain
-        var pIdx = 1
-        while pIdx < totalSamples {
-            preemph[pIdx] = (pcmData[pIdx] - (0.97 * pcmData[pIdx - 1])) * gain
-            pIdx += 1
-        }
-
-        // 2. 64ch Mel Filterbank 抽出
-        let dspConfig = DSPConfig(melChannels: 64)
-        let filterbank = Filterbank(config: dspConfig)
-        let workspace = DSPWorkspace(melChannels: 64)
-
-        var rawMelSeq: [[Float]] = []
+        let frameSize = front.frameSize
+        let hopSize = front.hopSize
+        var out: [[Float]] = []
         var offset = 0
-        let frameSize = dspConfig.frameSize
-        let hopSize = dspConfig.hopSize
-
-        preemph.withUnsafeBufferPointer { pcmPtr in
-            let basePcm = pcmPtr.baseAddress!
+        pcmData.withUnsafeBufferPointer { buf in
+            let base = buf.baseAddress!
             while (offset + frameSize) <= totalSamples {
-                let framePtr = basePcm.advanced(by: offset)
-                let feat = filterbank.extractFeatures(
-                    pcmPtr: framePtr,
-                    count: frameSize,
-                    workspace: workspace
-                )
-                rawMelSeq.append(feat)
+                if let stacked = front.pushRawFrame(
+                    pcmPtr: base.advanced(by: offset),
+                    count: frameSize
+                ) {
+                    out.append(Array(stacked))
+                }
                 offset += hopSize
             }
         }
-
-        let numFrames = rawMelSeq.count
-        if numFrames <= 0 {
-            return []
-        }
-
-        // 3. Mel 系列の時間 3-tap カーネル適用 (平滑 s & 差分 d → 128 次元)
-        var featuresSeq: [[Float]] = []
-        featuresSeq.reserveCapacity(numFrames)
-
-        var t = 0
-        while t < numFrames {
-            let prevIdx: Int
-            if t == 0 {
-                prevIdx = 0
-            } else {
-                prevIdx = t - 1
-            }
-            let currIdx = t
-            let nextIdx: Int
-            if t == (numFrames - 1) {
-                nextIdx = numFrames - 1
-            } else {
-                nextIdx = t + 1
-            }
-
-            let prevMel = rawMelSeq[prevIdx]
-            let currMel = rawMelSeq[currIdx]
-            let nextMel = rawMelSeq[nextIdx]
-
-            var feat128 = [Float](repeating: 0.0, count: 128)
-            var c = 0
-            while c < 64 {
-                let xPrev = prevMel[c]
-                let xCurr = currMel[c]
-                let xNext = nextMel[c]
-
-                // 平滑化: s[t] = 0.25*x[t-1] + 0.5*x[t] + 0.25*x[t+1]
-                feat128[c] = (0.25 * xPrev) + (0.5 * xCurr) + (0.25 * xNext)
-                // 差分: d[t] = 0.5*(x[t+1] - x[t-1])
-                feat128[64 + c] = 0.5 * (xNext - xPrev)
-
-                c += 1
-            }
-
-            featuresSeq.append(feat128)
-            t += 1
-        }
-
-        return stackFrames(featuresSeq, stack: frameStack)
-    }
-
-    /// 連続する stack フレームを 1 フレームに束ねて時間解像度を落とす
-    ///
-    /// hopSize=160 (16kHz) では 1 フレーム 10ms と CTC には過剰に細かく、
-    /// SNN の逐次ステップ数がそのまま学習時間に効く。3 フレーム束ねて 30ms 相当に
-    /// すると情報を捨てずに逐次ステップを 1/3 にできる。
-    /// stack = 1 のときは何もしない。
-    public static func stackFrames(_ featuresSeq: [[Float]], stack: Int) -> [[Float]] {
-        if stack <= 1 || featuresSeq.isEmpty {
-            return featuresSeq
-        }
-
-        let frameDim = featuresSeq[0].count
-        let outCount = featuresSeq.count / stack
-        if outCount <= 0 {
-            // 束ねるには短すぎる場合は 1 フレームに全部詰めてゼロ埋め
-            var single = [Float](repeating: 0.0, count: frameDim * stack)
-            var f = 0
-            while f < featuresSeq.count {
-                let src = featuresSeq[f]
-                var d = 0
-                while d < frameDim {
-                    single[(f * frameDim) + d] = src[d]
-                    d += 1
-                }
-                f += 1
-            }
-            return [single]
-        }
-
-        var out = [[Float]](
-            repeating: [Float](repeating: 0.0, count: frameDim * stack),
-            count: outCount
-        )
-        var o = 0
-        while o < outCount {
-            var k = 0
-            while k < stack {
-                let src = featuresSeq[(o * stack) + k]
-                let offset = k * frameDim
-                var d = 0
-                while d < frameDim {
-                    out[o][offset + d] = src[d]
-                    d += 1
-                }
-                k += 1
-            }
-            o += 1
+        if let last = front.flush() {
+            out.append(Array(last))
         }
         return out
     }

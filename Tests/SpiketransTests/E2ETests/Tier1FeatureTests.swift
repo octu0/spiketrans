@@ -1181,7 +1181,7 @@ final class Tier1FeatureTests: XCTestCase {
 
     func testStreamingTranscriberSingleUtterance() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -1212,7 +1212,7 @@ final class Tier1FeatureTests: XCTestCase {
 
     func testStreamingTranscriberMultiUtteranceSegmentation() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -1244,7 +1244,7 @@ final class Tier1FeatureTests: XCTestCase {
 
     func testStreamingTranscriberPartialResultsStream() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -1270,7 +1270,7 @@ final class Tier1FeatureTests: XCTestCase {
 
     func testStreamingTranscriberFlushAndReset() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -1282,7 +1282,7 @@ final class Tier1FeatureTests: XCTestCase {
 
     func testStreamingTranscriberQuantizedMode() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let config = StreamingTranscriberConfig(useQuantization: true)
         let transcriber = StreamingTranscriber(config: config, acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)

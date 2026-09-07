@@ -211,7 +211,7 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 5. VAD セグメンテーション ↔ StreamingTranscriber
     func testComboVADSegmentationToStreamingTranscription() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -339,7 +339,7 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 11. StreamingTranscriber 完全ライフサイクル
     func testComboStreamingTranscriberLifecycle() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 

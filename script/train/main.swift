@@ -19,9 +19,9 @@ print("==================================================")
 enum Defaults {
     /// 連続フレームを束ねる倍率。10ms/フレームは CTC には細かすぎ、
     /// 逐次カーネル起動回数がそのまま学習時間に効く。4 で 40ms 相当。
-    static let frameStack = 4
+    static let frameStack = StreamingFeatureFrontEnd.defaultStack
     /// 1 フレームあたりの 3-tap Mel 次元
-    static let melFrameDim = 128
+    static let melFrameDim = StreamingFeatureFrontEnd.tapDim
     /// 音響 SNN への入力次元
     static var acousticInputDim: Int { return melFrameDim * frameStack }
 

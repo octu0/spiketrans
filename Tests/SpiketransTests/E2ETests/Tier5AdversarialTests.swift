@@ -80,7 +80,7 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 1. ガウスホワイトノイズ重畳検証 (SNR 20dB, 10dB, 0dB, -5dB)
     func testAdversarialGaussianNoiseSNR() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -122,7 +122,7 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 2. ピンクノイズ重畳検証 (1/f 低周波妨害)
     func testAdversarialPinkNoise() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -289,7 +289,7 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 6. ホットパス ゼロアロケーション & RSS フォレンジック検証
     func testAdversarialZeroAllocHotPathRSSForensics() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let config = StreamingTranscriberConfig(beamWidth: 1)
         let transcriber = StreamingTranscriber(config: config, acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
@@ -375,7 +375,7 @@ final class Tier5AdversarialTests: XCTestCase {
     // MARK: - 10. メモリ安全性 / 高速連続ライフサイクル
     func testAdversarialMemorySafetyDoubleFree() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
 
         var i = 0

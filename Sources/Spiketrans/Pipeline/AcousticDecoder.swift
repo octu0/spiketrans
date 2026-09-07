@@ -78,7 +78,7 @@ public struct AcousticFrameProbabilities: Sendable, Equatable {
     }
 }
 
-/// 第1段 音響 SNN デコーダ (64次元音響特徴量 -> 直接漢字かな文字事後確率分布)
+/// 第1段 音響 SNN。1 フレームの特徴 (`network.inputDim`) から文字事後確率を出す
 public final class AcousticDecoder: @unchecked Sendable {
     public let network: SpikingNetwork
     public let quantizedEngine: QuantizedEngine?

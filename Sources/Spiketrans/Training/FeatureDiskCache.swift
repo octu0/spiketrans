@@ -281,7 +281,7 @@ public final class FeatureDiskCache: @unchecked Sendable {
 
     /// 指定されたフレーム数とスタック数におけるキャッシュファイル容量（バイト数）を算出
     public static func estimateFileBytes(frameCount: Int, frameStack: Int) -> Int64 {
-        let fDim = 128 * frameStack
+        let fDim = StreamingFeatureFrontEnd.tapDim * frameStack
         let (elemCount, overflow1) = frameCount.multipliedReportingOverflow(by: fDim)
         if overflow1 || elemCount <= 0 {
             return 0

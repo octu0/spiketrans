@@ -132,7 +132,7 @@ final class Tier4RealWorldTests: XCTestCase {
     // MARK: - 2. 動的会話音声の VAD 分割と 2 段ストリーミング文字起こし
     func testScenario2ConversationVADSegmentationAndTwoStageSTT() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 
@@ -202,7 +202,7 @@ final class Tier4RealWorldTests: XCTestCase {
     // MARK: - 5. 長時間連続ストリーム O(1) メモリ安定性
     func testScenario5TenMinutesContinuousStreamO1Memory() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let config = StreamingTranscriberConfig(beamWidth: 1)
         let transcriber = StreamingTranscriber(config: config, acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
@@ -292,7 +292,7 @@ final class Tier4RealWorldTests: XCTestCase {
     // MARK: - 8. 急激な音量スイング & 発話速度変化追従性
     func testScenario8DynamicVolumeAndSpeechRateTracking() {
         let vocab = TextVocabulary()
-        let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
+        let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let transcriber = StreamingTranscriber(acousticNetwork: acNet, languageNetwork: lmNet, textVocabulary: vocab)
 

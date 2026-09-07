@@ -67,7 +67,7 @@ final class M3AdversarialChallengerTests: XCTestCase {
 
     private func createTestNetworks() -> (acoustic: SpikingNetwork, language: SpikingNetwork) {
         let vocabSize = TextVocabulary().size
-        let ac = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocabSize, timeSteps: 4)
+        let ac = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocabSize, timeSteps: 4)
         let lm = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocabSize, timeSteps: 4)
         return (acoustic: ac, language: lm)
     }

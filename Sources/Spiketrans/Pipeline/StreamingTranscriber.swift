@@ -83,11 +83,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
 
     // DSP & SNN エンジン
     private let vad: VAD
-    private let pitchDetector: PitchDetector
-    private let lpc: LPC
-    private let durandKerner: DurandKernerSolver
-    private let formantExtractor: FormantExtractor
-    private let filterbank: Filterbank
     private let dspWorkspace: DSPWorkspace
 
     private let acousticDecoder: AcousticDecoder
@@ -108,13 +103,16 @@ public final class StreamingTranscriber: @unchecked Sendable {
     private var totalSamplesProcessed: Int64 = 0
 
     // 発話セグメント管理 (固定容量バッファ再利用)
-    private let maxSegmentFrames: Int
+    private let maxSegmentHops: Int
+    private var segmentHopCount: Int = 0
     private var segmentProbs: [AcousticFrameProbabilities]
     private var segmentRawFeatures: [[Float]] // フォールバック音素推定用
     private var segmentStartSample: Int64 = 0
     private var segmentSpeechActive: Bool = false
     private var consecutiveSilenceFrames: Int = 0
     private var consecutiveSpeechFrames: Int = 0
+    private let featureFrontEnd: StreamingFeatureFrontEnd
+    private let partialEveryStacked: Int
 
     public init(
         config: StreamingTranscriberConfig = StreamingTranscriberConfig(),
@@ -132,13 +130,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
 
         let dspCfg = config.dspConfig
         self.vad = VAD(config: dspCfg)
-        self.pitchDetector = PitchDetector(config: dspCfg)
-        self.lpc = LPC(config: dspCfg)
-        self.durandKerner = DurandKernerSolver()
-        self.formantExtractor = FormantExtractor(sampleRate: Float(dspCfg.sampleRate))
-        self.filterbank = Filterbank(config: dspCfg)
         self.dspWorkspace = DSPWorkspace(
-            maxFrameSize: dspCfg.frameSize,
             lpcOrder: dspCfg.lpcOrder,
             melChannels: dspCfg.melChannels,
             maxPitchLag: dspCfg.maxPitchLag
@@ -188,11 +180,26 @@ public final class StreamingTranscriber: @unchecked Sendable {
 
         self.ringBuffer = [Float](repeating: 0.0, count: ringBufferCapacity)
         let framesPerSec = Float(dspCfg.sampleRate) / Float(dspCfg.hopSize)
-        self.maxSegmentFrames = Int(config.maxSegmentDurationSeconds * framesPerSec) + 100
+        self.maxSegmentHops = Int(config.maxSegmentDurationSeconds * framesPerSec) + 100
+        var stack = acousticNetwork.inputDim / StreamingFeatureFrontEnd.tapDim
+        if stack < 1 {
+            stack = 1
+        }
+        let stackedCap = (maxSegmentHops / stack) + 4
         self.segmentProbs = []
-        self.segmentProbs.reserveCapacity(maxSegmentFrames)
+        self.segmentProbs.reserveCapacity(stackedCap)
         self.segmentRawFeatures = []
-        self.segmentRawFeatures.reserveCapacity(maxSegmentFrames)
+        self.segmentRawFeatures.reserveCapacity(stackedCap)
+        self.featureFrontEnd = StreamingFeatureFrontEnd(
+            frameStack: stack,
+            dspConfig: dspCfg
+        )
+        let partialEvery = 10 / stack
+        if partialEvery < 1 {
+            self.partialEveryStacked = 1
+        } else {
+            self.partialEveryStacked = partialEvery
+        }
     }
 
     /// PCM 音声配列の入力
@@ -271,6 +278,9 @@ public final class StreamingTranscriber: @unchecked Sendable {
                             segmentStartSample = 0
                         }
                         segmentProbs.removeAll(keepingCapacity: true)
+                        segmentRawFeatures.removeAll(keepingCapacity: true)
+                        segmentHopCount = 0
+                        featureFrontEnd.beginUtterance()
                     }
                 }
             } else {
@@ -278,58 +288,56 @@ public final class StreamingTranscriber: @unchecked Sendable {
                 consecutiveSilenceFrames += 1
             }
 
-            // 4. 発話フレームの特徴量抽出 & 音響 SNN 推論
+            // 4. 学習時と同じ stacked 特徴を FrontEnd で作り、音響 SNN へ渡す。
+            //    セグメンテーション VAD は raw のまま (エネルギー閾値を変えない)。
             if segmentSpeechActive {
-                let features = filterbank.extractFeatures(
-                    pcmPtr: rawBuf,
-                    count: frameSize,
-                    workspace: dspWorkspace
-                )
-
-                let acousticFrame = acousticDecoder.decodeFrame(
-                    features: features,
-                    workspace: acousticWorkspace,
-                    frameIndex: segmentProbs.count
-                )
-
-                if segmentProbs.count < maxSegmentFrames {
-                    segmentProbs.append(acousticFrame)
-                    segmentRawFeatures.append(features)
+                segmentHopCount += 1
+                if let features = featureFrontEnd.pushRawFrame(pcmPtr: rawBuf, count: frameSize) {
+                    ingestStackedFeatures(features)
                 }
 
-                // 5. 部分認識結果コールバック (10フレーム = 100ms ごと、コールバック登録時のみ実行)
-                if let onPartial = onPartialResult {
-                    if (segmentProbs.count % 10) == 0 {
-                        let windowLimit = 50
-                        let window: [AcousticFrameProbabilities]
-                        if windowLimit < segmentProbs.count {
-                            window = Array(segmentProbs[(segmentProbs.count - windowLimit)..<segmentProbs.count])
-                        } else {
-                            window = segmentProbs
-                        }
-                        let greedy = languageDecoder.decodeGreedy(
-                            acousticProbs: window,
-                            unkThreshold: unkThreshold
-                        )
-                        let startSec = Float(segmentStartSample) / Float(config.dspConfig.sampleRate)
-                        let endSec = Float(totalSamplesProcessed) / Float(config.dspConfig.sampleRate)
-                        let partialRes = TranscriptionResult(
-                            text: greedy.text,
-                            phonemes: phonemeVocabulary.kanaToPhonemes(greedy.text),
-                            tokenIds: greedy.tokens,
-                            startTimeSeconds: startSec,
-                            endTimeSeconds: endSec,
-                            confidence: 0.8,
-                            isFinal: false
-                        )
-                        onPartial(partialRes)
-                    }
-                }
-
-                // 6. 発話終了判定 (20フレーム = 200ms 無音 または 最大セグメント長到達)
-                if 20 <= consecutiveSilenceFrames || maxSegmentFrames <= segmentProbs.count {
+                // 5. 発話終了判定 (20 ホップ = 200ms 無音 または 最大セグメント長到達)
+                if 20 <= consecutiveSilenceFrames || maxSegmentHops <= segmentHopCount {
                     finalizeSegment()
                 }
+            }
+        }
+    }
+
+    private func ingestStackedFeatures(_ features: [Float]) {
+        let acousticFrame = acousticDecoder.decodeFrame(
+            features: features,
+            workspace: acousticWorkspace,
+            frameIndex: segmentProbs.count
+        )
+        segmentProbs.append(acousticFrame)
+        segmentRawFeatures.append(features)
+
+        if let onPartial = onPartialResult {
+            if 0 < segmentProbs.count && (segmentProbs.count % partialEveryStacked) == 0 {
+                let windowLimit = 50
+                let window: [AcousticFrameProbabilities]
+                if windowLimit < segmentProbs.count {
+                    window = Array(segmentProbs[(segmentProbs.count - windowLimit)..<segmentProbs.count])
+                } else {
+                    window = segmentProbs
+                }
+                let greedy = languageDecoder.decodeGreedy(
+                    acousticProbs: window,
+                    unkThreshold: unkThreshold
+                )
+                let startSec = Float(segmentStartSample) / Float(config.dspConfig.sampleRate)
+                let endSec = Float(totalSamplesProcessed) / Float(config.dspConfig.sampleRate)
+                let partialRes = TranscriptionResult(
+                    text: greedy.text,
+                    phonemes: phonemeVocabulary.kanaToPhonemes(greedy.text),
+                    tokenIds: greedy.tokens,
+                    startTimeSeconds: startSec,
+                    endTimeSeconds: endSec,
+                    confidence: 0.8,
+                    isFinal: false
+                )
+                onPartial(partialRes)
             }
         }
     }
@@ -394,6 +402,9 @@ public final class StreamingTranscriber: @unchecked Sendable {
 
     /// 現在の発話セグメントの言語デコードと結果確定 (本線: 直接漢字かな + 未知語フォールバック: 聞こえた音のかな)
     private func finalizeSegment() {
+        if let flushed = featureFrontEnd.flush() {
+            ingestStackedFeatures(flushed)
+        }
         if segmentProbs.isEmpty != true {
             let decodeRes: (tokens: [Int], text: String, score: Float)
             if config.beamWidth <= 1 {
@@ -450,10 +461,12 @@ public final class StreamingTranscriber: @unchecked Sendable {
 
         segmentProbs.removeAll(keepingCapacity: true)
         segmentRawFeatures.removeAll(keepingCapacity: true)
+        segmentHopCount = 0
         segmentSpeechActive = false
         consecutiveSilenceFrames = 0
         consecutiveSpeechFrames = 0
         acousticWorkspace.reset()
+        featureFrontEnd.beginUtterance()
     }
 
     /// 残存バッファのフラッシュと終端処理
@@ -495,9 +508,11 @@ public final class StreamingTranscriber: @unchecked Sendable {
         segmentSpeechActive = false
         consecutiveSilenceFrames = 0
         consecutiveSpeechFrames = 0
+        segmentHopCount = 0
         segmentProbs.removeAll(keepingCapacity: true)
         segmentRawFeatures.removeAll(keepingCapacity: true)
         acousticWorkspace.reset()
         paragraphSegmenter.reset()
+        featureFrontEnd.beginUtterance()
     }
 }
