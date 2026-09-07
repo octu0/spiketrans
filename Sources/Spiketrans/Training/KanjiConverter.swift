@@ -137,6 +137,134 @@ public struct KanjiConverter: Sendable {
         return result
     }
 
+    /// 長音符・波ダッシュ・引き伸ばし記号（半角長音符、ホリゾンタルバー、ダッシュ含む）か判定
+    static func isProlongedMark(_ val: UInt32) -> Bool {
+        switch val {
+        case 0x301C, // WAVE DASH (〜)
+             0xFF5E, // FULLWIDTH TILDE (～)
+             0x3030, // WAVY DASH (〰)
+             0x223C, // TILDE OPERATOR (∼)
+             0xFF70, // HALFWIDTH KATAKANA-HIRAGANA PROLONGED SOUND MARK (ｰ)
+             0x2015, // HORIZONTAL BAR (―)
+             0x2014, // EM DASH (—)
+             0x2013, // EN DASH (–)
+             0x2500, // BOX DRAWINGS LIGHT HORIZONTAL (─)
+             0xFF0D: // FULLWIDTH HYPHEN-MINUS (－)
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 波ダッシュ等の引き伸ばし記号を長音符「ー」に正規化
+    static func normalizeProlongedMarks(_ text: String) -> String {
+        var result = ""
+        result.reserveCapacity(text.count)
+        for scalar in text.unicodeScalars {
+            if isProlongedMark(scalar.value) {
+                result.append("ー")
+            } else {
+                result.unicodeScalars.append(scalar)
+            }
+        }
+        return result
+    }
+
+    /// ハイフン・ダッシュまたは引き伸ばし記号のスパンか判定
+    static func isHyphenSpan(_ surface: String) -> Bool {
+        if surface.count != 1 {
+            return false
+        }
+        guard let val = surface.unicodeScalars.first?.value else {
+            return false
+        }
+        switch val {
+        case 0x2D,   // HYPHEN-MINUS (-)
+             0xFF0D, // FULLWIDTH HYPHEN-MINUS (－)
+             0x2010, // HYPHEN (‐)
+             0x2011, // NON-BREAKING HYPHEN (‑)
+             0x2012, // FIGURE DASH (‒)
+             0x2013, // EN DASH (–)
+             0x2014, // EM DASH (—)
+             0x2015, // HORIZONTAL BAR (―)
+             0x30FC: // PROLONGED SOUND MARK (ー)
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 英字・アルファベットトークンか判定 (半角および全角英字、ハイフン区切り英語複合語)
+    static func isAlphabetToken(_ text: String) -> Bool {
+        if text.isEmpty {
+            return false
+        }
+        var letterCount = 0
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            switch v {
+            case 0x41...0x5A, 0x61...0x7A, 0xFF21...0xFF3A, 0xFF41...0xFF5A:
+                letterCount += 1
+            case 0x2D, 0xFF0D, 0x2010...0x2015:
+                ()
+            default:
+                return false
+            }
+        }
+        return 0 < letterCount
+    }
+
+    /// 英文・アルファベットトークンの読みを取得
+    ///
+    /// 組み込み辞書 (SeedVocabulary) を優先し、大文字頭字語は単文字読みに展開する。
+    /// 未知の英単語はローマ字規則による異常変換 (「いぷほね」「あっぷれ」等) を防ぐため空文字で保護する。
+    static func alphabetReading(_ surface: String) -> String? {
+        // 1. シード語彙テーブルから既知語を検索
+        if let reading = SeedVocabulary.readingForAlphabetSurface(surface) {
+            return reading
+        }
+
+        // 2. 単語が純粋な英字・頭字語か検査
+        if isAlphabetToken(surface) {
+            // 大文字のみの頭字語 (例: "GPU", "API", "SDK", "PC", "CPU", "USB") は各文字を展開
+            var isAllUpper = true
+            var letterCount = 0
+            for scalar in surface.unicodeScalars {
+                let v = scalar.value
+                switch v {
+                case 0x41...0x5A, 0xFF21...0xFF3A:
+                    letterCount += 1
+                case 0x2D, 0xFF0D, 0x2010...0x2015:
+                    ()
+                default:
+                    isAllUpper = false
+                    break
+                }
+                if isAllUpper != true {
+                    break
+                }
+            }
+
+            if isAllUpper && 0 < letterCount {
+                var spelled = ""
+                for scalar in surface.unicodeScalars {
+                    let letter = String(scalar)
+                    if let r = SeedVocabulary.readingForLetter(letter) {
+                        spelled.append(r)
+                    }
+                }
+                if spelled.isEmpty != true {
+                    return spelled
+                }
+            }
+
+            // 未知の英単語はローマ字読みへの異常崩れを防ぐため空文字とする
+            return ""
+        }
+
+        return nil
+    }
+
     /// テキストを形態素に分割し、表層と読みを同時に取得する。
     ///
     /// 読みは形態素解析器が文脈から決めたものを使う。漢字単体から読みを引く
@@ -146,33 +274,88 @@ public struct KanjiConverter: Sendable {
             return []
         }
 
+        // 引き伸ばし記号（〜等）の正規化
+        let cleanText = Self.normalizeProlongedMarks(text)
+
         let loc = Locale(identifier: "ja_JP") as CFLocale
-        let nsText = text as NSString
+        let nsText = cleanText as NSString
         let tokenizer = CFStringTokenizerCreate(
             nil,
-            text as CFString,
+            cleanText as CFString,
             CFRangeMake(0, nsText.length),
             kCFStringTokenizerUnitWordBoundary,
             loc
         )
 
-        var tokens: [Token] = []
+        struct RawTokenSpan {
+            let surface: String
+            let range: CFRange
+            let latinAttr: NSString?
+        }
+
+        var rawSpans: [RawTokenSpan] = []
         while CFStringTokenizerAdvanceToNextToken(tokenizer) != [] {
             let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
             let surface = nsText.substring(with: NSRange(location: range.location, length: range.length))
+            let attr = CFStringTokenizerCopyCurrentTokenAttribute(tokenizer, kCFStringTokenizerAttributeLatinTranscription) as? NSString
+            rawSpans.append(RawTokenSpan(surface: surface, range: range, latinAttr: attr))
+        }
 
-            // 数字トークンの読みはラテン翻字が ASCII 数字のまま返り
-            // かな抽出で脱落するため、位取りのかな読みを直接生成する
+        // ハイフン結合英単語 (例: "Wi" + "-" + "Fi" -> "Wi-Fi") の連続トークンを連結
+        var mergedSpans: [RawTokenSpan] = []
+        var spanIdx = 0
+        while spanIdx < rawSpans.count {
+            var currentSpan = rawSpans[spanIdx]
+            spanIdx += 1
+
+            // 次がハイフンで、さらにその次がアルファベットトークンであり、かつ空白を挟まず連続している場合は結合
+            while spanIdx + 1 < rawSpans.count {
+                let hyphenSpan = rawSpans[spanIdx]
+                let nextSpan = rawSpans[spanIdx + 1]
+                let isContiguousHyphen = Self.isHyphenSpan(hyphenSpan.surface) &&
+                    currentSpan.range.location + currentSpan.range.length == hyphenSpan.range.location &&
+                    hyphenSpan.range.location + hyphenSpan.range.length == nextSpan.range.location
+                if isContiguousHyphen && Self.isAlphabetToken(currentSpan.surface) && Self.isAlphabetToken(nextSpan.surface) {
+                    let combinedSurface = "\(currentSpan.surface)-\(nextSpan.surface)"
+                    let combinedRange = CFRangeMake(
+                        currentSpan.range.location,
+                        currentSpan.range.length + hyphenSpan.range.length + nextSpan.range.length
+                    )
+                    currentSpan = RawTokenSpan(surface: combinedSurface, range: combinedRange, latinAttr: nil)
+                    spanIdx += 2
+                } else {
+                    break
+                }
+            }
+            mergedSpans.append(currentSpan)
+        }
+
+        var tokens: [Token] = []
+        var mIdx = 0
+        while mIdx < mergedSpans.count {
+            let span = mergedSpans[mIdx]
+            mIdx += 1
+            let surface = span.surface
+
+            // 数字トークンの読みは位取りのかな読みを直接生成する
             if let numReading = Self.numberReading(surface) {
                 tokens.append(Token(surface: surface, reading: numReading))
                 continue
             }
 
+            // 英文・アルファベットトークン（Wi-Fi, iPhone等）の保護およびフォールバック処理
+            if let alphaReading = Self.alphabetReading(surface) {
+                tokens.append(Token(surface: surface, reading: kanaOnly(alphaReading)))
+                continue
+            }
+
             var reading = ""
-            switch CFStringTokenizerCopyCurrentTokenAttribute(tokenizer, kCFStringTokenizerAttributeLatinTranscription) {
-            case .some(let attr):
-                let latin = attr as! NSString
-                let ms = NSMutableString(string: latin)
+            switch span.latinAttr {
+            case .some(let latin):
+                // NFD 分解で合成マクロン (\u{0304}) に統一し、CFStringTransform の前に長音符「ー」に置換
+                let decomposed = (latin as String).decomposedStringWithCanonicalMapping
+                let withProlongedMark = decomposed.replacingOccurrences(of: "\u{0304}", with: "ー")
+                let ms = NSMutableString(string: withProlongedMark)
                 CFStringTransform(ms as CFMutableString, nil, kCFStringTransformLatinHiragana, false)
                 reading = normalizeKana(ms as String)
             case .none:
@@ -196,11 +379,11 @@ public struct KanjiConverter: Sendable {
         var result = ""
         for scalar in text.precomposedStringWithCanonicalMapping.unicodeScalars {
             let val = scalar.value
-            switch true {
-            case 0x3041 <= val && val <= 0x3096:
+            switch val {
+            case 0x3041...0x3096, 0x30FC:
                 result.unicodeScalars.append(scalar)
-            case val == 0x30FC:
-                result.unicodeScalars.append(scalar)
+            case _ where Self.isProlongedMark(val):
+                result.append("ー")
             default:
                 break
             }
@@ -230,8 +413,8 @@ public struct KanjiConverter: Sendable {
         var normalized = ""
         for scalar in text.unicodeScalars {
             let val = scalar.value
-            switch true {
-            case 0x30A1 <= val && val <= 0x30F6:
+            switch val {
+            case 0x30A1...0x30F6:
                 // カタカナ -> ひらがな
                 switch UnicodeScalar(val - 0x60) {
                 case .some(let hScalar):
@@ -239,6 +422,8 @@ public struct KanjiConverter: Sendable {
                 case .none:
                     normalized.append(Character(scalar))
                 }
+            case _ where Self.isProlongedMark(val):
+                normalized.append("ー")
             default:
                 normalized.append(Character(scalar))
             }
@@ -250,26 +435,12 @@ public struct KanjiConverter: Sendable {
     /// テキスト中の全発音から音素トークン ID 列を抽出
     public func toPhonemeTokenIds(_ text: String) -> [Int] {
         let hira = convertToHiragana(text)
-        var pureKana = ""
-        for c in hira {
-            let scalarVal = c.unicodeScalars.first?.value ?? 0
-            if 0x3041 <= scalarVal && scalarVal <= 0x3096 || c == "ー" {
-                pureKana.append(c)
-            }
-        }
-        return vocabulary.textToTokens(pureKana)
+        return vocabulary.textToTokens(hira)
     }
 
     /// テキスト中の全発音から音素文字列配列を抽出
     public func toPhonemes(_ text: String) -> [String] {
         let hira = convertToHiragana(text)
-        var pureKana = ""
-        for c in hira {
-            let scalarVal = c.unicodeScalars.first?.value ?? 0
-            if 0x3041 <= scalarVal && scalarVal <= 0x3096 || c == "ー" {
-                pureKana.append(c)
-            }
-        }
-        return vocabulary.kanaToPhonemes(pureKana)
+        return vocabulary.kanaToPhonemes(hira)
     }
 }

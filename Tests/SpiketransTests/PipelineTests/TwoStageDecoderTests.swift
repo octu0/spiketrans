@@ -242,6 +242,57 @@ final class TwoStageDecoderTests: XCTestCase {
         XCTAssertEqual(beamResult.text, "にほん")
     }
 
-    // MARK: - 8. スライス動的切り替えテスト
+    // MARK: - 8. 2段階デコードにおけるシード辞書・固有名詞復元統合テスト
 
+    func testTwoStageDecoderWithSeedVocabulary() {
+        let vocab = PhonemeVocabulary()
+        let dict = KanaKanjiDictionary()
+        let kanaDecoder = KanaKanjiDecoder(dictionary: dict, languageBonus: 0.0)
+
+        // 1. 音素列との相互可逆性の確認（長音素 "_" を含む標準音素列）
+        let reversibleKanaWords: [(kana: String, expectedSurface: String)] = [
+            ("すたば", "スターバックス"),
+            ("まくど", "マクドナルド"),
+            ("めすか", "メルカリ"),
+            ("えあびー", "AirBnB"),
+            ("ぐーぐる", "Google")
+        ]
+
+        var rIdx = 0
+        while rIdx < reversibleKanaWords.count {
+            let pair = reversibleKanaWords[rIdx]
+            let phonemes = vocab.kanaToPhonemes(pair.kana)
+            let reconstructedKana = vocab.phonemesToKana(phonemes)
+            XCTAssertEqual(reconstructedKana, pair.kana, "Acoustic phoneme reconstruction failed for: \(pair.kana)")
+            rIdx += 1
+        }
+
+        // 2. 第2段（言語デコーダ）による表記・固有名詞・和英併記復元検証
+        let acousticKanaWords: [(kana: String, expectedSurface: String)] = [
+            ("すたば", "スターバックス"),
+            ("まくど", "マクドナルド"),
+            ("めすか", "メルカリ"),
+            ("あいふぉーん", "iPhone"),
+            ("おーぷんえーあい", "OpenAI"),
+            ("えあびー", "AirBnB"),
+            ("わいふぁい", "WiFi"),
+            ("ぐーぐる", "Google"),
+            ("あっぷる", "アップル")
+        ]
+
+        var i = 0
+        while i < acousticKanaWords.count {
+            let pair = acousticKanaWords[i]
+            let decoded = kanaDecoder.decode(kanaText: pair.kana)
+            switch pair.kana {
+            case "わいふぁい":
+                XCTAssertTrue(decoded == "WiFi" || decoded == "Wi-Fi", "Failed for WiFi: \(decoded)")
+            case "ぐーぐる":
+                XCTAssertTrue(decoded == "Google" || decoded == "グーグル", "Failed for Google: \(decoded)")
+            default:
+                XCTAssertEqual(decoded, pair.expectedSurface, "Failed for acoustic kana: \(pair.kana)")
+            }
+            i += 1
+        }
+    }
 }

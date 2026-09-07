@@ -21,7 +21,7 @@ public enum MLXCTCLoss {
         public let validMask: MLXArray      // [B, Lmax] 1.0 で有効な位置
         public let finalIndex1: MLXArray    // [B] Int32  L_b - 1
         public let finalIndex2: MLXArray    // [B] Int32  L_b - 2 (下限 0)
-        public let hasSecondFinal: MLXArray // [B] 1.0 で L_b >= 2
+        public let hasSecondFinal: MLXArray // [B] 1.0 で 2 <= L_b
         public let inputLengths: MLXArray   // [B] Int32
         public let maxExtendedLength: Int
 
@@ -100,6 +100,37 @@ public enum MLXCTCLoss {
             self.hasSecondFinal = MLXArray(hasSecond, [batchSize])
             self.inputLengths = MLXArray(lengths, [batchSize])
         }
+
+        public init(
+            extTargets: MLXArray,
+            skipMask: MLXArray,
+            validMask: MLXArray,
+            finalIndex1: MLXArray,
+            finalIndex2: MLXArray,
+            hasSecondFinal: MLXArray,
+            inputLengths: MLXArray
+        ) {
+            self.extTargets = extTargets
+            self.skipMask = skipMask
+            self.validMask = validMask
+            self.finalIndex1 = finalIndex1
+            self.finalIndex2 = finalIndex2
+            self.hasSecondFinal = hasSecondFinal
+            self.inputLengths = inputLengths
+            self.maxExtendedLength = extTargets.shape[1]
+        }
+
+        public func toArrays() -> [MLXArray] {
+            return [
+                extTargets,
+                skipMask,
+                validMask,
+                finalIndex1,
+                finalIndex2,
+                hasSecondFinal,
+                inputLengths,
+            ]
+        }
     }
 
     /// alpha を s 方向に k だけずらす。空いた先頭は -inf 相当で埋める。
@@ -146,7 +177,7 @@ public enum MLXCTCLoss {
             let stay = alpha
             let fromPrev = shiftedRight(alpha, by: 1)
             let skipRaw = shiftedRight(alpha, by: 2)
-            let skip = which(targets.skipMask .> 0.0, skipRaw, MLXArray(negativeInfinity))
+            let skip = which(MLXArray(0.0) .< targets.skipMask, skipRaw, MLXArray(negativeInfinity))
 
             var next = logAddExp(logAddExp(stay, fromPrev), skip) + emission(at: t)
             next = which(invalid, MLXArray(negativeInfinity), next)
@@ -162,7 +193,7 @@ public enum MLXCTCLoss {
             .squeezed(axis: 1)
         let last2Raw = takeAlong(alpha, targets.finalIndex2.expandedDimensions(axis: 1), axis: 1)
             .squeezed(axis: 1)
-        let last2 = which(targets.hasSecondFinal .> 0.0, last2Raw, MLXArray(negativeInfinity))
+        let last2 = which(MLXArray(0.0) .< targets.hasSecondFinal, last2Raw, MLXArray(negativeInfinity))
 
         let logLikelihood = logAddExp(last1, last2)
         return -mean(logLikelihood)

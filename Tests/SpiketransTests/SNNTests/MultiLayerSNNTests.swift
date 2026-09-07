@@ -10,6 +10,11 @@ final class MultiLayerSNNTests: XCTestCase {
         MLXRandom.seed(42)
     }
 
+    override func tearDown() {
+        Device.setDefault(device: .gpu)
+        super.tearDown()
+    }
+
     /// 決定的なテスト用特徴量系列 (0〜1)
     private func makeFeatures(frames: Int, dim: Int) -> [[Float]] {
         var seq: [[Float]] = []

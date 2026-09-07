@@ -70,8 +70,7 @@ public final class LanguageTrainer: @unchecked Sendable {
             // 並列勾配計算
             DispatchQueue.concurrentPerform(iterations: currentBatchCount) { idx in
                 let sampleIdx = currentStart + idx
-                let sample = dataset[sampleIdx]
-                let tokens = [TextVocabulary.sosId] + sample.textIds + [TextVocabulary.eosId]
+                let tokens = [TextVocabulary.sosId] + dataset.textIds(at: sampleIdx) + [TextVocabulary.eosId]
 
                 if 1 < tokens.count {
                     var featSeq: [[Float]] = []
@@ -170,9 +169,8 @@ public final class LanguageTrainer: @unchecked Sendable {
 
             DispatchQueue.concurrentPerform(iterations: currentBatchCount) { idx in
                 let sampleIdx = currentStart + idx
-                let sample = dataset[sampleIdx]
-                let kanaIds = kanaVocabulary.textToIds(sample.hiraganaText)
-                let kanjiIds = sample.textIds
+                let kanaIds = kanaVocabulary.textToIds(dataset.hiraganaText(at: sampleIdx))
+                let kanjiIds = dataset.textIds(at: sampleIdx)
 
                 if 0 < kanaIds.count && 0 < kanjiIds.count {
                     // 入力: かなトークン特徴量系列

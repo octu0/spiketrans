@@ -81,6 +81,10 @@ func performanceCoreCount() -> Int {
 var numWorkers = performanceCoreCount()
 var epochs = 20
 var maxTrainSamples: Int? = nil
+var batchSize = Defaults.batchSize
+var useFeatureCache = false
+var cacheMaxGB: Double = 0.0
+var featureCacheDir: String? = nil
 var datasetPath = ""
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
@@ -92,6 +96,22 @@ let args = CommandLine.arguments
 while argIdx < args.count {
     let arg = args[argIdx]
     switch arg {
+    case "-h", "--help":
+        print("使い方: train -d <マニフェスト.jsonl> [オプション]")
+        print("オプション:")
+        print("  -d, --dir, --dataset <パス>        学習マニフェスト (JSONL) のパス [必須]")
+        print("  -b, --batch-size <Int>             ミニバッチサイズ (既定: 64)")
+        print("  --cache-features                   特徴量ディスクキャッシュを有効化 (推奨)")
+        print("  --no-cache-features                特徴量ディスクキャッシュを無効化 (オンデマンド抽出)")
+        print("  --cache-max-gb <Double>            特徴量ディスクキャッシュの最大容量 (GB, 既定: 0.0 で無制限)")
+        print("  --feature-cache-dir <ディレクトリ> 特徴量ディスクキャッシュの保存先ディレクトリ")
+        print("  -e, --epochs <Int>                 エポック数 (既定: 20)")
+        print("  -s, --samples <Int>                最大学習サンプル数 (制限なし)")
+        print("  -p, --parallel <Int>               並列ワーカー数 (既定: P コア数)")
+        print("  --device <auto|gpu|cpu>            実行デバイス (既定: auto)")
+        print("  --export-weights <パス>            学習済み重みの出力先 JSON パス")
+        print("  --import-weights <パス>            初期重みのインポート元 JSON パス")
+        exit(0)
     case "-p", "--parallel":
         if (argIdx + 1) < args.count {
             if let val = Int(args[argIdx + 1]) {
@@ -111,6 +131,35 @@ while argIdx < args.count {
             if let val = Int(args[argIdx + 1]) {
                 maxTrainSamples = max(1, val)
             }
+            argIdx += 1
+        }
+    case "-b", "--batch-size":
+        if (argIdx + 1) < args.count {
+            if let val = Int(args[argIdx + 1]) {
+                batchSize = max(1, val)
+            }
+            argIdx += 1
+        }
+    case "--cache-features":
+        useFeatureCache = true
+    case "--no-cache-features":
+        useFeatureCache = false
+    case "--cache-max-gb":
+        if (argIdx + 1) < args.count {
+            if let val = Double(args[argIdx + 1]) {
+                if 0.0 < val {
+                    cacheMaxGB = val
+                } else {
+                    cacheMaxGB = 0.0
+                }
+                useFeatureCache = true
+            }
+            argIdx += 1
+        }
+    case "--feature-cache-dir", "--cache-dir":
+        if (argIdx + 1) < args.count {
+            featureCacheDir = args[argIdx + 1]
+            useFeatureCache = true
             argIdx += 1
         }
     case "-d", "--dir", "--dataset":
@@ -144,7 +193,8 @@ while argIdx < args.count {
 // データセットのパスは必須。特定コーパスを既定値に埋め込まない
 if datasetPath.isEmpty {
     print("エラー: 学習マニフェスト (JSONL) を指定してください。")
-    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数]")
+    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数] [-b バッチサイズ] [--cache-features]")
+    print("  詳細は train --help を参照してください。")
     print("  各行: {\"path\": \"/path/to/voice.wav\", \"text\": \"漢字かな混じりの発話テキスト\"}")
     print("  マニフェストは script/dataset/ の各コーパス用スクリプトで生成する")
     exit(1)
@@ -164,8 +214,16 @@ default: // "auto"
     #endif
 }
 
+let deviceDescription: String
+if useGPU {
+    deviceDescription = "Apple Silicon GPU (MLX Swift)"
+} else {
+    deviceDescription = "CPU (Pure Swift)"
+}
+
 print("データセットパス: \(datasetPath)")
-print("実行デバイス   : \(useGPU ? "Apple Silicon GPU (MLX Swift)" : "CPU (Pure Swift)")")
+print("実行デバイス   : \(deviceDescription)")
+print("ミニバッチサイズ (-b): \(batchSize)")
 print("並列ワーカー数 (-p): \(numWorkers) スレッド")
 print("エポック数     (-e): \(epochs) エポック")
 if let s = maxTrainSamples {
@@ -194,6 +252,30 @@ guard let manifestContent = try? String(contentsOfFile: datasetPath, encoding: .
 }
 
 let manifestDir = (datasetPath as NSString).deletingLastPathComponent
+let resolvedCacheDir: String
+if let customDir = featureCacheDir {
+    resolvedCacheDir = (customDir as NSString).standardizingPath
+} else {
+    let baseDir: String
+    if manifestDir.isEmpty {
+        baseDir = FileManager.default.currentDirectoryPath
+    } else {
+        baseDir = manifestDir
+    }
+    resolvedCacheDir = ((baseDir as NSString).appendingPathComponent(".spiketrans_feature_cache") as NSString).standardizingPath
+}
+var featureCache: FeatureDiskCache? = nil
+if useFeatureCache {
+    featureCache = FeatureDiskCache(baseDirectory: resolvedCacheDir)
+    if 0.0 < cacheMaxGB {
+        print("特徴量キャッシュ (--cache-features): 有効 (\(resolvedCacheDir), 最大容量: \(String(format: "%.1f", cacheMaxGB)) GB 長尺優先クォータ)")
+    } else {
+        print("特徴量キャッシュ (--cache-features): 有効 (\(resolvedCacheDir), 容量制限なし)")
+    }
+} else {
+    print("特徴量キャッシュ (--cache-features): 無効 (オンデマンド抽出)")
+}
+
 let jsonDecoder = JSONDecoder()
 var textLines: [String] = []
 var rawPairs: [(path: String, fileId: String, text: String)] = []
@@ -226,7 +308,26 @@ let trainTextLines = Array(textLines.prefix(sampleLimit))
 
 let kanjiConverter = KanjiConverter()
 let trainHiraganaLines = trainTextLines.map { kanjiConverter.convertToHiragana($0) }
-let phoneticVocabulary = TextVocabulary(corpus: trainHiraganaLines)
+
+// 重みを持ち込む場合は同梱の語彙を使う。学習時と別のマニフェストでも
+// 出力層の ID 割当が変わらず、評価や追加学習ができる
+var importedWeights: SpikingNetworkWeights? = nil
+if let impPath = importWeightsPath {
+    print("\n[重み読込] 外部ファイルからモデル重みをインポート中: \(impPath)")
+    guard let wData = try? SpikingNetworkWeights.load(from: URL(fileURLWithPath: impPath)) else {
+        print("  ✕ 重みファイルの読み込みに失敗しました。")
+        exit(1)
+    }
+    importedWeights = wData
+}
+let phoneticVocabulary: TextVocabulary
+switch importedWeights?.vocabulary {
+case .some(let embedded):
+    phoneticVocabulary = embedded
+    print("  同梱語彙を使用: \(embedded.size) 文字")
+case .none:
+    phoneticVocabulary = TextVocabulary(corpus: trainHiraganaLines)
+}
 let textVocabulary = TextVocabulary(corpus: trainTextLines)
 
 let kanaKanjiDict = KanaKanjiDictionary()
@@ -248,14 +349,32 @@ let dataset = SpeechDataset.lazyFromManifest(
     pairs: manifestPairs,
     textVocabulary: textVocabulary,
     frameStack: Defaults.frameStack,
-    workers: numWorkers
+    workers: numWorkers,
+    cache: featureCache,
+    maxCacheGigabytes: cacheMaxGB
 )
 
 let loadElapsed = CFAbsoluteTimeGetCurrent() - startTime
 print("データセット構築完了: \(dataset.count) サンプル (所要時間: \(String(format: "%.3f", loadElapsed)) 秒)")
+if let c = featureCache {
+    if let allowed = c.allowedPaths {
+        let totalSamples = dataset.count
+        let cachedCount = allowed.count
+        let ratio: Double
+        if 0 < totalSamples {
+            ratio = Double(cachedCount) / Double(totalSamples) * 100.0
+        } else {
+            ratio = 0.0
+        }
+        print("  [キャッシュクォータ] 長尺上位 \(cachedCount)/\(totalSamples) 件 (\(String(format: "%.1f", ratio))%) をディスクキャッシュ対象に選別 (上限: \(String(format: "%.1f", cacheMaxGB)) GB)")
+        if 0 < totalSamples && cachedCount <= 0 {
+            print("  [警告] 指定されたキャッシュ上限 (\(String(format: "%.4f", cacheMaxGB)) GB) が小さすぎるため、全サンプルがキャッシュ対象外となりました。すべてオンデマンドで処理されます。")
+        }
+    }
+}
 
 for i in 0..<min(3, dataset.count) {
-    let sample = dataset[i]
+    let sample = dataset.sample(at: i, loadPCM: true)
     let featDim = sample.acousticFeatures.first?.count ?? 128
     let numSamples = sample.audioPCM.count
     let durSec = Float(numSamples) / 16000.0
@@ -266,10 +385,19 @@ for i in 0..<min(3, dataset.count) {
 }
 
 // 4. 第1段 音響 SNN (かな・音素) の学習実行
-print("\n--- 2. 第1段 音響 SNN (かな・音素) の学習実行 (デバイス: \(useGPU ? "GPU" : "CPU")) ---")
+let trainDeviceLabel: String
+let trainLR: Float
+if useGPU {
+    trainDeviceLabel = "GPU"
+    trainLR = 0.003
+} else {
+    trainDeviceLabel = "CPU"
+    trainLR = 0.015
+}
+print("\n--- 2. 第1段 音響 SNN (かな・音素) の学習実行 (デバイス: \(trainDeviceLabel)) ---")
 let trainConfig = TrainingConfig(
     epochs: epochs,
-    learningRate: useGPU ? 0.003 : 0.015,
+    learningRate: trainLR,
     logInterval: 2,
     clipNorm: 5.0
 )
@@ -302,21 +430,14 @@ let trainer = Trainer(
 )
 
 // 重みのインポート。-e 0 なら評価のみ、-e N なら読み込んだ重みから追加学習する
-var importedWeights: SpikingNetworkWeights? = nil
-if let impPath = importWeightsPath {
-    print("\n[重み読込] 外部ファイルからモデル重みをインポート中: \(impPath)")
-    let impURL = URL(fileURLWithPath: impPath)
-    guard let wData = try? SpikingNetworkWeights.load(from: impURL) else {
-        print("  ✕ 重みファイルの読み込みに失敗しました。")
-        exit(1)
-    }
+if let wData = importedWeights {
     guard wData.outputDim == phoneticVocabulary.size,
-          wData.inputDim == acousticInputDim else {
-        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size))。")
+          wData.inputDim == acousticInputDim,
+          wData.numLayers == Defaults.numLayers else {
+        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size), 層数 \(wData.numLayers)/\(Defaults.numLayers))。")
         exit(1)
     }
     trainer.acousticTrainer.network.importWeights(from: wData)
-    importedWeights = wData
     if epochs == 0 {
         print("  ✓ 音響モデル重みのインポート完了。評価のみ実行します (-e 0)。")
     } else {
@@ -326,40 +447,39 @@ if let impPath = importWeightsPath {
 
 if epochs == 0 {
     // 追加学習なし。インポート済み重みで評価へ進む
-} else if useGPU {
-    print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(Defaults.batchSize))...")
+} else {
+    if useGPU {
+        print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(batchSize))...")
 
-    // 教師はフレームに整列していないかな ID 列。アライメントは CTC が周辺化する。
-    // 発話フレームを文字数で等分する近似アライメント + 交差エントロピーでは、
-    // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
-    print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
-    let allTargets: [[Int]] = (0..<dataset.count).map { idx in
-        return phoneticVocabulary.textToIds(dataset.hiraganaText(at: idx))
-    }
+        // 教師はフレームに整列していないかな ID 列。アライメントは CTC が周辺化する。
+        // 発話フレームを文字数で等分する近似アライメント + 交差エントロピーでは、
+        // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
+        print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
+        let allTargets: [[Int]] = (0..<dataset.count).map { idx in
+            return phoneticVocabulary.textToIds(dataset.hiraganaText(at: idx))
+        }
 
-    let mlxNet = MLXSpikingNetwork(
-        numLayers: Defaults.numLayers,
-        inputDim: acousticInputDim,
-        maxHiddenDim: Defaults.maxHiddenDim,
-        outputDim: phoneticVocabulary.size,
-        timeSteps: 4,
-        lifConfig: trainer.acousticTrainer.network.lifConfig
-    )
-    if let wData = importedWeights {
-        mlxNet.importWeights(from: wData)
-        print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
-    }
-    let mlxTrainer = MLXBPTTTrainer(
-        network: mlxNet,
-        config: trainConfig,
-        bpttWindow: Defaults.bpttWindow
-    )
-    print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
-    let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
-    print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
-    let trainStartTime = CFAbsoluteTimeGetCurrent()
-
-    let batchSize = Defaults.batchSize
+        let mlxNet = MLXSpikingNetwork(
+            numLayers: Defaults.numLayers,
+            inputDim: acousticInputDim,
+            maxHiddenDim: Defaults.maxHiddenDim,
+            outputDim: phoneticVocabulary.size,
+            timeSteps: 4,
+            lifConfig: trainer.acousticTrainer.network.lifConfig
+        )
+        if let wData = importedWeights {
+            mlxNet.importWeights(from: wData)
+            print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
+        }
+        let mlxTrainer = MLXBPTTTrainer(
+            network: mlxNet,
+            config: trainConfig,
+            bpttWindow: Defaults.bpttWindow
+        )
+        print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
+        let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
+        print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
+        let trainStartTime = CFAbsoluteTimeGetCurrent()
 
     // CTC はフレーム数 T >= ラベル数 + 連続重複数 を要求する。
     // これを満たさないサンプル (早口・短尺音声に長い教師) は尤度が定義できず、
@@ -431,16 +551,19 @@ if epochs == 0 {
             self.items = [[[Float]]](repeating: [], count: count)
         }
     }
-    func buildBatchFeatures(_ indices: [Int]) -> [[[Float]]] {
+    let activeWorkers = numWorkers
+    @Sendable func buildBatchFeatures(_ indices: [Int]) -> [[[Float]]] {
         let buffer = FeatureBatchBuffer(count: indices.count)
-        let workerCount = max(1, min(numWorkers, indices.count))
+        let workerCount = max(1, min(activeWorkers, indices.count))
         DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
             var i = worker
             while i < indices.count {
                 let meta = dataset.metaSamples[indices[i]]
                 buffer.items[i] = SpeechDataset.loadFeatures(
                     path: meta.path,
-                    frameStack: Defaults.frameStack
+                    frameStack: Defaults.frameStack,
+                    cache: dataset.cache,
+                    loadPCM: false
                 ).features
                 i += workerCount
             }
@@ -466,6 +589,10 @@ if epochs == 0 {
     var ep = 1
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
+        // バッチの並びは毎エポック混ぜる。長さ順のまま流すと 1 エポックの前半は
+        // 短い断片ばかり、後半は長い発話ばかりになり、100 万件規模では最初の
+        // 数千ステップが 1 秒未満の断片だけで埋まって blank 一色に崩れる
+        batchGroups.shuffle()
         var curLR = scheduler.learningRate(
             step: globalStep + 1, totalSteps: totalSteps, warmupSteps: warmupSteps)
 
@@ -554,26 +681,27 @@ if epochs == 0 {
     #if canImport(MLX)
     MLX.Memory.clearCache()
     #endif
-} else {
-    print("  CPU (Pure Swift \(numWorkers) スレッド) による SNN-CTC 損失並列学習を開始...")
-    let trainStartTime = CFAbsoluteTimeGetCurrent()
-    var acResults: [EpochResult] = []
-    var ep = 1
-    while ep <= epochs {
-        let epStartTime = CFAbsoluteTimeGetCurrent()
-        let acRes = trainer.acousticTrainer.trainCTCEpoch(
-            dataset: dataset,
-            kanaVocabulary: phoneticVocabulary,
-            epoch: ep,
-            numWorkers: numWorkers
-        )
-        acResults.append(acRes)
-        let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
-        print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", acRes.totalLoss)) (所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
-        ep += 1
+    } else {
+        print("  CPU (Pure Swift \(numWorkers) スレッド) による SNN-CTC 損失並列学習を開始...")
+        let trainStartTime = CFAbsoluteTimeGetCurrent()
+        var acResults: [EpochResult] = []
+        var ep = 1
+        while ep <= epochs {
+            let epStartTime = CFAbsoluteTimeGetCurrent()
+            let acRes = trainer.acousticTrainer.trainCTCEpoch(
+                dataset: dataset,
+                kanaVocabulary: phoneticVocabulary,
+                epoch: ep,
+                numWorkers: numWorkers
+            )
+            acResults.append(acRes)
+            let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
+            print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", acRes.totalLoss)) (所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
+            ep += 1
+        }
+        let trainElapsed = CFAbsoluteTimeGetCurrent() - trainStartTime
+        print("\nCPU 学習完了 (総所要時間: \(String(format: "%.3f", trainElapsed)) 秒)")
     }
-    let trainElapsed = CFAbsoluteTimeGetCurrent() - trainStartTime
-    print("\nCPU 学習完了 (総所要時間: \(String(format: "%.3f", trainElapsed)) 秒)")
 }
 
 // 4.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド)
@@ -618,7 +746,7 @@ print("\n--- 3. 音声文字起こしテスト ---")
 
 // === 一次診断ログ (データセット先頭の発話) ===
 if 0 < dataset.count {
-    let s0 = dataset[0]
+    let s0 = dataset.sample(at: 0, loadPCM: true)
     let feat0 = s0.acousticFeatures
     let totalF = feat0.count
     let hiraIds0 = phoneticVocabulary.textToIds(s0.hiraganaText)
@@ -692,7 +820,7 @@ if 0 < dataset.count {
                 }
                 
                 // イコライジング後
-                _ = filterbank.extractFeatures(pcmPtr: framePtr, count: 400, workspace: ws)
+                filterbank.extractFeatures(pcmPtr: framePtr, count: 400, workspace: ws)
                 var eqOOB: Float = 0.0
                 k = 0
                 while k < 256 {
@@ -713,8 +841,18 @@ if 0 < dataset.count {
             }
         }
         
-        let attenRatio = 0.0 < rawOutOfBandTotal ? (eqOutOfBandTotal / rawOutOfBandTotal) : 0.20
-        let attenDb = 0.0 < attenRatio ? -10.0 * log10(attenRatio) : 7.0
+        let attenRatio: Float
+        if 0.0 < rawOutOfBandTotal {
+            attenRatio = eqOutOfBandTotal / rawOutOfBandTotal
+        } else {
+            attenRatio = 0.20
+        }
+        let attenDb: Float
+        if 0.0 < attenRatio {
+            attenDb = -10.0 * log10(attenRatio)
+        } else {
+            attenDb = 7.0
+        }
         print("\n[0] フォルマント適応スペクトルイコライジング測定 (発話区間 \(measuredFrames) フレーム平均):")
         print("  200〜4000Hz 外 パワー (適用前): \(String(format: "%.6e", rawOutOfBandTotal))")
         print("  200〜4000Hz 外 パワー (適用後): \(String(format: "%.6e", eqOutOfBandTotal))")
@@ -845,7 +983,7 @@ if 0 < dataset.count {
 
 if 0 < dataset.count {
     for idx in 0..<min(3, dataset.count) {
-        let testSample = dataset[idx]
+        let testSample = dataset.sample(at: idx, loadPCM: true)
         print("\n  ==================================================")
         print("  [\(idx+1)] 正解テキスト(漢字): \"\(testSample.rawText)\"")
         print("      正解かな発音:     \"\(testSample.hiraganaText)\"")

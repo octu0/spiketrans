@@ -8,6 +8,7 @@ var weightsPath = ""
 var dictPath = ""          // 第2段辞書を構築するテキスト (1 行 1 文)
 var chunkSeconds = 0.0     // 0 で分割なし
 var maxSeconds = 0.0       // 0 で全体
+var usePostProcess = true
 
 var argIdx = 1
 let args = CommandLine.arguments
@@ -43,6 +44,8 @@ while argIdx < args.count {
             }
             argIdx += 1
         }
+    case "--raw", "--no-postprocess":
+        usePostProcess = false
     default:
         break
     }
@@ -50,7 +53,7 @@ while argIdx < args.count {
 }
 
 if wavPath.isEmpty || weightsPath.isEmpty {
-    print("使い方: transcribe -i <音声.wav> -w <重み.json> [-d <辞書テキスト>] [--chunk-seconds N] [--max-seconds N]")
+    print("使い方: transcribe -i <音声.wav> -w <重み.json> [-d <辞書テキスト>] [--chunk-seconds N] [--max-seconds N] [--raw]")
     exit(1)
 }
 
@@ -161,7 +164,11 @@ if chunkSeconds <= 0.0 {
         offset += n
     }
 }
-print("分割: \(segments.count) チャンク" + (chunkSeconds <= 0.0 ? " (分割なし)" : " (\(Int(chunkSeconds)) 秒ごと)"))
+var chunkDescription = " (\(Int(chunkSeconds)) 秒ごと)"
+if chunkSeconds <= 0.0 {
+    chunkDescription = " (分割なし)"
+}
+print("分割: \(segments.count) チャンク" + chunkDescription)
 
 // 5. 文字起こし
 let network = SpikingNetwork(weights: weights)
@@ -239,26 +246,61 @@ print("  処理フレーム数: \(totalFrames), かな文字数: \(kanaText.coun
 print(String(format: "  ピークメモリ: %.0f MB", peakMemory))
 
 // 6. 第2段 (辞書がある場合)
-if 0 < kanaText.count && 0 < kanaKanjiDict.count {
-    let stage2Start = CFAbsoluteTimeGetCurrent()
-    let kanaDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
-    var kanjiParts: [String] = []
-    var pIdx = 0
-    while pIdx < kanaParts.count {
-        kanjiParts.append(kanaDecoder.decode(kanaText: kanaParts[pIdx]))
-        pIdx += 1
+if 0 < kanaText.count {
+    var outputParts = kanaParts
+    if 0 < kanaKanjiDict.count {
+        let stage2Start = CFAbsoluteTimeGetCurrent()
+        let kanaDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
+        var kanjiParts: [String] = []
+        kanjiParts.reserveCapacity(kanaParts.count)
+        for part in kanaParts {
+            kanjiParts.append(kanaDecoder.decode(kanaText: part))
+        }
+        outputParts = kanjiParts
+        let stage2Elapsed = CFAbsoluteTimeGetCurrent() - stage2Start
+        let totalKanjiChars = kanjiParts.reduce(0) { $0 + $1.count }
+        print(String(format: "第2段 完了: %.1f 秒 (漢字 %d 文字)", stage2Elapsed, totalKanjiChars))
+        let mem = residentMemoryMB()
+        if peakMemory < mem {
+            peakMemory = mem
+        }
+        print(String(format: "  ピークメモリ: %.0f MB", peakMemory))
+        print("")
     }
-    let kanjiText = kanjiParts.joined()
-    let stage2Elapsed = CFAbsoluteTimeGetCurrent() - stage2Start
-    print(String(format: "第2段 完了: %.1f 秒 (漢字 %d 文字)", stage2Elapsed, kanjiText.count))
-    let mem = residentMemoryMB()
-    if peakMemory < mem {
-        peakMemory = mem
+
+    if usePostProcess {
+        print("=== 整形結果 (フィラー除去・ITN・段落タイムスタンプ) ===")
+        let fillerFilter = FillerWordFilter()
+        let normalizer = InverseTextNormalizer()
+        var results: [TranscriptionResult] = []
+        results.reserveCapacity(segments.count)
+        for (idx, seg) in segments.enumerated() {
+            let sSec = Float(seg.start) / 16000.0
+            let eSec = Float(seg.start + seg.count) / 16000.0
+            var text = outputParts[idx]
+            text = fillerFilter.filter(text)
+            text = normalizer.normalize(text)
+            results.append(TranscriptionResult(
+                text: text,
+                phonemes: [],
+                tokenIds: [],
+                startTimeSeconds: sSec,
+                endTimeSeconds: eSec,
+                confidence: 1.0,
+                isFinal: true
+            ))
+        }
+        let paragraphs = ParagraphSegmenter.segment(results: results)
+        for p in paragraphs {
+            print(p.formattedLine)
+        }
+        print("==================================================")
+    } else {
+        if 0 < kanaKanjiDict.count {
+            print("--- 冒頭 300 文字 ---")
+            print(String(outputParts.joined().prefix(300)))
+        }
     }
-    print(String(format: "  ピークメモリ: %.0f MB", peakMemory))
-    print("")
-    print("--- 冒頭 300 文字 ---")
-    print(String(kanjiText.prefix(300)))
 }
 print("")
 print("--- かな冒頭 200 文字 ---")

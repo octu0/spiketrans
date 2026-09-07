@@ -36,19 +36,34 @@ public struct StreamingTranscriberConfig: Sendable {
     public let beamWidth: Int
     public let lmWeight: Float
     public let maxSegmentDurationSeconds: Float
+    public let enableFillerRemoval: Bool
+    public let fillerMode: FillerFilterMode
+    public let enableITN: Bool
+    public let enableParagraphSegmentation: Bool
+    public let paragraphPauseThreshold: Float
 
     public init(
         dspConfig: DSPConfig = DSPConfig(),
         useQuantization: Bool = false,
         beamWidth: Int = 4,
         lmWeight: Float = 0.3,
-        maxSegmentDurationSeconds: Float = 15.0
+        maxSegmentDurationSeconds: Float = 15.0,
+        enableFillerRemoval: Bool = false,
+        fillerMode: FillerFilterMode = .remove,
+        enableITN: Bool = false,
+        enableParagraphSegmentation: Bool = false,
+        paragraphPauseThreshold: Float = 1.2
     ) {
         self.dspConfig = dspConfig
         self.useQuantization = useQuantization
         self.beamWidth = beamWidth
         self.lmWeight = lmWeight
         self.maxSegmentDurationSeconds = maxSegmentDurationSeconds
+        self.enableFillerRemoval = enableFillerRemoval
+        self.fillerMode = fillerMode
+        self.enableITN = enableITN
+        self.enableParagraphSegmentation = enableParagraphSegmentation
+        self.paragraphPauseThreshold = paragraphPauseThreshold
     }
 }
 
@@ -64,6 +79,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
     // コールバック
     public var onPartialResult: (@Sendable (TranscriptionResult) -> Void)?
     public var onFinalResult: (@Sendable (TranscriptionResult) -> Void)?
+    public var onParagraphResult: (@Sendable (ParagraphSegment) -> Void)?
 
     // DSP & SNN エンジン
     private let vad: VAD
@@ -77,6 +93,11 @@ public final class StreamingTranscriber: @unchecked Sendable {
     private let acousticDecoder: AcousticDecoder
     private let acousticWorkspace: AcousticWorkspace
     private let languageDecoder: LanguageDecoder
+
+    // テキスト後処理エンジン (フィラー除去・ITN・段落分け)
+    private let fillerFilter: FillerWordFilter
+    private let normalizer: InverseTextNormalizer
+    private let paragraphSegmenter: ParagraphSegmenter
 
     // O(1) 固定長リングバッファ
     private let ringBufferCapacity: Int = 32768
@@ -160,6 +181,10 @@ public final class StreamingTranscriber: @unchecked Sendable {
             fallbackVocabulary: phonemeVocabulary,
             config: lmConfig
         )
+
+        self.fillerFilter = FillerWordFilter(mode: config.fillerMode)
+        self.normalizer = InverseTextNormalizer()
+        self.paragraphSegmenter = ParagraphSegmenter(pauseThresholdSeconds: config.paragraphPauseThreshold)
 
         self.ringBuffer = [Float](repeating: 0.0, count: ringBufferCapacity)
         let framesPerSec = Float(dspCfg.sampleRate) / Float(dspCfg.hopSize)
@@ -388,6 +413,17 @@ public final class StreamingTranscriber: @unchecked Sendable {
             finalText = finalText.replacingOccurrences(of: "<unk>", with: "")
             finalText = finalText.replacingOccurrences(of: "?", with: "")
 
+            if finalText.isEmpty {
+                finalText = decodeFallbackKana(from: segmentRawFeatures)
+            }
+
+            if config.enableFillerRemoval {
+                finalText = fillerFilter.filter(finalText)
+            }
+            if config.enableITN {
+                finalText = normalizer.normalize(finalText)
+            }
+
             let startSec = Float(segmentStartSample) / Float(config.dspConfig.sampleRate)
             let endSec = Float(totalSamplesProcessed) / Float(config.dspConfig.sampleRate)
             let finalRes = TranscriptionResult(
@@ -400,6 +436,16 @@ public final class StreamingTranscriber: @unchecked Sendable {
                 isFinal: true
             )
             onFinalResult?(finalRes)
+
+            if config.enableParagraphSegmentation {
+                if let paragraph = paragraphSegmenter.appendSegment(
+                    text: finalText,
+                    startSeconds: startSec,
+                    endSeconds: endSec
+                ) {
+                    onParagraphResult?(paragraph)
+                }
+            }
         }
 
         segmentProbs.removeAll(keepingCapacity: true)
@@ -432,6 +478,12 @@ public final class StreamingTranscriber: @unchecked Sendable {
         if segmentSpeechActive {
             finalizeSegment()
         }
+
+        if config.enableParagraphSegmentation {
+            if let finalParagraph = paragraphSegmenter.flush() {
+                onParagraphResult?(finalParagraph)
+            }
+        }
     }
 
     /// 内部状態の全リセット
@@ -446,5 +498,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         segmentProbs.removeAll(keepingCapacity: true)
         segmentRawFeatures.removeAll(keepingCapacity: true)
         acousticWorkspace.reset()
+        paragraphSegmenter.reset()
     }
 }

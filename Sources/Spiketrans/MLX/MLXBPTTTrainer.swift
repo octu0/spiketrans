@@ -6,10 +6,15 @@ import MLXOptimizers
 /// 上位層の電流 RMSNorm で分散 0 のときの除算を避ける微小値 (推論側と共有)
 internal let rmsNormEpsilon: Float = 1e-5
 
+/// compile() する系列長の上限 (32 の倍数に切り上げた後のフレーム数)。
+/// compile は時間ループを静的に展開するため、実測で T=256 が 13 GB、T=500 が 46〜72 GB、
+/// T=1000 で OOM。これを超える長い系列は eager で流す
+internal let compiledMaxFrames = 256
+
 /// MLX GPU による SNN BPTT 学習エンジン (フレーム単位安定化 BPTT & ミニバッチ対応)
 public final class MLXBPTTTrainer: @unchecked Sendable {
     public let network: MLXSpikingNetwork
-    public let optimizer: Adam
+    public let optimizer: ArrayLRAdam
     public let config: TrainingConfig
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     ///
@@ -17,6 +22,19 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// フレームをまたぐ信用割り当てが完全に消え、第1段は実質フレーム独立の
     /// 分類器になる。大きくすると時間文脈を学習できる一方、計算グラフが深くなる。
     public let bpttWindow: Int
+
+    /// 系列長 (padded maxT) をキーとするコンパイル済み CTC 学習ステップのキャッシュ
+    private var compiledCTCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// 系列長 (T) をキーとするコンパイル済み logitsBatch のキャッシュ
+    private var compiledLogitsSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// CTC 学習ステップのコンパイル（キャッシュミス）回数
+    public private(set) var ctcCompileCount: Int = 0
+
+    /// CTC 学習ステップのキャッシュヒット回数
+    public private(set) var ctcCacheHitCount: Int = 0
+
     public init(
         network: MLXSpikingNetwork,
         config: TrainingConfig = TrainingConfig(learningRate: 0.015),
@@ -24,20 +42,32 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     ) {
         self.network = network
         self.config = config
-        self.optimizer = Adam(learningRate: config.learningRate)
+        self.optimizer = ArrayLRAdam(learningRate: config.learningRate)
         self.bpttWindow = max(1, bpttWindow)
     }
 
-    /// 学習率を更新
+    /// 学習率を更新。配列で持つので compile 済みステップにも入力として渡る
     public func updateLearningRate(_ lr: Float) {
-        self.optimizer.learningRate = lr
+        self.optimizer.learningRate = MLXArray(lr)
     }
 
     /// バッチ（複数発話）に対するフォワードとロジット系列 [B, T, outputDim] の計算
     public func logitsBatch(
         network: MLXSpikingNetwork,
-        features: MLXArray           // [B, T, inputDim]
+        features: MLXArray,          // [B, T, inputDim]
+        compiled: Bool = false
     ) -> MLXArray {
+        if compiled {
+            let seqLen = features.shape[1]
+            if let cached = compiledLogitsSteps[seqLen] {
+                return cached([features])[0]
+            }
+            let fn = compile(inputs: [network]) { arrays in
+                return [self.logitsBatch(network: network, features: arrays[0], compiled: false)]
+            }
+            compiledLogitsSteps[seqLen] = fn
+            return fn([features])[0]
+        }
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
@@ -147,7 +177,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     ) -> MLXArray {
         let logits = logitsBatch(network: network, features: features)
 
-        // 重み: targets == -1 (パディング) は 0.0, targets == 0 (padId) は 0.3, targets > 0 は 1.0
+        // 重み: targets == -1 (パディング) は 0.0, targets == 0 (padId) は 0.3, 0 < targets は 1.0
         let weights = which(targets .== -1, MLXArray(0.0), which(targets .== 0, MLXArray(0.3), MLXArray(1.0)))
         let totalWeight = sum(weights) + 1e-6
         let cleanTargets = clip(targets, min: 0, max: Float(network.outputDim - 1)).asType(.int32)
@@ -228,10 +258,12 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// ロジットを CPU へ取り出す必要もない。
     ///
     /// - Parameter targetsBatch: フレームに整列していないラベル列 (かな ID 列)。
+    @discardableResult
     public func trainBatchCTC(
         featuresBatch: [[[Float]]],
         targetsBatch: [[Int]],
-        blankId: Int = 0
+        blankId: Int = 0,
+        compiled: Bool = true
     ) -> Float {
         let bSize = featuresBatch.count
         if bSize == 0 {
@@ -293,14 +325,67 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             blankId: blankId
         )
 
-        let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
-            let logits = self.logitsBatch(network: model, features: arrays[0])
-            return [MLXCTCLoss.loss(logits: logits, targets: extTargets)]
+        if compiled != true || compiledMaxFrames < maxT {
+            let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+                let logits = self.logitsBatch(network: model, features: arrays[0], compiled: false)
+                return [MLXCTCLoss.loss(logits: logits, targets: extTargets)]
+            }
+
+            let (lossValues, grads) = lg(network, [featArray])
+            let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+            optimizer.update(model: network, gradients: clippedGrads)
+            eval(network, optimizer, lossValues)
+
+            return lossValues[0].item(Float.self)
         }
 
-        let (lossValues, grads) = lg(network, [featArray])
-        let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
-        optimizer.update(model: network, gradients: clippedGrads)
+        let stepFn: ([MLXArray]) -> [MLXArray]
+        if let cached = compiledCTCSteps[maxT] {
+            ctcCacheHitCount += 1
+            stepFn = cached
+        } else {
+            ctcCompileCount += 1
+            let computeLoss = { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+                let logits = self.logitsBatch(network: model, features: arrays[0], compiled: false)
+                let targets = MLXCTCLoss.ExtendedTargets(
+                    extTargets: arrays[1],
+                    skipMask: arrays[2],
+                    validMask: arrays[3],
+                    finalIndex1: arrays[4],
+                    finalIndex2: arrays[5],
+                    hasSecondFinal: arrays[6],
+                    inputLengths: arrays[7]
+                )
+                let loss = MLXCTCLoss.loss(logits: logits, targets: targets)
+                return [loss]
+            }
+            let lg = valueAndGrad(model: self.network, computeLoss)
+            // 学習率は最後の入力配列。トレース時にここで差し替えるので、以後の呼び出しでは
+            // 入力に渡した値がそのまま更新式に使われる。トレース用のプレースホルダ配列は
+            // 実体を持たないので、更新後は元の配列へ戻す
+            func step(arrays: [MLXArray]) -> [MLXArray] {
+                let (lossValues, grads) = lg(self.network, Array(arrays[0..<8]))
+                let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+                let outerLearningRate = self.optimizer.learningRate
+                self.optimizer.learningRate = arrays[8]
+                self.optimizer.update(model: self.network, gradients: clippedGrads)
+                self.optimizer.learningRate = outerLearningRate
+                return lossValues
+            }
+            let newStep = compile(
+                inputs: [self.network, self.optimizer],
+                outputs: [self.network, self.optimizer],
+                step
+            )
+            compiledCTCSteps[maxT] = newStep
+            stepFn = newStep
+        }
+
+        var inputs: [MLXArray] = [featArray]
+        inputs.append(contentsOf: extTargets.toArrays())
+        inputs.append(optimizer.learningRate)
+
+        let lossValues = stepFn(inputs)
         // オプティマイザの状態も評価する。network と損失だけ評価すると
         // Adam の m/v が遅延グラフとして積み上がり、生存バッファ数が
         // Metal のリソース上限 (約 50 万) に達して落ちる
