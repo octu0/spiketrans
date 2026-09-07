@@ -1,13 +1,11 @@
 import Foundation
 
-/// Pure Swift による 512点 Cooley-Tukey Radix-2 FFT プロセッサ
+/// 512 点 Cooley-Tukey Radix-2 FFT。`size` は 2 の冪。
 public struct FFT: Sendable {
     public let size: Int
     public let log2Size: Int
     
     private let bitReversedIndices: [Int]
-    private let twiddleReal: [Float]
-    private let twiddleImag: [Float]
     /// ステージごとの回転因子を連続に並べ直したもの。
     /// 元の twiddle は j * step の飛び飛び参照になり SIMD 化できないため、
     /// ステージ s の j 番目を stageTwiddleOffsets[s] + j で連続に引けるようにする
@@ -57,9 +55,6 @@ public struct FFT: Sendable {
             twImag[k] = sin(theta)
             k += 1
         }
-        self.twiddleReal = twReal
-        self.twiddleImag = twImag
-
         // 3. ステージ別の連続回転因子テーブル
         var stageReal: [Float] = []
         var stageImag: [Float] = []
@@ -198,7 +193,7 @@ public struct FFT: Sendable {
         }
     }
     
-    /// パワースペクトル (|X[k]|^2) の高速算出 (SIMD8 + ポインタ)
+    /// |X[k]|^2 を `powerSpectrum[0...halfSize]` に書く。
     @inline(__always)
     public func computePowerSpectrum(
         real: UnsafePointer<Float>,

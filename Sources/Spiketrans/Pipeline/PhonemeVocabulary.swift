@@ -1,18 +1,5 @@
 import Foundation
 
-/// 音素トークン定義
-public struct PhonemeToken: Sendable, Hashable, Equatable {
-    public let id: Int
-    public let name: String
-    public let isSpecial: Bool
-
-    public init(id: Int, name: String, isSpecial: Bool) {
-        self.id = id
-        self.name = name
-        self.isSpecial = isSpecial
-    }
-}
-
 /// 日本語音素・かな語彙テーブルおよび双方向変換
 public struct PhonemeVocabulary: Sendable {
     public static let padId = 0
@@ -603,6 +590,62 @@ public struct PhonemeVocabulary: Sendable {
             i += 1
         }
         return result
+    }
+
+    /// 先頭 Mel 64ch の低/中/高エネルギー比で粗い母音列を出す。本線デコードが空のとき用。
+    public func fallbackKana(fromFeatureFrames featuresSeq: [[Float]]) -> String {
+        if featuresSeq.isEmpty {
+            return ""
+        }
+        var phonemes: [String] = []
+        var lastPhoneme = ""
+        var fIdx = 0
+        while fIdx < featuresSeq.count {
+            let feat = featuresSeq[fIdx]
+            var lowEnergy: Float = 0.0
+            var midEnergy: Float = 0.0
+            var highEnergy: Float = 0.0
+            var bandEnd = StreamingFeatureFrontEnd.melChannels
+            if feat.count < bandEnd {
+                bandEnd = feat.count
+            }
+            var d = 0
+            while d < bandEnd {
+                let v = feat[d]
+                switch true {
+                case d < 16:
+                    lowEnergy += v
+                case d < 40:
+                    midEnergy += v
+                default:
+                    highEnergy += v
+                }
+                d += 1
+            }
+            let totalEnergy = lowEnergy + midEnergy + highEnergy
+            if 0.1 <= totalEnergy {
+                var p = "a"
+                switch true {
+                case highEnergy < lowEnergy && midEnergy < lowEnergy:
+                    p = "u"
+                case lowEnergy < highEnergy && midEnergy < highEnergy:
+                    p = "i"
+                case lowEnergy < midEnergy && highEnergy < midEnergy:
+                    p = "a"
+                default:
+                    p = "o"
+                }
+                if p != lastPhoneme {
+                    phonemes.append(p)
+                    lastPhoneme = p
+                }
+            }
+            fIdx += 1
+        }
+        if phonemes.isEmpty {
+            return ""
+        }
+        return phonemesToKana(phonemes)
     }
 
     /// トークン ID 系列から日本語ひらがな文字列へ変換

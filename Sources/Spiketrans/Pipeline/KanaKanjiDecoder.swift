@@ -441,7 +441,7 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
     }
 }
 
-/// 第2段 堅牢なかな漢字ビーム探索統合デコーダ (音素調音距離 ＆ Bigram 連接確率大域最適化)
+/// 第2段。ひらがな読みを辞書と調音距離・連接確率で漢字かな混じりに変換する。
 public final class KanaKanjiDecoder: @unchecked Sendable {
     /// 辞書引きの最大読み長
     private static let maxWordLength = 12

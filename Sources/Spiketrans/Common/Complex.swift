@@ -1,6 +1,5 @@
 import Foundation
 
-/// 単精度浮動小数点複素数
 public struct Complex: Sendable, Equatable {
     public var real: Float
     public var imag: Float

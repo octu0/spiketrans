@@ -1,7 +1,7 @@
 import Foundation
 import Numerics
 
-/// Pure Swift / SIMD による対数空間安定 CTC (Connectionist Temporal Classification) 損失計算器
+/// 対数空間の CTC 損失と勾配。CPU 学習用。
 public struct CTCLossCalculator: Sendable {
     public let blankId: Int
 
@@ -137,7 +137,6 @@ public struct CTCLossCalculator: Sendable {
                 }
 
                 beta[t][s] = logSum
-                t_loop_condition: if t < 0 { break }
                 s += 1
             }
             t -= 1

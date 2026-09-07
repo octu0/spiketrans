@@ -3,7 +3,7 @@ import Foundation
 public struct DurandKernerSolver: Sendable {
     public init() {}
     
-    /// 多項式根探索 (ゼロアロケーション反復)
+    /// LPC 多項式の根を `workspace.durandKernerCurr/Next` 上で反復する。
     @inline(__always)
     public func solve(
         coefficients: UnsafePointer<Float>,
@@ -94,8 +94,7 @@ public struct FormantExtractor: Sendable {
     @inline(__always)
     public func extractFormants(
         roots: UnsafePointer<Complex>,
-        count: Int,
-        workspace: DSPWorkspace? = nil
+        count: Int
     ) -> FormantResult {
         let pi = Float.pi
         var candCount = 0

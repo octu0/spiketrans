@@ -94,12 +94,10 @@ public final class CharLanguageModel: @unchecked Sendable {
         return total
     }
 
-    /// 重みの読み込み
     public func importWeights(_ weights: SpikingNetworkWeights) {
         network.importWeights(from: weights)
     }
 
-    /// 重みの書き出し
     public func exportWeights() -> SpikingNetworkWeights {
         return network.exportWeights()
     }

@@ -1,6 +1,6 @@
 import Foundation
 
-/// Fast Sigmoid 代理勾配計算モジュール
+/// Fast Sigmoid 代理勾配 dS/dV = 1 / (1 + alpha * |V - Vth|)^2
 public enum SurrogateGradient {
     /// スカラー代理勾配計算: dS/dV = 1 / (1 + alpha * |V - Vth|)^2
     @inline(__always)

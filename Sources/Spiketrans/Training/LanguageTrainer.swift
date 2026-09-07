@@ -1,6 +1,6 @@
 import Foundation
 
-/// 第2段 漢字自己回帰言語 SNN (Language SNN) 学習オーケストレータ
+/// 言語 SNN の CPU 学習。入力はトークン埋め込み。
 public final class LanguageTrainer: @unchecked Sendable {
     public let network: SpikingNetwork
     public let optimizer: AdamOptimizer
@@ -27,7 +27,7 @@ public final class LanguageTrainer: @unchecked Sendable {
         self.bpttTrainer = BPTTTrainer(network: network, optimizer: self.optimizer)
     }
 
-    /// トークン ID から決定論的埋め込み特徴量 (inputDim 次元) を生成
+    /// 正弦埋め込み。`LanguageDecoder` のワンホットとは別物。`languageBonus == 0` のあいだは学習しない。
     public func buildTokenFeature(tokenId: Int) -> [Float] {
         let dim = network.inputDim
         var feat = [Float](repeating: 0.0, count: dim)
@@ -40,7 +40,6 @@ public final class LanguageTrainer: @unchecked Sendable {
         return feat
     }
 
-    /// データセットに対する 1 エポックの学習を実行 (並列ワーカー数指定対応)
     public func trainEpoch(dataset: SpeechDataset, epoch: Int = 1, numWorkers: Int = 1) -> EpochResult {
         var sumTotalLoss: Float = 0.0
         var validSampleCount = 0

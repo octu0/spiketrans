@@ -53,7 +53,7 @@ public final class Parameter: @unchecked Sendable {
     }
 }
 
-/// Adam オプティマイザ本体
+/// Adam。勾配クリップのあと、バイアス補正したモーメントで更新する。
 public final class AdamOptimizer: @unchecked Sendable {
     public let config: AdamConfig
     public let parameters: [Parameter]

@@ -19,59 +19,12 @@ public struct PitchDetector: Sendable {
         }
         
         let frameSize = count
-        let clipPtr = workspace.clippedFrame.withUnsafeMutableBufferPointer { $0.baseAddress! }
-        
-        // 1. センタークリッピング (Sondhi 法: 生信号から算出)
         let maxAbs = VectorOperations.maxMagnitude(ptr: ptr, count: frameSize)
         if maxAbs < 1e-4 {
             return PitchResult(f0: 0.0, hnr: 0.0, isVoiced: false)
         }
-        
-        let cl = 0.3 * maxAbs
-        let negCl = -1.0 * cl
-        
-        var i = 0
-        let width = 8
-        let limit = frameSize - (frameSize % width)
-        let clVec = SIMD8<Float>(repeating: cl)
-        let negClVec = SIMD8<Float>(repeating: negCl)
-        
-        while i < limit {
-            let v = SIMD8<Float>(
-                ptr[i+0], ptr[i+1], ptr[i+2], ptr[i+3],
-                ptr[i+4], ptr[i+5], ptr[i+6], ptr[i+7]
-            )
-            var clipped = SIMD8<Float>(repeating: 0.0)
-            let posMask = clVec .< v
-            let negMask = v .< negClVec
-            
-            clipped = clipped.replacing(with: v - clVec, where: posMask)
-            clipped = clipped.replacing(with: v + clVec, where: negMask)
-            
-            clipPtr[i+0] = clipped[0]
-            clipPtr[i+1] = clipped[1]
-            clipPtr[i+2] = clipped[2]
-            clipPtr[i+3] = clipped[3]
-            clipPtr[i+4] = clipped[4]
-            clipPtr[i+5] = clipped[5]
-            clipPtr[i+6] = clipped[6]
-            clipPtr[i+7] = clipped[7]
-            i += width
-        }
-        while i < frameSize {
-            let val = ptr[i]
-            var c: Float = 0.0
-            if cl < val {
-                c = val - cl
-            }
-            if val < negCl {
-                c = val + cl
-            }
-            clipPtr[i] = c
-            i += 1
-        }
-        
-        // 2. 原信号エネルギーおよび正規化自己相関の計算
+
+        // 1. 原信号エネルギーおよび正規化自己相関の計算
         let calcLength = frameSize - config.maxPitchLag
         let e0 = VectorOperations.sumOfSquares(ptr: ptr, count: calcLength)
         if e0 < 1e-6 {
@@ -95,7 +48,7 @@ public struct PitchDetector: Sendable {
             lag += 1
         }
         
-        // 3. 極大値の抽出とオクターブエラー抑制 (workspace バッファ使用)
+        // 2. 極大値の抽出とオクターブエラー抑制 (workspace バッファ使用)
         var globalMaxR: Float = -Float.greatestFiniteMagnitude
         let peaksLag = workspace.pitchPeaksLag.withUnsafeMutableBufferPointer { $0.baseAddress! }
         let peaksR = workspace.pitchPeaksR.withUnsafeMutableBufferPointer { $0.baseAddress! }

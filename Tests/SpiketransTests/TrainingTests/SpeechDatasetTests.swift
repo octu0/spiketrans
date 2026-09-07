@@ -28,7 +28,7 @@ final class SpeechDatasetTests: XCTestCase {
         XCTAssertEqual(dataset.count, 2)
         XCTAssertEqual(dataset[0].rawText, "こんにちは")
         XCTAssertFalse(dataset[0].acousticFeatures.isEmpty)
-        XCTAssertEqual(dataset[0].acousticFeatures[0].count, 128)
+        XCTAssertEqual(dataset[0].acousticFeatures[0].count, SpeechDataset.acousticInputDim())
         XCTAssertFalse(dataset[0].textIds.isEmpty)
     }
 }

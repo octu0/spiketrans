@@ -34,7 +34,7 @@ public struct EpochResult: Sendable {
     }
 }
 
-/// 第1段 音響 SNN (Acoustic SNN) 学習オーケストレータ
+/// 音響 SNN の CPU 学習。
 public final class AcousticTrainer: @unchecked Sendable {
     public let network: SpikingNetwork
     public let optimizer: AdamOptimizer
@@ -58,7 +58,7 @@ public final class AcousticTrainer: @unchecked Sendable {
         self.bpttTrainer = BPTTTrainer(network: network, optimizer: self.optimizer)
     }
 
-    /// 音声フレームに対するエネルギー・音素特性連動の動的アライメント生成
+    /// Mel エネルギーの高いフレームへ文字 ID を配る。CTC を使わないときの教師。
     public func alignTargets(textIds: [Int], features: [[Float]]) -> [Int] {
         let frameCount = features.count
         if textIds.isEmpty || frameCount <= 0 {
@@ -116,14 +116,13 @@ public final class AcousticTrainer: @unchecked Sendable {
             return targets
         }
 
-        // 2. 音素の特性に応じた継続時間重みの計算
+        // pad (id 0) は重み 1、それ以外は 2。促音・母音ごとの重み分けはしていない。
         var weights = [Float](repeating: 2.0, count: numChars)
         var totalWeight: Float = 0.0
         var cIdx = 0
         while cIdx < numChars {
             let tid = textIds[cIdx]
             var w: Float = 2.0
-            // 特殊トークンまたは短音の判定 (促音 1.2, 母音・長音 3.0)
             if tid == 0 {
                 w = 1.0
             }
@@ -168,7 +167,6 @@ public final class AcousticTrainer: @unchecked Sendable {
         return targets
     }
 
-    /// データセットに対する 1 エポックの学習を実行 (並列ワーカー数指定対応)
     public func trainEpoch(dataset: SpeechDataset, epoch: Int = 1, numWorkers: Int = 1) -> EpochResult {
         var sumTotalLoss: Float = 0.0
         var validSampleCount = 0
@@ -293,7 +291,7 @@ public final class AcousticTrainer: @unchecked Sendable {
         return results
     }
 
-    /// CTC 損失による 1 エポックの SNN 学習を実行 (音素ターゲット系列直接学習)
+    /// かな文字 ID 系列を CTC で学習する 1 エポック。
     public func trainCTCEpoch(
         dataset: SpeechDataset,
         kanaVocabulary: TextVocabulary,

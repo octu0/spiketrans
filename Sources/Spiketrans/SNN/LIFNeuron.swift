@@ -4,7 +4,7 @@ import Foundation
 public struct LIFConfig: Sendable, Equatable {
     public let beta: Float      // 膜電位減衰率 (0.0 < beta < 1.0)
     public let vTh: Float       // 基本発火閾値 (通常 1.0)
-    public let vReset: Float    // リセット電位 (通常 0.0)
+    public let vReset: Float    // 未使用。発火リセットは v * (1 - s) で 0。JSON 互換のため残す
     public let alpha: Float     // Surrogate Gradient 鋭さパラメータ (通常 2.0)
     public let rho: Float       // 適応閾値減衰率 (通常 0.85)
     public let gamma: Float     // 発火時閾値上昇幅 (0.0 で標準固定閾値, >0.0 で適応型 ALIF)
@@ -26,7 +26,7 @@ public struct LIFConfig: Sendable, Equatable {
     }
 }
 
-/// 膜電位とスパイク状態を保持するコンテナ (Hot Path ゼロアロケーション用)
+/// 膜電位 `v`、スパイク `s`、適応閾値 `a`。サイズはニューロン数。
 public final class LIFState: @unchecked Sendable {
     public var v: ContiguousArray<Float>
     public var s: ContiguousArray<Float>
@@ -52,7 +52,7 @@ public final class LIFState: @unchecked Sendable {
     }
 }
 
-/// SIMD8 ベクトル化 LIF 膜電位更新エンジン
+/// LIF 膜電位更新。スカラーと SIMD8。学習側と同じ範囲で膜電位をクリップする。
 public enum LIFNeuronEngine {
     /// 膜電位の飽和範囲。学習側 (MLX) が同じ範囲でクリップしているため、
     /// 推論側でも揃えないと発火パターンが学習時と食い違う。

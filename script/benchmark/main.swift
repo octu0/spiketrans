@@ -120,7 +120,7 @@ do {
     var logits = [Float](repeating: 0.0, count: 64)
     var probs = [Float](repeating: 0.0, count: 64)
     let feat = [Float](repeating: 0.5, count: 64)
-    // Hot Path ゼロアロケーション計測のため中間バッファは事前確保
+    // 計測対象からバッファ確保を外すため ForwardScratch をループ外で作る
     let scratch = ForwardScratch(maxHiddenDim: hSize)
 
     let benchSteps = 10000

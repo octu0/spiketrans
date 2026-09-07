@@ -85,7 +85,7 @@ final class TwoStageDecoderTests: XCTestCase {
     func testAcousticDecoderCollapseIdenticalTokens() {
         let textVocab = TextVocabulary(characters: Array("からす"))
         let net = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: textVocab.size)
-        let decoder = AcousticDecoder(network: net, vocabulary: textVocab)
+        let decoder = AcousticDecoder(network: net)
 
         let kId = textVocab.id(for: "か")
         let aId = textVocab.id(for: "ら")
@@ -139,8 +139,8 @@ final class TwoStageDecoderTests: XCTestCase {
         let qWeights = QuantizedEngine.quantize(network: net, config: qConfig)
         let qEngine = QuantizedEngine(weights: qWeights, timeSteps: 4)
 
-        let floatDecoder = AcousticDecoder(network: net, vocabulary: textVocab)
-        let quantDecoder = AcousticDecoder(network: net, quantizedEngine: qEngine, vocabulary: textVocab)
+        let floatDecoder = AcousticDecoder(network: net)
+        let quantDecoder = AcousticDecoder(network: net, quantizedEngine: qEngine)
 
         let floatWs = AcousticWorkspace(maxHiddenDim: 256, outputDim: textVocab.size, inputDim: 64)
         let quantWs = AcousticWorkspace(maxHiddenDim: 256, outputDim: textVocab.size, inputDim: 64)

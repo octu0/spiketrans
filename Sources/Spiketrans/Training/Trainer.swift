@@ -20,7 +20,7 @@ public struct TrainingSummary: Sendable {
     }
 }
 
-/// 第1段 音響 SNN と第2段 言語 SNN を束ねる学習・推論の基盤
+/// 音響 SNN と言語 SNN の学習と、その推論入口。
 public final class Trainer: @unchecked Sendable {
     public let acousticTrainer: AcousticTrainer
     public let languageTrainer: LanguageTrainer
@@ -44,14 +44,14 @@ public final class Trainer: @unchecked Sendable {
         )
     }
 
-    /// デフォルトネットワーク構成で簡単に初期化するファクトリ (音響・言語とも直接TextVocabularyを出力)
+    /// 音響入力は `SpeechDataset.acousticInputDim()`、言語入力は 128 次元のトークン埋め込み。
     public static func makeDefault(
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         config: TrainingConfig = TrainingConfig()
     ) -> Trainer {
         let acNet = SpikingNetwork(
-            inputDim: 128,
+            inputDim: SpeechDataset.acousticInputDim(),
             maxHiddenDim: 1024,
             outputDim: textVocabulary.size,
             timeSteps: 4
@@ -71,7 +71,7 @@ public final class Trainer: @unchecked Sendable {
         )
     }
 
-    /// データセットを用いた音響・言語両モデルの統合並列学習
+    /// 音響を先に、言語を後に学習する。`numWorkers` は各段の内部並列。
     public func fit(dataset: SpeechDataset, numWorkers: Int = 1) -> TrainingSummary {
         let acResults = acousticTrainer.train(dataset: dataset, numWorkers: numWorkers)
         let lmResults = languageTrainer.train(dataset: dataset, numWorkers: numWorkers)
@@ -104,71 +104,23 @@ public enum ExecutionPrecision: String, Sendable, CaseIterable {
 }
 
 extension Trainer {
-    /// 音響特徴量から母音・子音を推定し、ひらがな（聞こえた音）にフォールバック
-    public func decodeFallbackKana(from featuresSeq: [[Float]]) -> String {
-        if featuresSeq.isEmpty {
-            return ""
+    private func acousticFrameStack() -> Int {
+        var stack = acousticTrainer.network.inputDim / StreamingFeatureFrontEnd.tapDim
+        if stack < 1 {
+            stack = 1
         }
-        var phonemes: [String] = []
-        var lastPhoneme = ""
-
-        var fIdx = 0
-        while fIdx < featuresSeq.count {
-            let feat = featuresSeq[fIdx]
-            var lowEnergy: Float = 0.0
-            var midEnergy: Float = 0.0
-            var highEnergy: Float = 0.0
-
-            var d = 0
-            let featCount = feat.count
-            while d < featCount {
-                let v = feat[d]
-                switch true {
-                case d < 16:
-                    lowEnergy += v
-                case d < 40:
-                    midEnergy += v
-                default:
-                    highEnergy += v
-                }
-                d += 1
-            }
-
-            let totalEnergy = lowEnergy + midEnergy + highEnergy
-            if 0.1 <= totalEnergy {
-                var p = "a"
-                switch true {
-                case highEnergy < lowEnergy && midEnergy < lowEnergy:
-                    p = "u"
-                case lowEnergy < highEnergy && midEnergy < highEnergy:
-                    p = "i"
-                case lowEnergy < midEnergy && highEnergy < midEnergy:
-                    p = "a"
-                default:
-                    p = "o"
-                }
-
-                if p != lastPhoneme {
-                    phonemes.append(p)
-                    lastPhoneme = p
-                }
-            }
-            fIdx += 1
-        }
-
-        if phonemes.isEmpty {
-            return ""
-        }
-        return phonemeVocabulary.phonemesToKana(phonemes)
+        return stack
     }
 
-    /// PCM 音声から直接漢字・かなテキストを文字起こし (本線: TextVocabulary + Language SNN 自己回帰 + 未知語フォールバック)
+    /// PCM から音響 greedy でテキストを返す。既定の LanguageDecoder は lmWeight=0。
     public func transcribe(
         pcmData: [Float],
-        precision: ExecutionPrecision = .float32,
-        unkThreshold: Float = 0.25
+        precision: ExecutionPrecision = .float32
     ) -> String {
-        let featuresSeq = SpeechDataset.extractFeaturesFromPCM(pcmData: pcmData)
+        let featuresSeq = SpeechDataset.extractFeaturesFromPCM(
+            pcmData: pcmData,
+            frameStack: acousticFrameStack()
+        )
         if featuresSeq.isEmpty {
             return ""
         }
@@ -193,9 +145,7 @@ extension Trainer {
 
         let acDecoder = AcousticDecoder(
             network: acousticTrainer.network,
-            quantizedEngine: qEngine,
-            vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary
+            quantizedEngine: qEngine
         )
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
@@ -206,8 +156,7 @@ extension Trainer {
 
         let lmDecoder = LanguageDecoder(
             lmNetwork: languageTrainer.network,
-            vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary
+            vocabulary: textVocabulary
         )
 
         var acousticProbs: [AcousticFrameProbabilities] = []
@@ -226,45 +175,41 @@ extension Trainer {
         }
 
         let greedyRes = lmDecoder.decodeGreedy(
-            acousticProbs: acousticProbs,
-            unkThreshold: unkThreshold
+            acousticProbs: acousticProbs
         )
 
         return greedyRes.text
     }
 
-    /// 音響 SNN のみによる直接文字起こし (低信頼度pad化, 短padマージ, CTC collapse, 最小持続フレーム判定)
+    /// 音響 SNN のみ。低信頼度は pad、短い pad を挟んだ同一文字をマージし、最短フレーム未満を落とす。
     public func transcribeAcousticDirect(
         pcmData: [Float],
         minDurationFrames: Int = 3,
         minConfidence: Float = 0.45
     ) -> String {
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: pcmData, sampleRate: 16000)
-        let featuresSeq = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k)
-        let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
+        let featuresSeq = SpeechDataset.extractFeaturesFromPCM(
+            pcmData: pcm16k,
+            frameStack: acousticFrameStack()
+        )
         return transcribeAcousticDirect(
             featuresSeq: featuresSeq,
             minDurationFrames: minDurationFrames,
-            minConfidence: minConfidence,
-            boundaries: boundaries
+            minConfidence: minConfidence
         )
     }
 
-    /// 特徴量系列から音響 SNN のみによる直接文字起こし
     public func transcribeAcousticDirect(
         featuresSeq: [[Float]],
         minDurationFrames: Int = 3,
-        minConfidence: Float = 0.45,
-        boundaries: [Int]? = nil
+        minConfidence: Float = 0.45
     ) -> String {
         if featuresSeq.isEmpty {
             return ""
         }
 
         let acDecoder = AcousticDecoder(
-            network: acousticTrainer.network,
-            vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary
+            network: acousticTrainer.network
         )
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticTrainer.network.maxHiddenDim,
@@ -275,8 +220,7 @@ extension Trainer {
 
         let frameProbs = acDecoder.decodeSequence(
             featuresSeq: featuresSeq,
-            workspace: acWorkspace,
-            boundaries: boundaries
+            workspace: acWorkspace
         )
         var rawTokens: [Int] = []
         rawTokens.reserveCapacity(featuresSeq.count)
@@ -357,11 +301,7 @@ extension Trainer {
         return textVocabulary.idsToText(collapsedTokens)
     }
 
-    /// 音響 SNN の対数確率から CTC プレフィックスビーム探索文字起こしを実行
-    ///
-    /// フォワードには Event-driven 疎スパイク推論 (`AcousticDecoder`) を用いる。
-    /// BPTT 用の密なフォワードと違い発話ごとの巨大キャッシュを確保せず、
-    /// 学習側と同じ sliceNorm を適用するためスライス間のスケールも一致する。
+    /// `AcousticDecoder` のフレーム対数確率を CTC ビームで文字列にする。
     public func transcribeAcousticCTC(
         featuresSeq: [[Float]],
         beamWidth: Int = 16,
@@ -373,9 +313,7 @@ extension Trainer {
 
         let network = acousticTrainer.network
         let acDecoder = AcousticDecoder(
-            network: network,
-            vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary
+            network: network
         )
         let acWorkspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
@@ -420,14 +358,13 @@ extension Trainer {
         return decoder.decode(logProbs: logProbs).text
     }
 
-    /// 2段階音声文字起こし (第1段 音響 SNN かな推定 -> 第2段 漢字かな混じり文復元)
+    /// 第1段でかな、第2段で漢字かな混じり。`useCTC` なら第1段はビーム CTC。
     public func transcribeTwoStage(
         featuresSeq: [[Float]],
         kanjiVocabulary: TextVocabulary,
         dictionary: KanaKanjiDictionary? = nil,
         minDurationFrames: Int = 3,
         minConfidence: Float = 0.05,
-        boundaries: [Int]? = nil,
         useCTC: Bool = false,
         languageBonus: Float = 4.0,
         blankPenalty: Float = 0.0
@@ -439,8 +376,7 @@ extension Trainer {
             kanaText = transcribeAcousticDirect(
                 featuresSeq: featuresSeq,
                 minDurationFrames: minDurationFrames,
-                minConfidence: minConfidence,
-                boundaries: boundaries
+                minConfidence: minConfidence
             )
         }
 

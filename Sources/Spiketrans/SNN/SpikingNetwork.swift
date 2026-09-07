@@ -1,10 +1,10 @@
 import Foundation
 
-/// スパイキングニューラルネットワーク本体 (Float32)
+/// Float32 の SNN。層 0 は再帰 LIF、層 1 以降は FF LIF。上位層は結合電流を RMSNorm してから前層電流を足す。
 public final class SpikingNetwork: @unchecked Sendable {
     public let numLayers: Int
     public let inputDim: Int
-    public let maxHiddenDim: Int  // 4096
+    public let maxHiddenDim: Int
     public let outputDim: Int
     public let timeSteps: Int
     /// LIF / ALIF 設定 (重みインポート時に保存済みの値へ追従するため var)
@@ -32,6 +32,7 @@ public final class SpikingNetwork: @unchecked Sendable {
     public let pWOut: Parameter        // [outputDim, maxHiddenDim]
     public let pBOut: Parameter
 
+    /// 音響本線の `inputDim` は `StreamingFeatureFrontEnd.acousticInputDim()` (既定 512)。
     public init(
         numLayers: Int = 1,
         inputDim: Int = 64,
@@ -693,7 +694,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         }
     }
 
-    /// 中間バッファと適応閾値状態を呼び出し側で保持しない簡便版 (Hot Path 以外)
+    /// `aPrev` と `ForwardScratch` を都度確保する版。ストリーミングでは使わない。
     public func forward(
         features: [Float],
         vPrev: inout [Float],
@@ -717,14 +718,11 @@ public final class SpikingNetwork: @unchecked Sendable {
     }
 }
 
-/// forward の Hot Path 用事前確保中間バッファ (ゼロアロケーション維持)
+/// `SpikingNetwork.forward` の層間電流と次状態。呼び出し側が保持する。
 public final class ForwardScratch: @unchecked Sendable {
     public var inputCurrents: [Float]
     public var stepCurrents: [Float]
     public var stepCurrentsPrev: [Float]
-    public var vNext: [Float]
-    public var sNext: [Float]
-    public var aNext: [Float]
     public var activeSpikes: [Int]
     public var activeLayerSpikes: [Int]
     public var activeReadoutIndices: [Int]
@@ -736,9 +734,6 @@ public final class ForwardScratch: @unchecked Sendable {
         self.inputCurrents = [Float](repeating: 0.0, count: size)
         self.stepCurrents = [Float](repeating: 0.0, count: size)
         self.stepCurrentsPrev = [Float](repeating: 0.0, count: size)
-        self.vNext = [Float](repeating: 0.0, count: size)
-        self.sNext = [Float](repeating: 0.0, count: size)
-        self.aNext = [Float](repeating: 0.0, count: size)
         self.activeSpikes = [Int](repeating: 0, count: size)
         self.activeLayerSpikes = [Int](repeating: 0, count: size)
         self.activeReadoutIndices = [Int](repeating: 0, count: size)

@@ -1,6 +1,6 @@
 import Foundation
 
-/// ホットパスにおける動的メモリアロケーション回数 0 を保証する事前確保ワークスペース
+/// DSP 各段が共有する事前確保バッファ。ハミング窓は `maxFrameSize` 点（既定 1024）。
 public final class DSPWorkspace: @unchecked Sendable {
     public let maxFrameSize: Int
     public let lpcOrder: Int
@@ -9,7 +9,6 @@ public final class DSPWorkspace: @unchecked Sendable {
     // バッファ配列
     public var rawFrame: [Float]
     public var windowedFrame: [Float]
-    public var clippedFrame: [Float]
     public var preemphasizedFrame: [Float]
     public var hammingWindow: [Float]
     
@@ -27,8 +26,6 @@ public final class DSPWorkspace: @unchecked Sendable {
     public var lpcTempA: [Float]
     public var durandKernerCurr: [Complex]
     public var durandKernerNext: [Complex]
-    public var formantCandidatesFreq: [Float]
-    public var formantCandidatesBw: [Float]
     
     // フィルタバンク & 64次元音響特徴量
     public var melEnergies: [Float]
@@ -47,7 +44,6 @@ public final class DSPWorkspace: @unchecked Sendable {
         
         self.rawFrame = [Float](repeating: 0.0, count: maxFrameSize)
         self.windowedFrame = [Float](repeating: 0.0, count: maxFrameSize)
-        self.clippedFrame = [Float](repeating: 0.0, count: maxFrameSize)
         self.preemphasizedFrame = [Float](repeating: 0.0, count: maxFrameSize)
         self.hammingWindow = [Float](repeating: 0.0, count: maxFrameSize)
         
@@ -65,8 +61,6 @@ public final class DSPWorkspace: @unchecked Sendable {
         
         self.durandKernerCurr = [Complex](repeating: Complex(real: 0.0, imag: 0.0), count: lpcOrder)
         self.durandKernerNext = [Complex](repeating: Complex(real: 0.0, imag: 0.0), count: lpcOrder)
-        self.formantCandidatesFreq = [Float](repeating: 0.0, count: lpcOrder)
-        self.formantCandidatesBw = [Float](repeating: 0.0, count: lpcOrder)
         
         self.melEnergies = [Float](repeating: 0.0, count: melChannels)
         self.featureBuffer = [Float](repeating: 0.0, count: melChannels)

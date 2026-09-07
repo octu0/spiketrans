@@ -1,51 +1,5 @@
 import Foundation
 
-/// 音声フレームの解析結果
-public struct AudioFrameResult: Sendable, Equatable {
-    public let isSpeech: Bool
-    public let pitchHz: Float
-    public let hnrDb: Float
-    public let formants: (f1: Float, f2: Float, f3: Float)
-    public let formantBandwidths: (b1: Float, b2: Float, b3: Float)
-    public let features: [Float] // 64次元 (Direct Input Current: 0.0〜1.0)
-    
-    public init(
-        isSpeech: Bool,
-        pitchHz: Float,
-        hnrDb: Float,
-        formants: (f1: Float, f2: Float, f3: Float),
-        formantBandwidths: (b1: Float, b2: Float, b3: Float),
-        features: [Float]
-    ) {
-        self.isSpeech = isSpeech
-        self.pitchHz = pitchHz
-        self.hnrDb = hnrDb
-        self.formants = formants
-        self.formantBandwidths = formantBandwidths
-        self.features = features
-    }
-    
-    public static func == (lhs: AudioFrameResult, rhs: AudioFrameResult) -> Bool {
-        if lhs.isSpeech != rhs.isSpeech {
-            return false
-        }
-        if lhs.pitchHz != rhs.pitchHz {
-            return false
-        }
-        if lhs.hnrDb != rhs.hnrDb {
-            return false
-        }
-        if lhs.formants.f1 != rhs.formants.f1 || lhs.formants.f2 != rhs.formants.f2 || lhs.formants.f3 != rhs.formants.f3 {
-            return false
-        }
-        if lhs.formantBandwidths.b1 != rhs.formantBandwidths.b1 || lhs.formantBandwidths.b2 != rhs.formantBandwidths.b2 || lhs.formantBandwidths.b3 != rhs.formantBandwidths.b3 {
-            return false
-        }
-        return lhs.features == rhs.features
-    }
-}
-
-/// ピッチおよび有声度解析結果
 public struct PitchResult: Sendable, Equatable {
     public let f0: Float
     public let hnr: Float
@@ -58,7 +12,6 @@ public struct PitchResult: Sendable, Equatable {
     }
 }
 
-/// フォルマント解析結果
 public struct FormantResult: Sendable, Equatable {
     public let f1: Float
     public let f2: Float
@@ -79,7 +32,6 @@ public struct FormantResult: Sendable, Equatable {
     }
 }
 
-/// VAD（Voice Activity Detection）フレーム判定結果
 public struct VADResult: Sendable, Equatable {
     public let isSpeech: Bool
     public let rms: Float
@@ -96,7 +48,6 @@ public struct VADResult: Sendable, Equatable {
     }
 }
 
-/// 発話区間セグメント
 public struct SpeechSegment: Sendable, Equatable {
     public let startIndex: Int
     public let endIndex: Int
@@ -109,7 +60,7 @@ public struct SpeechSegment: Sendable, Equatable {
     }
 }
 
-/// パイプライン設定パラメータ
+/// フロントエンド DSP のフレーム長・LPC・Mel・VAD しきい値。
 public struct DSPConfig: Sendable {
     public let sampleRate: Int
     public let frameSize: Int

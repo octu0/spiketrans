@@ -1,6 +1,6 @@
 import Foundation
 
-/// SNN 重みのシリアライゼーションコンテナ (JSON)
+/// SNN 重みの JSON 表現。語彙文字を同梱できる。
 public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let inputDim: Int
     public let maxHiddenDim: Int
@@ -93,14 +93,12 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         return TextVocabulary(serializedCharacters: chars)
     }
 
-    /// ファイルに保存
     public func save(to url: URL) throws {
         let encoder = JSONEncoder()
         let data = try encoder.encode(self)
         try data.write(to: url, options: .atomic)
     }
 
-    /// ファイルから読み込み
     public static func load(from url: URL) throws -> SpikingNetworkWeights {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()

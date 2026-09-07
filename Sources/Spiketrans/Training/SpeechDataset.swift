@@ -7,7 +7,7 @@ public struct AudioTextSample: Sendable {
     public let hiraganaText: String
     public let textIds: [Int]
     public let phonemeIds: [Int]
-    public let acousticFeatures: [[Float]] // [frames][128]
+    public let acousticFeatures: [[Float]] // [frames][stackedDim]
 
     public init(
         audioPCM: [Float],
@@ -26,12 +26,10 @@ public struct AudioTextSample: Sendable {
     }
 }
 
-/// 音声・漢字テキスト学習用データセット (音素・かな音響学習 & 言語SNN統合)
+/// 音声とテキストの学習セット。
 ///
-/// 2 つのモードを持つ。
-/// - 即時モード: 全サンプルの特徴量を保持する (テスト・小規模データ用)
-/// - 遅延モード: メタデータだけ保持し、アクセス時に WAV から特徴量を生成する。
-///   メモリ消費がデータ量と切り離されるため、大規模コーパスはこちらを使う
+/// 即時モードは全サンプルの特徴をメモリに持つ。遅延モードはパスとテキストだけ持ち、
+/// アクセス時に WAV から特徴を作る。大規模コーパスは遅延モード。
 public final class SpeechDataset: @unchecked Sendable {
     /// 遅延モードの 1 発話ぶんのメタデータ
     public struct SampleMeta: Sendable {
@@ -248,7 +246,7 @@ public final class SpeechDataset: @unchecked Sendable {
         pairs: [(path: String, text: String)],
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        frameStack: Int = 1,
+        frameStack: Int = defaultFrameStack,
         workers: Int = 8,
         cache: FeatureDiskCache? = nil,
         maxCacheGigabytes: Double = 0.0
@@ -409,7 +407,7 @@ public final class SpeechDataset: @unchecked Sendable {
         pairs: [(wavBytes: [UInt8], text: String)],
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        frameStack: Int = 1
+        frameStack: Int = defaultFrameStack
     ) throws -> SpeechDataset {
         let parser = WavParser()
         var sampleList: [AudioTextSample] = []
@@ -447,7 +445,7 @@ public final class SpeechDataset: @unchecked Sendable {
         pairs: [(pcmData: [Float], text: String)],
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        frameStack: Int = 1
+        frameStack: Int = defaultFrameStack
     ) -> SpeechDataset {
         var sampleList: [AudioTextSample] = []
         var pIdx = 0
@@ -474,16 +472,14 @@ public final class SpeechDataset: @unchecked Sendable {
         return SpeechDataset(samples: sampleList)
     }
 
-    /// 学習スクリプトとストリーミングの既定束ね数。SNN `inputDim` は `acousticInputDim()`。
     public static let defaultFrameStack = StreamingFeatureFrontEnd.defaultStack
 
     public static func acousticInputDim(frameStack: Int = defaultFrameStack) -> Int {
         return StreamingFeatureFrontEnd.acousticInputDim(stack: frameStack)
     }
 
-    /// クリップ全体の RMS でゲインを固定し、`StreamingFeatureFrontEnd` で特徴化する。
-    /// データセット・`transcribe`・`mictrans` の入口。ストリーミングと Mel / 3-tap / 束ねを共有する。
-    public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = 1) -> [[Float]] {
+    /// クリップ RMS を `setGain` して FrontEnd にホップを流す。データセットとバッチ推論の入口。
+    public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = defaultFrameStack) -> [[Float]] {
         let totalSamples = pcmData.count
         if totalSamples < 400 {
             return []

@@ -8,9 +8,7 @@ public struct Filterbank: Sendable {
     private let durandKerner: DurandKernerSolver
     private let formantExtractor: FormantExtractor
     
-    // Mel フィルタバンクの重みテーブル (SoA)。
-    // 各チャネルが担当する FFT ビンは連続範囲になるため、開始ビンと重み列だけ持てば足りる。
-    // タプルの配列の配列 (AoS) と違いポインタ追跡がなく、積算を SIMD 化できる
+    // チャネルごとの連続ビン範囲を SoA で持つ (開始ビン、本数、flat 重み)。積算はスカラー。
     private let melBinStart: [Int]
     private let melBinCount: [Int]
     private let melWeightOffset: [Int]
@@ -24,7 +22,7 @@ public struct Filterbank: Sendable {
         self.durandKerner = DurandKernerSolver()
         self.formantExtractor = FormantExtractor(sampleRate: Float(config.sampleRate))
         
-        // 64ch Mel フィルタの構築
+        // Mel 三角フィルタの構築
         var weights: [[(bin: Int, weight: Float)]] = []
         let numChannels = config.melChannels
         let fftSize = 512
@@ -94,7 +92,8 @@ public struct Filterbank: Sendable {
         self.melWeightsFlat = flatWeights
     }
     
-    /// FFT パワースペクトルから 64 次元 Mel 特徴量ベクトルを抽出 (Direct Input Current: 0.0〜1.0)
+    /// 窓→FFT→(発話時のみフォルマント EQ)→Mel→[0, 1]。次元は `config.melChannels`。
+    /// 内部 VAD のノイズフロアを更新する。戻り値は `workspace.featureBuffer` のコピー。
     @discardableResult
     @inline(__always)
     public func extractFeatures(
@@ -162,7 +161,7 @@ public struct Filterbank: Sendable {
                 workspace.lpcCoeffs.withUnsafeBufferPointer { cPtr in
                     if durandKerner.solve(coefficients: cPtr.baseAddress!, order: config.lpcOrder, workspace: workspace) {
                         workspace.durandKernerCurr.withUnsafeBufferPointer { rPtr in
-                            formantRes = formantExtractor.extractFormants(roots: rPtr.baseAddress!, count: config.lpcOrder, workspace: workspace)
+                            formantRes = formantExtractor.extractFormants(roots: rPtr.baseAddress!, count: config.lpcOrder)
                         }
                     }
                 }
@@ -235,7 +234,7 @@ public struct Filterbank: Sendable {
             }
         }
         
-        // 5. 64ch Mel 特徴量の Direct Input Current への正規化 ([0.0, 1.0])
+        // 5. Mel エネルギーを [0, 1] にクリップ
         var ch = 0
         while ch < config.melChannels {
             let rawE = melEnergies[ch]

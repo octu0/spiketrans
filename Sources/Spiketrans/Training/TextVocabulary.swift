@@ -98,7 +98,6 @@ public struct TextVocabulary: Sendable {
         self.init(characters: Array(serializedCharacters))
     }
 
-    /// 文字からトークン ID を取得
     public func id(for char: Character) -> Int {
         switch charToIdTable[char] {
         case .some(let val):
@@ -108,7 +107,6 @@ public struct TextVocabulary: Sendable {
         }
     }
 
-    /// トークン ID から文字を取得
     public func char(for id: Int) -> Character {
         switch true {
         case id < 0:
@@ -128,7 +126,6 @@ public struct TextVocabulary: Sendable {
         }
     }
 
-    /// テキスト文字列からトークン ID 列へ変換
     public func textToIds(_ text: String) -> [Int] {
         var ids = [Int](repeating: 0, count: text.count)
         var i = 0
@@ -139,7 +136,6 @@ public struct TextVocabulary: Sendable {
         return ids
     }
 
-    /// トークン ID 列からテキスト文字列へ復元
     public func idsToText(_ ids: [Int]) -> String {
         var result = ""
         var i = 0

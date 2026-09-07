@@ -239,7 +239,7 @@ final class Tier3CombinationTests: XCTestCase {
         let vocab = TextVocabulary()
         let acNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
         let lmNet = SpikingNetwork(inputDim: 64, maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
-        let acDecoder = AcousticDecoder(network: acNet, vocabulary: vocab)
+        let acDecoder = AcousticDecoder(network: acNet)
         let lmDecoder = LanguageDecoder(lmNetwork: lmNet, vocabulary: vocab)
         let workspace = AcousticWorkspace(maxHiddenDim: 256, outputDim: vocab.size, inputDim: 64)
 

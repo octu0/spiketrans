@@ -1,10 +1,8 @@
 import Foundation
 
-/// フォルマント遷移変曲点および音響境界の動的セグメンテーション
+/// F1/F2 変化と有声境界から、系列を切るフレーム番号を返す。
 public struct FormantSegmenter: Sendable {
 
-    /// PCM データからフォルマント周波数の変化率変曲点および有声/無声境界を検出し、
-    /// TBPTT および推論同期用の動的境界フレームインデックス（0-indexed）リストを返す
     public static func detectBoundaries(
         pcmData: [Float],
         sampleRate: Int = 16000,
@@ -57,7 +55,7 @@ public struct FormantSegmenter: Sendable {
                     let rootsSuccess = solver.solve(coefficients: coeffPtr, order: 12, workspace: dspWs)
                     if rootsSuccess {
                         let rootPtr = dspWs.durandKernerCurr.withUnsafeBufferPointer { $0.baseAddress! }
-                        let formantRes = formantExtractor.extractFormants(roots: rootPtr, count: 12, workspace: dspWs)
+                        let formantRes = formantExtractor.extractFormants(roots: rootPtr, count: 12)
                         f1List[fIdx] = formantRes.f1
                         f2List[fIdx] = formantRes.f2
                     }

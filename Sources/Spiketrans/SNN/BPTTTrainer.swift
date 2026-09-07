@@ -47,11 +47,11 @@ public final class ForwardCache: @unchecked Sendable {
     }
 }
 
-/// スレッドセーフな独立勾配バッファ構造体 (並列学習用)
+/// 1 ワーカー分の勾配。合算は呼び出し側。
 public struct NetworkGradients: @unchecked Sendable {
     public var gradWIn: [Float]
     public var gradWRec: [Float]
-    public var gradWOut: [Float]        // 全スライス共有
+    public var gradWOut: [Float]
     public var gradBOut: [Float]
 
     public init(inputDim: Int, maxHiddenDim: Int, outputDim: Int) {
@@ -88,7 +88,7 @@ public struct NetworkGradients: @unchecked Sendable {
     }
 }
 
-/// BPTT 学習トレーナー
+/// CPU の BPTT。層 0 のみ。上位層の重みは更新しない。
 public final class BPTTTrainer: @unchecked Sendable {
     public let network: SpikingNetwork
     public let optimizer: AdamOptimizer
@@ -98,7 +98,6 @@ public final class BPTTTrainer: @unchecked Sendable {
         self.optimizer = optimizer
     }
 
-    /// 新規勾配バッファの割り当て
     public func makeGradients() -> NetworkGradients {
         return NetworkGradients(
             inputDim: network.inputDim,
@@ -107,7 +106,7 @@ public final class BPTTTrainer: @unchecked Sendable {
         )
     }
 
-    /// 単一スライスのシーケンス順伝播と損失計算
+    /// 系列順伝播とフレーム CE 損失。
     public func forwardSequence(
         featuresSeq: [[Float]],
         targets: [Int]
@@ -266,7 +265,7 @@ public final class BPTTTrainer: @unchecked Sendable {
         return (cache, avgLoss)
     }
 
-    /// 単一スライスの時間逆伝播（メインネットワークの grad 配列に直接蓄積）
+    /// 時間逆伝播。結果を network の grad に足す。
     public func backwardSequence(
         featuresSeq: [[Float]],
         targets: [Int],
@@ -303,7 +302,7 @@ public final class BPTTTrainer: @unchecked Sendable {
         }
     }
 
-    /// 単一スライスの時間逆伝播（指定された勾配バッファに蓄積）
+    /// 時間逆伝播。結果を grads に足す。
     public func backwardSequence(
         featuresSeq: [[Float]],
         targets: [Int],
@@ -476,7 +475,7 @@ public final class BPTTTrainer: @unchecked Sendable {
         }
     }
 
-    /// 1 サンプルの多重スライス勾配計算 (並列ワーカー用)
+    /// 1 系列の順伝播 + 逆伝播。並列ワーカーは grads を共有しない。
     public func computeSampleGradients(
         featuresSeq: [[Float]],
         targets: [Int],
@@ -536,7 +535,7 @@ public final class BPTTTrainer: @unchecked Sendable {
         return result
     }
 
-    /// 単一スライスのシーケンス順伝播と対数確率系列の生成
+    /// 系列順伝播と log-softmax。
     public func forwardSequenceLogProbs(
         featuresSeq: [[Float]]
     ) -> (cache: ForwardCache, logProbs: [[Float]]) {
@@ -769,7 +768,7 @@ public final class BPTTTrainer: @unchecked Sendable {
         }
     }
 
-    /// CTC 損失による 多重スライス勾配計算
+    /// 1 系列の CTC 損失と勾配。
     public func computeSampleCTCGradients(
         featuresSeq: [[Float]],
         targets: [Int],

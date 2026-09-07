@@ -49,26 +49,23 @@ public struct LanguageDecoderConfig: Sendable {
     }
 }
 
-/// 第2段 自己回帰言語 SNN デコーダ
+/// 音響フレーム確率に言語 SNN の対数を足して greedy / ビームで文字列を出す。
 public final class LanguageDecoder: @unchecked Sendable {
     public let lmNetwork: SpikingNetwork
     public let vocabulary: TextVocabulary
-    public let fallbackVocabulary: PhonemeVocabulary
     public let config: LanguageDecoderConfig
 
     public init(
         lmNetwork: SpikingNetwork,
         vocabulary: TextVocabulary = TextVocabulary(),
-        fallbackVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         config: LanguageDecoderConfig = LanguageDecoderConfig()
     ) {
         self.lmNetwork = lmNetwork
         self.vocabulary = vocabulary
-        self.fallbackVocabulary = fallbackVocabulary
         self.config = config
     }
 
-    /// トークン ID からワンホット風埋め込み特徴量を生成
+    /// ワンホット。語彙が inputDim を超える位置はハッシュ。学習側の正弦埋め込みとは別物。
     private func buildTokenFeature(tokenId: Int) -> [Float] {
         var feat = [Float](repeating: 0.0, count: lmNetwork.inputDim)
         if tokenId < lmNetwork.inputDim {
@@ -81,10 +78,9 @@ public final class LanguageDecoder: @unchecked Sendable {
         return feat
     }
 
-    /// 貪欲法 (Greedy) による音響+言語結合デコード (直接漢字かな + 未知語フォールバック)
+    /// フレームごとに音響と LM の対数を足して最大トークンを取る。unk は -1、pad は blankPenalty。
     public func decodeGreedy(
-        acousticProbs: [AcousticFrameProbabilities],
-        unkThreshold: Float = 0.25
+        acousticProbs: [AcousticFrameProbabilities]
     ) -> (tokens: [Int], text: String, score: Float) {
         if acousticProbs.isEmpty {
             return ([], "", 0.0)
@@ -198,10 +194,8 @@ public final class LanguageDecoder: @unchecked Sendable {
         return (tokens: selectedTokens, text: text, score: accumulatedScore)
     }
 
-    /// ビーム探索 (Beam Search) による音響+言語結合デコード
     public func decodeBeamSearch(
-        acousticProbs: [AcousticFrameProbabilities],
-        unkThreshold: Float = 0.25
+        acousticProbs: [AcousticFrameProbabilities]
     ) -> (tokens: [Int], text: String, score: Float) {
         if acousticProbs.isEmpty {
             return ([], "", 0.0)

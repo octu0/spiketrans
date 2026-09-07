@@ -8,7 +8,7 @@ setbuf(stdout, nil)
 // マイク入力をその場で文字起こしする体験用アプリ。
 //
 // 無音で区切って発話単位に文字起こしする。認識は 2 段構成 (音響 SNN でかな →
-// 辞書 Viterbi で漢字) で、推論は CPU の Event-driven 疎スパイク。
+// 辞書 Viterbi で漢字)。CPU 上の AcousticDecoder + CTC ビーム。
 
 // MARK: - 引数
 
@@ -507,9 +507,7 @@ final class Transcriber: @unchecked Sendable {
             numLayers: network.numLayers
         )
         self.acousticDecoder = AcousticDecoder(
-            network: network,
-            vocabulary: phoneticVocabulary,
-            fallbackVocabulary: PhonemeVocabulary()
+            network: network
         )
         self.beamDecoder = CTCBeamDecoder(
             vocabulary: phoneticVocabulary,

@@ -26,11 +26,7 @@ public struct ParagraphSegment: Sendable, Equatable {
     }
 }
 
-/// 沈黙時間および文区切りに基づく改行段落分け＆タイムスタンプ処理エンジン
-///
-/// 一定以上の無音・沈黙時間（ポーズ閾値: 既定 1.2 秒）や文の区切りによって発話を段落に分割し、
-/// 段落ごとに開始〜終了時刻のタイムスタンプ（例: `[00:01.20 -> 00:05.80]`）を出力する。
-/// O(1) メモリ管理により、ストリーミング推論でもメモリ肥大化を起こさない。
+/// ポーズ（既定 1.2 秒）と文区切りで段落を切り、開始〜終了時刻を付ける。
 public final class ParagraphSegmenter: @unchecked Sendable {
     public let pauseThresholdSeconds: Float
 
@@ -149,7 +145,6 @@ public final class ParagraphSegmenter: @unchecked Sendable {
         return paragraph
     }
 
-    /// 内部状態の全リセット
     public func reset() {
         currentStart = 0.0
         currentEnd = 0.0

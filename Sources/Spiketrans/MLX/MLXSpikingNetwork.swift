@@ -2,11 +2,9 @@ import Foundation
 import MLX
 import MLXNN
 
-/// MLX (Apple Silicon GPU) によるSNN ネットワーク。
-///
-/// 層 0 は再帰 LIF 層、層 1 以降は前層のスパイクを受けるフィードフォワード LIF 層。
-/// 上位層への入力電流は RMSNorm で単位スケールに揃え、前層の入力電流を加算する
-/// (電流空間の残差接続)。疎な発火率をそのまま重み付けすると上位層が沈黙するため
+/// MLX 上の SNN。層 0 は再帰 LIF、層 1 以降は FF LIF。
+/// 上位層は結合電流を RMSNorm し、前層の入力電流を足す。疎スパイクをそのまま
+/// 重み付けすると上位層が沈黙するため。
 public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     public let numLayers: Int
     public let inputDim: Int

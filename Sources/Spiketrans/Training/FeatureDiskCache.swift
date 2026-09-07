@@ -1,13 +1,6 @@
 import Foundation
 
-/// ディスク上の音響特徴量バイナリキャッシュ管理クラス
-///
-/// 数万〜数十万時間規模の音声データセットにおいて、WAV デコードおよび
-/// FFT・Mel フィルタバンク・3-tap FIR 演算の重複を排除し、NVMe SSD の広帯域 I/O により
-/// 学習スループットを最大化する。
-///
-/// ディスク配置は 2 階層のハッシュシャーディング (例: `baseDir/ab/cd/<hash>.feat`)
-/// により、数百万〜数千万ファイル環境でもディレクトリ走査性能を一定に維持する。
+/// 音響特徴のディスクキャッシュ。パスを FNV-1a で 2 階層 (`ab/cd/<hash>.feat`) に置く。
 public final class FeatureDiskCache: @unchecked Sendable {
     public let baseDirectory: String
     private let lock = NSLock()

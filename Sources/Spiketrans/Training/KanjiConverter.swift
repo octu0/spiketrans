@@ -1,6 +1,6 @@
 import Foundation
 
-/// かなテキストの正規化、ひらがな発音変換および音素抽出コンバータ
+/// 漢字かな混じり文を形態素解析し、ひらがな読みへ正規化する。
 public struct KanjiConverter: Sendable {
     public let vocabulary: PhonemeVocabulary
 
@@ -8,7 +8,6 @@ public struct KanjiConverter: Sendable {
         self.vocabulary = vocabulary
     }
 
-    /// 漢字混じり文をクリーンなひらがな発音文字列に変換 (ひらがな・長音・促音・読点・句点のみ抽出)
     /// 形態素単位の表層と読みの組
     public struct Token: Sendable {
         public let surface: String
@@ -391,6 +390,7 @@ public struct KanjiConverter: Sendable {
         return result
     }
 
+    /// 形態素の読みをひらがなに正規化する。句読点は `kanaOnly` で落とす。
     public func convertToHiragana(_ text: String) -> String {
         if text.isEmpty {
             return ""

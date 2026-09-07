@@ -349,7 +349,7 @@ final class StreamingTranscriberTests: XCTestCase {
         XCTAssertEqual(collector.count, 1, "Quantized transcriber must process speech stream correctly")
     }
 
-    // MARK: - 7. 配信フロントエンドが学習 extractFeaturesFromPCM と一致すること
+    // MARK: - 7. クリップ RMS 固定時、ホップ再生が extractFeaturesFromPCM と一致すること
 
     func testStreamingFrontEndMatchesOfflineExtract() {
         let pcm = synthesizeSpeech(sampleRate: 16000, durationSeconds: 1.0, amplitude: 0.4)

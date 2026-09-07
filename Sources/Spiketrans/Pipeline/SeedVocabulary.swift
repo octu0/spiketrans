@@ -1,10 +1,6 @@
 import Foundation
 
-/// 組み込み静的シード辞書テーブル
-///
-/// 有名な固有名詞、外来語、略称・通称、テック用語を収録し、
-/// 第1段（音響モデル・発音変換）と第2段（かな漢字変換）の双方で
-/// 統一的な読みと表記の対応を提供する。
+/// 固有名詞・外来語の読みと表記。第1段の発音変換と第2段のかな漢字で同じ表を使う。
 public struct SeedVocabulary: Sendable {
     /// かな漢字変換用シードエントリ一覧
     public static let entries: [KanaKanjiEntry] = [

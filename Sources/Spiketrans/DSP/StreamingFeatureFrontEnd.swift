@@ -1,16 +1,10 @@
 import Foundation
 
-/// ホップ単位の音響特徴抽出。SNN へ渡すベクトル (既定 512 次元) をここで作る。
+/// ホップ単位の音響特徴抽出。SNN 入力ベクトル (既定 512 次元) を作る。
 ///
-/// 処理は RMS ゲイン → プリエンファシス → フォルマント EQ 付き 64ch Mel →
-/// 時間 3-tap (128 次元) → `frameStack` 本の連結。オフライン (`extractFeaturesFromPCM`)
-/// はクリップ全体の RMS を `setGain` してからホップを流す。ストリーミングは未来が
-/// 見えないので発話開始以降の走行 RMS を使う。Mel / 3-tap / 束ねの実装はここだけ。
-/// 以前は `StreamingTranscriber` が 64 次元 raw Mel を渡しており、学習済み
-/// `inputDim=512` の重みと一致しなかった。
-///
-/// ハミング窓は `DSPWorkspace` 既定の 1024 点テーブルを使い、先頭 `frameSize`
-/// 点を掛ける。`frameSize` 点で窓を作り直すと学習時と形状が変わる。
+/// オフラインはクリップ RMS を `setGain` してからホップを流す。ストリーミングは
+/// 発話開始以降の走行 RMS を使う (未来のサンプルが見えない)。ハミング窓は
+/// `DSPWorkspace` 既定の 1024 点テーブル。`frameSize` 点で作り直すと学習時と形状が変わる。
 public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     public static let melChannels = 64
     /// 平滑 64 + 時間差分 64
@@ -22,12 +16,10 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     /// ほぼ無音のクリップでノイズだけを増幅しない上限
     public static let maxGain: Float = 20.0
 
-    /// 3-tap 128 次元を `stack` 本連結した SNN 入力次元。既定 512。
     public static func acousticInputDim(stack: Int = defaultStack) -> Int {
         return tapDim * max(1, stack)
     }
 
-    /// 目標 RMS 0.05 へ揃えるゲイン。無音で発散しないよう 20 倍で切る。
     public static func gainForRMS(_ rms: Float) -> Float {
         if 1e-6 < rms {
             let g = targetRMS / rms
@@ -85,15 +77,13 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         self.preemphBuf = [Float](repeating: 0.0, count: dspConfig.frameSize)
     }
 
-    /// ゲインを固定する。クリップ全体の RMS が先に分かるオフライン抽出用。
-    /// 呼ぶと以降の `pushRawFrame` は走行 RMS を更新しない。
+    /// オフライン用。クリップ RMS が先に分かるとき、以降の走行 RMS 更新を止める。
     public func setGain(_ g: Float) {
         gain = g
         gainFrozen = true
     }
 
-    /// VAD 発話の境界で呼ぶ。3-tap と束ねバッファを捨て、隣接発話の Mel が混ざらないようにする。
-    /// `setGain` 済みならゲインは維持し、未固定なら走行 RMS をやり直す。
+    /// 発話境界。3-tap / 束ねを捨てる。`setGain` 済みならゲインは維持する。
     public func beginUtterance() {
         hasPrevMel = false
         hasCurrMel = false
@@ -113,9 +103,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         }
     }
 
-    /// 1 ホップ分の raw フレームを入れる。3-tap は次ホップが揃うまで出さず、
-    /// `frameStack` 本たまると `stackedDim` のベクトルを返す。戻り値は内部バッファで、
-    /// 次の push / flush で上書きされる。
+    /// 1 ホップ入れる。`frameStack` 本そろうまで nil。戻り値は次の push / flush で上書きされる。
     public func pushRawFrame(pcmPtr: UnsafePointer<Float>, count: Int) -> [Float]? {
         if count < frameSize {
             return nil
@@ -128,9 +116,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         return pushTapIntoStack()
     }
 
-    /// 発話末の 3-tap を、オフライン末尾と同じく next=curr で確定する。
-    /// 束ねが 1 本も出ていなければゼロ埋めで 1 本出す。それ以外の端数は捨てる
-    /// (`extractFeaturesFromPCM` の `count / frameStack` と同じ)。
+    /// 末尾 3-tap を next=curr で確定する。未出力の束ねはゼロ埋め 1 本、それ以外の端数は捨てる。
     public func flush() -> [Float]? {
         if hasCurrMel != true {
             return nil
@@ -195,19 +181,14 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         let coeff = preemphasisCoeff
         if utteranceFirstFrame {
             preemphBuf[0] = pcmPtr[0] * gain
-            var i = 1
-            while i < count {
-                preemphBuf[i] = (pcmPtr[i] - (coeff * pcmPtr[i - 1])) * gain
-                i += 1
-            }
             utteranceFirstFrame = false
         } else {
             preemphBuf[0] = (pcmPtr[0] - (coeff * streamRawPrev)) * gain
-            var i = 1
-            while i < count {
-                preemphBuf[i] = (pcmPtr[i] - (coeff * pcmPtr[i - 1])) * gain
-                i += 1
-            }
+        }
+        var i = 1
+        while i < count {
+            preemphBuf[i] = (pcmPtr[i] - (coeff * pcmPtr[i - 1])) * gain
+            i += 1
         }
         streamRawPrev = pcmPtr[hopSize - 1]
     }

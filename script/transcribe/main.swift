@@ -175,9 +175,7 @@ let network = SpikingNetwork(weights: weights)
 report("モデル読み込み後")
 
 let decoder = AcousticDecoder(
-    network: network,
-    vocabulary: phoneticVocabulary,
-    fallbackVocabulary: PhonemeVocabulary()
+    network: network
 )
 let workspace = AcousticWorkspace(
     maxHiddenDim: network.maxHiddenDim,

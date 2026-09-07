@@ -5,7 +5,7 @@ import Darwin
 import Glibc
 #endif
 
-/// ストリーム読み込みおよびリソース解放を抽象化するプロトコル (Go の io.ReadCloser 相当)
+/// バイト列の逐次読み出しと close。
 public protocol ReadCloser: AnyObject, Sendable {
     /// 指定されたバッファに最大 count バイトを読み込む (戻り値 0 は EOF)
     func read(into buffer: UnsafeMutablePointer<UInt8>, count: Int) throws -> Int
@@ -14,7 +14,7 @@ public protocol ReadCloser: AnyObject, Sendable {
     func close() throws
 }
 
-/// ファイルディスクリプタを用いた Pure Swift ファイルストリームリーダー
+/// ファイルディスクリプタの ReadCloser。
 public final class FileReadCloser: ReadCloser, @unchecked Sendable {
     private var fd: Int32
     private var isClosed: Bool
@@ -40,7 +40,6 @@ public final class FileReadCloser: ReadCloser, @unchecked Sendable {
         }
     }
 
-    /// 最大 count バイトをバッファに読み出し
     public func read(into buffer: UnsafeMutablePointer<UInt8>, count: Int) throws -> Int {
         if isClosed {
             throw NSError(
@@ -66,7 +65,6 @@ public final class FileReadCloser: ReadCloser, @unchecked Sendable {
         }
     }
 
-    /// ファイルを閉じる
     public func close() throws {
         if isClosed != true {
             let res = Darwin.close(fd)

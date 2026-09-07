@@ -95,7 +95,7 @@ public final class VAD: @unchecked Sendable {
         )
     }
     
-    /// 長時間音声全体のセグメンテーション
+    /// フレーム VAD を連ねて発話区間 `[startIndex, endIndex)` を返す。
     public func segmentUtterances(
         pcmData: [Float],
         workspace: DSPWorkspace

@@ -17,12 +17,8 @@ print("==================================================")
 // いずれも loanword128 での掃引で最良だった値を採用している。
 // 変更する場合はここを直接書き換える (CLI 引数にはしない)。
 enum Defaults {
-    /// 連続フレームを束ねる倍率。10ms/フレームは CTC には細かすぎ、
-    /// 逐次カーネル起動回数がそのまま学習時間に効く。4 で 40ms 相当。
     static let frameStack = StreamingFeatureFrontEnd.defaultStack
-    /// 1 フレームあたりの 3-tap Mel 次元
     static let melFrameDim = StreamingFeatureFrontEnd.tapDim
-    /// 音響 SNN への入力次元
     static var acousticInputDim: Int { return melFrameDim * frameStack }
 
     /// 隠れ層の次元
@@ -402,8 +398,6 @@ let trainConfig = TrainingConfig(
     clipNorm: 5.0
 )
 
-// 第1段 音響 SNN に ALIF (適応型発火閾値) を適用し、強い母音の過剰発火を抑えて
-// 微小な子音スパイクを分離しやすくする
 let acousticInputDim = Defaults.acousticInputDim
 print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
 
@@ -704,8 +698,7 @@ if epochs == 0 {
     }
 }
 
-// 4.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド)
-// --language-bonus 0 のときは言語 SNN の出力が第2段で一切使われないため学習を丸ごと省略する
+// languageBonus == 0 のときは言語 SNN を第2段で使わないため学習を省略する
 if 0.0 < Defaults.languageBonus {
     print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド) ---")
     let lmStartTime = CFAbsoluteTimeGetCurrent()
@@ -726,7 +719,7 @@ if 0.0 < Defaults.languageBonus {
     let lmElapsed = CFAbsoluteTimeGetCurrent() - lmStartTime
     print("  ✓ 言語 SNN 学習完了 (所要時間: \(String(format: "%.2f", lmElapsed)) 秒)")
 } else {
-    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習をスキップ (--language-bonus 0) ---")
+    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習をスキップ (languageBonus = 0) ---")
 }
 
 if let expPath = exportWeightsPath {
@@ -757,7 +750,7 @@ if 0 < dataset.count {
     print("正解テキスト: \"\(s0.rawText)\"")
     print("正解かな発音: \"\(s0.hiraganaText)\" (\(hiraIds0.count) 文字), 音響フレーム数: \(totalF) フレーム")
 
-    // 1. alignTargets の集計 (実際の VAD 連動アライメント)
+    // 1. alignTargets の集計 (Mel エネルギーによる発話フレーム配分)
     let targets = trainer.acousticTrainer.alignTargets(textIds: hiraIds0, features: feat0)
     var charFrameCounts = [Int](repeating: 0, count: hiraIds0.count)
     var padCount = 0
@@ -872,8 +865,7 @@ if 0 < dataset.count {
 
     // 2. 音響 SNN のフレーム別予測
     let acDec = AcousticDecoder(
-        network: trainer.acousticTrainer.network,
-        vocabulary: phoneticVocabulary,
+        network: trainer.acousticTrainer.network
     )
     let acWs = AcousticWorkspace(
         maxHiddenDim: trainer.acousticTrainer.network.maxHiddenDim,
@@ -989,8 +981,6 @@ if 0 < dataset.count {
         print("      正解かな発音:     \"\(testSample.hiraganaText)\"")
         print("  ==================================================")
 
-        // 2段階音声文字起こし (音響かな推定 -> 辞書 Viterbi 漢字復元)
-        let bList = FormantSegmenter.detectBoundaries(pcmData: testSample.audioPCM)
         let t0 = CFAbsoluteTimeGetCurrent()
         let resTwoStage = trainer.transcribeTwoStage(
             featuresSeq: testSample.acousticFeatures,
@@ -998,7 +988,6 @@ if 0 < dataset.count {
             dictionary: kanaKanjiDict,
             minDurationFrames: 3,
             minConfidence: 0.05,
-            boundaries: bList,
             useCTC: true
         )
         let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
@@ -1254,7 +1243,6 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
 
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
         let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: evalFrameStack)
-        let boundaries = FormantSegmenter.detectBoundaries(pcmData: pcm16k)
         let isTrain = evalIsTrain[idx]
 
         // 正解のかな読み (第1段の評価基準)
@@ -1267,7 +1255,6 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
                 dictionary: kanaKanjiDict,
                 minDurationFrames: 3,
                 minConfidence: 0.05,
-                boundaries: boundaries,
                 useCTC: true,
                 languageBonus: evalLanguageBonus,
                 blankPenalty: Defaults.blankPenalty
@@ -1533,9 +1520,7 @@ if 0 < rawPairs.count {
     let benchNetwork = trainer.acousticTrainer.network
     do {
         let decoder = AcousticDecoder(
-            network: benchNetwork,
-            vocabulary: phoneticVocabulary,
-            fallbackVocabulary: PhonemeVocabulary()
+            network: benchNetwork
         )
         let ws = AcousticWorkspace(
             maxHiddenDim: benchNetwork.maxHiddenDim,

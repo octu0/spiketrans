@@ -1,6 +1,6 @@
 import Foundation
 
-/// WAV ファイルストリームをチャンク単位で読み出すストリーミングリーダー
+/// 先頭 44 バイト固定ヘッダの 16-bit PCM だけ読む。fmt/data 探索はしない。ステレオは平均でモノラル。
 public final class WavStreamReader: Sendable {
     public let reader: any ReadCloser
     public let sampleRate: Int

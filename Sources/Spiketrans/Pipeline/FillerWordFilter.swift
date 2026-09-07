@@ -7,11 +7,7 @@ public enum FillerFilterMode: Sendable, Equatable {
     case disabled     // フィルタリングを行わない
 }
 
-/// 日本語特有のフィラー・言い淀みの検出および除去フィルタ
-///
-/// 「えー」「あー」「えっと」「あのー」「そのー」「まあ」「なんか」「うーん」等の
-/// 音声認識結果に頻出する言い淀みを検出し、除去または整形する。
-/// SNN の軽量性を損なわないよう、外部依存ゼロ・最小限のアロケーションで動作する。
+/// 音声認識結果の言い淀み（えー、あのー 等）を検出して除去またはマーキングする。
 public struct FillerWordFilter: Sendable {
     public let mode: FillerFilterMode
 

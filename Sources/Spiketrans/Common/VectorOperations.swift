@@ -1,8 +1,8 @@
 import Foundation
 
-/// Float バッファに対する高速ベクトル・信号処理演算ユーティリティ
+/// Float バッファのベクトル演算。
 public enum VectorOperations {
-    /// 2つのバッファの内積 (Dot Product) を SIMD8 で高速計算
+    /// 内積。SIMD8。
     @inline(__always)
     public static func dotProduct(
         a: UnsafePointer<Float>,

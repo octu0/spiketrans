@@ -67,21 +67,17 @@ public struct StreamingTranscriberConfig: Sendable {
     }
 }
 
-/// 統合ストリーミング音声文字起こしパイプライン (O(1) メモリ & ゼロアロケーション)
+/// ストリーミング文字起こし。VAD で発話を切り、音響デコードして後処理する。
 public final class StreamingTranscriber: @unchecked Sendable {
-    public static let defaultUnkThreshold: Float = 0.25
-
     public let config: StreamingTranscriberConfig
     public let textVocabulary: TextVocabulary
     public let phonemeVocabulary: PhonemeVocabulary
-    public let unkThreshold: Float
 
     // コールバック
     public var onPartialResult: (@Sendable (TranscriptionResult) -> Void)?
     public var onFinalResult: (@Sendable (TranscriptionResult) -> Void)?
     public var onParagraphResult: (@Sendable (ParagraphSegment) -> Void)?
 
-    // DSP & SNN エンジン
     private let vad: VAD
     private let dspWorkspace: DSPWorkspace
 
@@ -106,7 +102,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
     private let maxSegmentHops: Int
     private var segmentHopCount: Int = 0
     private var segmentProbs: [AcousticFrameProbabilities]
-    private var segmentRawFeatures: [[Float]] // フォールバック音素推定用
+    private var segmentRawFeatures: [[Float]] // 本線が空のとき fallbackKana に渡す
     private var segmentStartSample: Int64 = 0
     private var segmentSpeechActive: Bool = false
     private var consecutiveSilenceFrames: Int = 0
@@ -120,13 +116,11 @@ public final class StreamingTranscriber: @unchecked Sendable {
         languageNetwork: SpikingNetwork,
         quantizedAcousticEngine: QuantizedEngine? = nil,
         textVocabulary: TextVocabulary = TextVocabulary(),
-        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        unkThreshold: Float = StreamingTranscriber.defaultUnkThreshold
+        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary()
     ) {
         self.config = config
         self.textVocabulary = textVocabulary
         self.phonemeVocabulary = phonemeVocabulary
-        self.unkThreshold = unkThreshold
 
         let dspCfg = config.dspConfig
         self.vad = VAD(config: dspCfg)
@@ -152,9 +146,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
 
         self.acousticDecoder = AcousticDecoder(
             network: acousticNetwork,
-            quantizedEngine: qEngine,
-            vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary
+            quantizedEngine: qEngine
         )
         self.acousticWorkspace = AcousticWorkspace(
             maxHiddenDim: acousticNetwork.maxHiddenDim,
@@ -170,7 +162,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         self.languageDecoder = LanguageDecoder(
             lmNetwork: languageNetwork,
             vocabulary: textVocabulary,
-            fallbackVocabulary: phonemeVocabulary,
             config: lmConfig
         )
 
@@ -194,6 +185,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
             frameStack: stack,
             dspConfig: dspCfg
         )
+        // 束ね前は 10 ホップごと (100 ms)。束ね後も同じ実時間。
         let partialEvery = 10 / stack
         if partialEvery < 1 {
             self.partialEveryStacked = 1
@@ -202,7 +194,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         }
     }
 
-    /// PCM 音声配列の入力
     public func appendAudio(pcm: [Float]) {
         pcm.withUnsafeBufferPointer { buf in
             switch buf.baseAddress {
@@ -214,7 +205,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         }
     }
 
-    /// PCM 音声ポインタの入力
     public func appendAudio(pcmPtr: UnsafePointer<Float>, count: Int) {
         if count <= 0 {
             return
@@ -235,7 +225,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         processAvailableFrames()
     }
 
-    /// リングバッファ内の利用可能フレームを順次処理
     private func processAvailableFrames() {
         let frameSize = config.dspConfig.frameSize
         let hopSize = config.dspConfig.hopSize
@@ -243,7 +232,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         let rawBuf = dspWorkspace.rawFrame.withUnsafeMutableBufferPointer { $0.baseAddress! }
 
         while frameSize <= ringAvailable {
-            // 1. リングバッファから rawFrame へコピー
             var i = 0
             while i < frameSize {
                 let idx = (ringReadPos + i) % ringBufferCapacity
@@ -256,14 +244,13 @@ public final class StreamingTranscriber: @unchecked Sendable {
             ringAvailable -= hopSize
             totalSamplesProcessed += Int64(hopSize)
 
-            // 2. VAD 判定
+            // セグメンテーション VAD は raw。エネルギー閾値を screen/segment と揃える。
             let vadRes = vad.processFrame(
                 ptr: rawBuf,
                 count: frameSize,
                 workspace: dspWorkspace
             )
 
-            // 3. 発話ステートマシン進行
             if vadRes.isSpeech {
                 consecutiveSilenceFrames = 0
                 consecutiveSpeechFrames += 1
@@ -288,15 +275,12 @@ public final class StreamingTranscriber: @unchecked Sendable {
                 consecutiveSilenceFrames += 1
             }
 
-            // 4. 学習時と同じ stacked 特徴を FrontEnd で作り、音響 SNN へ渡す。
-            //    セグメンテーション VAD は raw のまま (エネルギー閾値を変えない)。
             if segmentSpeechActive {
                 segmentHopCount += 1
                 if let features = featureFrontEnd.pushRawFrame(pcmPtr: rawBuf, count: frameSize) {
                     ingestStackedFeatures(features)
                 }
 
-                // 5. 発話終了判定 (20 ホップ = 200ms 無音 または 最大セグメント長到達)
                 if 20 <= consecutiveSilenceFrames || maxSegmentHops <= segmentHopCount {
                     finalizeSegment()
                 }
@@ -314,7 +298,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
         segmentRawFeatures.append(features)
 
         if let onPartial = onPartialResult {
-            if 0 < segmentProbs.count && (segmentProbs.count % partialEveryStacked) == 0 {
+            if (segmentProbs.count % partialEveryStacked) == 0 {
                 let windowLimit = 50
                 let window: [AcousticFrameProbabilities]
                 if windowLimit < segmentProbs.count {
@@ -323,8 +307,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
                     window = segmentProbs
                 }
                 let greedy = languageDecoder.decodeGreedy(
-                    acousticProbs: window,
-                    unkThreshold: unkThreshold
+                    acousticProbs: window
                 )
                 let startSec = Float(segmentStartSample) / Float(config.dspConfig.sampleRate)
                 let endSec = Float(totalSamplesProcessed) / Float(config.dspConfig.sampleRate)
@@ -342,65 +325,11 @@ public final class StreamingTranscriber: @unchecked Sendable {
         }
     }
 
-    /// 音響特徴量から母音・子音を推定し、ひらがな（聞こえた音）にフォールバック
     public func decodeFallbackKana(from featuresSeq: [[Float]]) -> String {
-        if featuresSeq.isEmpty {
-            return ""
-        }
-        var phonemes: [String] = []
-        var lastPhoneme = ""
-
-        var fIdx = 0
-        while fIdx < featuresSeq.count {
-            let feat = featuresSeq[fIdx]
-            var lowEnergy: Float = 0.0
-            var midEnergy: Float = 0.0
-            var highEnergy: Float = 0.0
-
-            var d = 0
-            let featCount = feat.count
-            while d < featCount {
-                let v = feat[d]
-                switch true {
-                case d < 16:
-                    lowEnergy += v
-                case d < 40:
-                    midEnergy += v
-                default:
-                    highEnergy += v
-                }
-                d += 1
-            }
-
-            let totalEnergy = lowEnergy + midEnergy + highEnergy
-            if 0.1 <= totalEnergy {
-                var p = "a"
-                switch true {
-                case highEnergy < lowEnergy && midEnergy < lowEnergy:
-                    p = "u"
-                case lowEnergy < highEnergy && midEnergy < highEnergy:
-                    p = "i"
-                case lowEnergy < midEnergy && highEnergy < midEnergy:
-                    p = "a"
-                default:
-                    p = "o"
-                }
-
-                if p != lastPhoneme {
-                    phonemes.append(p)
-                    lastPhoneme = p
-                }
-            }
-            fIdx += 1
-        }
-
-        if phonemes.isEmpty {
-            return ""
-        }
-        return phonemeVocabulary.phonemesToKana(phonemes)
+        return phonemeVocabulary.fallbackKana(fromFeatureFrames: featuresSeq)
     }
 
-    /// 現在の発話セグメントの言語デコードと結果確定 (本線: 直接漢字かな + 未知語フォールバック: 聞こえた音のかな)
+    /// 発話を確定する。本線が空なら `decodeFallbackKana`。
     private func finalizeSegment() {
         if let flushed = featureFrontEnd.flush() {
             ingestStackedFeatures(flushed)
@@ -409,17 +338,14 @@ public final class StreamingTranscriber: @unchecked Sendable {
             let decodeRes: (tokens: [Int], text: String, score: Float)
             if config.beamWidth <= 1 {
                 decodeRes = languageDecoder.decodeGreedy(
-                    acousticProbs: segmentProbs,
-                    unkThreshold: unkThreshold
+                    acousticProbs: segmentProbs
                 )
             } else {
                 decodeRes = languageDecoder.decodeBeamSearch(
-                    acousticProbs: segmentProbs,
-                    unkThreshold: unkThreshold
+                    acousticProbs: segmentProbs
                 )
             }
 
-            // 本線デコード結果の確定 (未知語トークン <unk>, ? のサニタイズ)
             var finalText = decodeRes.text
             finalText = finalText.replacingOccurrences(of: "<unk>", with: "")
             finalText = finalText.replacingOccurrences(of: "?", with: "")
@@ -469,24 +395,10 @@ public final class StreamingTranscriber: @unchecked Sendable {
         featureFrontEnd.beginUtterance()
     }
 
-    /// 残存バッファのフラッシュと終端処理
+    /// 端数ホップ (frameSize 未満) は捨て、開いている発話を確定する。
     public func flush() {
-        let frameSize = config.dspConfig.frameSize
-        if 0 < ringAvailable {
-            let rawBuf = dspWorkspace.rawFrame.withUnsafeMutableBufferPointer { $0.baseAddress! }
-            var i = 0
-            while i < frameSize {
-                if i < ringAvailable {
-                    let idx = (ringReadPos + i) % ringBufferCapacity
-                    rawBuf[i] = ringBuffer[idx]
-                } else {
-                    rawBuf[i] = 0.0
-                }
-                i += 1
-            }
-            ringReadPos = 0
-            ringAvailable = 0
-        }
+        ringReadPos = 0
+        ringAvailable = 0
 
         if segmentSpeechActive {
             finalizeSegment()
@@ -499,7 +411,6 @@ public final class StreamingTranscriber: @unchecked Sendable {
         }
     }
 
-    /// 内部状態の全リセット
     public func reset() {
         ringWritePos = 0
         ringReadPos = 0

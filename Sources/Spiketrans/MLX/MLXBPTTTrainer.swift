@@ -11,7 +11,7 @@ internal let rmsNormEpsilon: Float = 1e-5
 /// T=1000 で OOM。これを超える長い系列は eager で流す
 internal let compiledMaxFrames = 256
 
-/// MLX GPU による SNN BPTT 学習エンジン (フレーム単位安定化 BPTT & ミニバッチ対応)
+/// MLX 上の切り詰め BPTT。系列が `compiledMaxFrames` を超えると eager。
 public final class MLXBPTTTrainer: @unchecked Sendable {
     public let network: MLXSpikingNetwork
     public let optimizer: ArrayLRAdam
@@ -111,7 +111,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 let rec0 = matmul(s[0], network.wRec)
                 let totalCurrent0 = current0_t + rec0
                 let vDecayed0 = (v[0] * beta) * (1.0 - s[0])
-                v[0] = clip(vDecayed0 + totalCurrent0, min: -20.0, max: 20.0)
+                v[0] = clip(vDecayed0 + totalCurrent0, min: LIFNeuronEngine.vClampMin, max: LIFNeuronEngine.vClampMax)
 
                 a[0] = (a[0] * rho) + (s[0] * gamma)
                 let dynVTh0 = vTh + a[0]
@@ -140,7 +140,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                     prevCurrent = totalCurrent_l
 
                     let vDecayed_l = (v[l] * beta) * (1.0 - s[l])
-                    v[l] = clip(vDecayed_l + totalCurrent_l, min: -20.0, max: 20.0)
+                    v[l] = clip(vDecayed_l + totalCurrent_l, min: LIFNeuronEngine.vClampMin, max: LIFNeuronEngine.vClampMax)
 
                     a[l] = (a[l] * rho) + (s[l] * gamma)
                     let dynVTh_l = vTh + a[l]

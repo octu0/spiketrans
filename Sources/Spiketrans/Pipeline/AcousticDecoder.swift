@@ -1,6 +1,6 @@
 import Foundation
 
-/// 第1段 音響推論用事前確保ワークスペース (0 アロケーション)
+/// 音響フォワードの膜電位・スパイク・適応閾値と出力。層 l は `[l * maxHiddenDim, (l + 1) * maxHiddenDim)`。
 public final class AcousticWorkspace: @unchecked Sendable {
     public var vPrev: [Float]
     public var sPrev: [Float]
@@ -9,7 +9,7 @@ public final class AcousticWorkspace: @unchecked Sendable {
     public var logits: [Float]
     public var probabilities: [Float]
     public var quantizedWorkspace: QuantizedWorkspace?
-    /// forwardSlice の中間バッファ (Hot Path ゼロアロケーション用)
+    /// `forward` が毎フレーム確保しない中間バッファ
     public let scratch: ForwardScratch
 
     public init(maxHiddenDim: Int = 4096, outputDim: Int = 523, inputDim: Int = 64, numLayers: Int = 1) {
@@ -78,29 +78,19 @@ public struct AcousticFrameProbabilities: Sendable, Equatable {
     }
 }
 
-/// 第1段 音響 SNN。1 フレームの特徴 (`network.inputDim`) から文字事後確率を出す
+/// 第1段 音響 SNN。1 フレームの特徴から文字事後確率を出す
 public final class AcousticDecoder: @unchecked Sendable {
     public let network: SpikingNetwork
     public let quantizedEngine: QuantizedEngine?
-    public let vocabulary: TextVocabulary
-    public let fallbackVocabulary: PhonemeVocabulary
-    public let silenceThreshold: Float
 
     public init(
         network: SpikingNetwork,
-        quantizedEngine: QuantizedEngine? = nil,
-        vocabulary: TextVocabulary = TextVocabulary(),
-        fallbackVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        silenceThreshold: Float = 0.5
+        quantizedEngine: QuantizedEngine? = nil
     ) {
         self.network = network
         self.quantizedEngine = quantizedEngine
-        self.vocabulary = vocabulary
-        self.fallbackVocabulary = fallbackVocabulary
-        self.silenceThreshold = silenceThreshold
     }
 
-    /// 1フレームの音響特徴量から音素事後確率分布を推定
     @inline(__always)
     public func decodeFrame(
         features: [Float],
@@ -162,11 +152,9 @@ public final class AcousticDecoder: @unchecked Sendable {
         )
     }
 
-    /// 特徴量シーケンスのデコード
     public func decodeSequence(
         featuresSeq: [[Float]],
-        workspace: AcousticWorkspace,
-        boundaries: [Int]? = nil
+        workspace: AcousticWorkspace
     ) -> [AcousticFrameProbabilities] {
         var results = [AcousticFrameProbabilities]()
         results.reserveCapacity(featuresSeq.count)
@@ -183,10 +171,9 @@ public final class AcousticDecoder: @unchecked Sendable {
         return results
     }
 
-    /// CTC 重複圧縮 (Collapse) による文字トークン系列の抽出
+    /// 連続同一トークンと pad / 制御トークン (id < 4) を潰す。
     public func collapseTokens(
-        _ frameProbs: [AcousticFrameProbabilities],
-        blankThreshold: Float = 0.4
+        _ frameProbs: [AcousticFrameProbabilities]
     ) -> [Int] {
         var collapsed: [Int] = []
         var lastNonBlankToken: Int? = nil

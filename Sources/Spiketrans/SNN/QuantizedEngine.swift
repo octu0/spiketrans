@@ -52,7 +52,7 @@ public struct QuantizedWeights: Sendable, Equatable {
     public let wIn: [Int32]
     public let wRec: [Int32]
     public let bH: [Int32]
-    public let wOut: [Int32]        // 全スライスで共有
+    public let wOut: [Int32]
     public let bOut: [Int32]
 
     public init(
@@ -79,7 +79,7 @@ public struct QuantizedWeights: Sendable, Equatable {
     }
 }
 
-/// 固定小数点推論用事前確保ワークスペース (0 アロケーション)
+/// 固定小数点フォワードの膜電位・スパイク・入力・ロジット。`predict` が毎回確保しない。
 public final class QuantizedWorkspace: @unchecked Sendable {
     public var vPrev: ContiguousArray<Int32>
     public var sPrev: ContiguousArray<Int32>
@@ -113,7 +113,7 @@ public final class QuantizedWorkspace: @unchecked Sendable {
     }
 }
 
-/// Int32 / Int16 固定小数点推論エンジン
+/// Int32 / Int16 固定小数点のフォワード。
 public final class QuantizedEngine: @unchecked Sendable {
     public let weights: QuantizedWeights
     public let timeSteps: Int
@@ -123,7 +123,7 @@ public final class QuantizedEngine: @unchecked Sendable {
         self.timeSteps = timeSteps
     }
 
-    /// Float32 モデルから Int32 / Int16 量子化モデルを生成するコンバータ
+    /// 層 0 の Float32 重みを Int32 固定小数点へ写す。上位層・適応閾値は持たない。
     public static func quantize(
         network: SpikingNetwork,
         config: QuantizedConfig,
@@ -169,7 +169,7 @@ public final class QuantizedEngine: @unchecked Sendable {
         )
     }
 
-    /// 固定小数点推論（乗算フリー・スパース加算・ビットシフト減衰）
+    /// 固定小数点推論。入力は整数 MAC、再帰は発火ニューロンの重み加算、減衰はビットシフト。
     public func predict(
         features: [Float],
         workspace: QuantizedWorkspace,
