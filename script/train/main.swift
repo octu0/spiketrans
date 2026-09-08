@@ -42,6 +42,8 @@ enum Defaults {
 
     /// 学習率の暖機に使うステップ数の分母 (全ステップの 1/N を暖機に充てる)
     static let warmupStepDivisor = 50
+    /// 暖機ステップ数の下限
+    static let minWarmupSteps = 100
 
     /// MLX のバッファキャッシュを捨てる間隔 (バッチ数)
     static let clearCacheEveryBatches = 200
@@ -573,7 +575,9 @@ if epochs == 0 {
     // 学習率はバッチ単位で刻む。エポック単位だとデータが増えたときに
     // 暖機の割合が大きすぎる (6 エポック中 4 エポックが暖機など)
     let totalSteps = max(1, epochs * batchGroups.count)
-    let warmupSteps = max(1, totalSteps / Defaults.warmupStepDivisor)
+    // 総ステップの 1/50 だが下限を設ける。2000 件 × 20 epoch (640 ステップ) では暖機 12 ステップとなり
+    // lr 0.003 で暖機中に発散した。100 万件規模 (暖機 1000 ステップ超) には影響しない
+    let warmupSteps = min(max(Defaults.minWarmupSteps, totalSteps / Defaults.warmupStepDivisor), max(1, totalSteps / 2))
     print("  学習ステップ数: \(totalSteps) (暖機 \(warmupSteps) ステップ)")
 
     let checkpointInterval = min(Defaults.checkpointEvery, max(1, epochs / 6))

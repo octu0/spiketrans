@@ -150,21 +150,21 @@ if corpusLines.isEmpty != true {
     print("第2段辞書: なし (かなのみ出力します)")
 }
 
-// 4. 分割単位の決定
+// 4. 分割単位の決定。VAD の無音で切り、--chunk-seconds を 1 区間の上限にする
+//    (固定長で切ると語の途中で分断される)。0 なら分割なし
 let frameStack = StreamingFeatureFrontEnd.defaultStack
 var segments: [(start: Int, count: Int)] = []
 if chunkSeconds <= 0.0 {
     segments.append((start: 0, count: pcm.count))
 } else {
-    let chunkSamples = Int(chunkSeconds * 16000.0)
-    var offset = 0
-    while offset < pcm.count {
-        let n = min(chunkSamples, pcm.count - offset)
-        segments.append((start: offset, count: n))
-        offset += n
+    let chunkStart = CFAbsoluteTimeGetCurrent()
+    let chunker = SpeechChunker(maxSegmentSeconds: Float(chunkSeconds))
+    for span in chunker.chunk(pcm: pcm) {
+        segments.append((start: span.start, count: span.end - span.start))
     }
+    print(String(format: "VAD 分割: %.1f 秒", CFAbsoluteTimeGetCurrent() - chunkStart))
 }
-var chunkDescription = " (\(Int(chunkSeconds)) 秒ごと)"
+var chunkDescription = " (無音で区切り、上限 \(Int(chunkSeconds)) 秒)"
 if chunkSeconds <= 0.0 {
     chunkDescription = " (分割なし)"
 }

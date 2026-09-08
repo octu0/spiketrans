@@ -17,7 +17,7 @@ setbuf(stdout, nil)
 let mergeGapSeconds: Float = 0.35
 /// 単独では短すぎて捨てる区間 (秒)
 let minSegmentSeconds: Float = 0.6
-/// 1 区間の上限 (秒)。これを超える区間は内部でいちばん長い無音で割る
+/// 1 区間の上限 (秒)。これを超える区間は内部でいちばん静かな窓で割る
 var maxSegmentSeconds: Float = 15.0
 /// 割り当て後に「要確認」として出す文字密度の範囲 (文字/秒)
 let plausibleCharsPerSecond: ClosedRange<Float> = 3.0...12.0
@@ -81,100 +81,25 @@ guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
     exit(1)
 }
 let pcm = SpeechDataset.resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
+
+// ---- 1. VAD で区間を得る (transcribe と同じ切り方) ----
+
 let sampleRate: Float = 16000.0
 let totalSeconds = Float(pcm.count) / sampleRate
-
-// ---- 1. VAD で区間を得て、短い間は結合し、長すぎる区間は無音で割る ----
-
-let dspConfig = DSPConfig()
-let vad = VAD(config: dspConfig)
-let workspace = DSPWorkspace(maxFrameSize: 1024, lpcOrder: dspConfig.lpcOrder, melChannels: dspConfig.melChannels)
-
-// VAD は発話単位の RMS 正規化を前提にしているので、小さい録音は持ち上げる
-var sumSq: Float = 0.0
-var i = 0
-while i < pcm.count {
-    sumSq += pcm[i] * pcm[i]
-    i += 1
-}
-let rms = sqrt(sumSq / Float(max(1, pcm.count)))
-var scaled = pcm
-if 1e-6 < rms {
-    let gain = min(0.05 / rms, 20.0)
-    i = 0
-    while i < scaled.count {
-        scaled[i] *= gain
-        i += 1
-    }
-}
-
-let rawSegments = vad.segmentUtterances(pcmData: scaled, workspace: workspace)
-if rawSegments.isEmpty {
-    warn("エラー: 有声区間が見つかりません")
-    exit(1)
-}
-
-struct Span {
-    var start: Int
-    var end: Int
-    var seconds: Float {
-        return Float(end - start) / sampleRate
-    }
-}
-
-// 1a. 近い区間を結合
-var merged: [Span] = []
-for seg in rawSegments {
-    if let last = merged.last, Float(seg.startIndex - last.end) / sampleRate < mergeGapSeconds {
-        merged[merged.count - 1].end = max(last.end, seg.endIndex)
-    } else {
-        merged.append(Span(start: seg.startIndex, end: seg.endIndex))
-    }
-}
-
-// 1b. 長すぎる区間は、内部でエネルギーが最も低い 200ms 窓で割る (再帰的に)
-func lowestEnergySplit(_ span: Span, in samples: [Float]) -> Int {
-    let window = Int(0.2 * sampleRate)
-    let hop = Int(0.05 * sampleRate)
-    // 端から 1 秒以内では割らない
-    let margin = Int(1.0 * sampleRate)
-    var best = (span.start + span.end) / 2
-    var bestEnergy = Float.greatestFiniteMagnitude
-    var pos = span.start + margin
-    while (pos + window) <= (span.end - margin) {
-        var e: Float = 0.0
-        var k = pos
-        while k < pos + window {
-            e += samples[k] * samples[k]
-            k += 1
-        }
-        if e < bestEnergy {
-            bestEnergy = e
-            best = pos + window / 2
-        }
-        pos += hop
-    }
-    return best
-}
-
-var spans: [Span] = []
-var queue = merged
-while queue.isEmpty != true {
-    let span = queue.removeFirst()
-    if maxSegmentSeconds < span.seconds {
-        let cut = lowestEnergySplit(span, in: scaled)
-        if span.start < cut && cut < span.end {
-            queue.insert(Span(start: cut, end: span.end), at: 0)
-            queue.insert(Span(start: span.start, end: cut), at: 0)
-            continue
-        }
-    }
-    spans.append(span)
-}
-spans = spans.filter { minSegmentSeconds <= $0.seconds }
+let chunker = SpeechChunker(
+    mergeGapSeconds: mergeGapSeconds,
+    minSegmentSeconds: minSegmentSeconds,
+    maxSegmentSeconds: maxSegmentSeconds
+)
+var spans = chunker.chunk(pcm: pcm)
 if spans.isEmpty {
-    warn("エラー: 十分な長さの区間がありません")
+    warn("エラー: 十分な長さの有声区間がありません")
     exit(1)
+}
+extension SpeechChunker.Span {
+    var seconds: Float {
+        return Float(end - start) / 16000.0
+    }
 }
 
 // ---- 2. 書き起こしを文に分け、文字/秒が揃うように区間へ割り当てる ----
@@ -259,7 +184,7 @@ while effectiveK < spans.count {
 }
 
 var prefix = [Int](repeating: 0, count: sCount + 1)
-i = 0
+var i = 0
 while i < sCount {
     prefix[i + 1] = prefix[i] + sentenceLengths[i]
     i += 1
