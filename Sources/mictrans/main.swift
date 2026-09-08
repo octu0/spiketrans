@@ -21,6 +21,7 @@ var showKana = false
 var listMicrophones = false
 var showMeter = false
 var micSelector = ""          // 番号または名前の一部
+var wavInputPath = ""         // マイクの代わりに WAV を流す (動作確認用)
 
 var argIdx = 1
 let args = CommandLine.arguments
@@ -55,6 +56,11 @@ while argIdx < args.count {
             micSelector = args[argIdx + 1]
             argIdx += 1
         }
+    case "--wav":
+        if (argIdx + 1) < args.count {
+            wavInputPath = args[argIdx + 1]
+            argIdx += 1
+        }
     case "-h", "--help":
         print("""
         マイク入力の文字起こし
@@ -67,6 +73,7 @@ while argIdx < args.count {
           --silence <秒>     無音で発話を区切る長さ (既定 0.6)
           --kana             かな (第1段の生出力) も表示する
           --meter            入力音量と VAD の判定を表示する
+          --wav <音声.wav>   マイクの代わりに WAV を 10ms ずつ流して結果を出す (動作確認用)
 
         かな語彙は重みファイルに同梱されているものを使う。
         -d に文の一覧を渡すと第2段のかな漢字変換も行う (省略時はかなのみ)。
@@ -432,20 +439,27 @@ final class Transcriber: @unchecked Sendable {
     private let showKana: Bool
     private let showMeter: Bool
     private let display: StatusDisplay?
-    private let frameStack = StreamingFeatureFrontEnd.defaultStack
 
+    // 逐次認識の実体 (recognizeQueue からだけ触る)。
+    // 10ms ホップごとに特徴 → SNN 1 フレーム → CTC ビーム 1 フレームを進めるので、
+    // 途中結果は溜まった仮説を読むだけで出せ、処理量は発話長に比例する
+    private let frontEnd: StreamingFeatureFrontEnd
     private let workspace: AcousticWorkspace
     private let acousticDecoder: AcousticDecoder
-    private let beamDecoder: CTCBeamDecoder
+    private let ctcDecoder: CTCStreamingDecoder
     private let kanaDecoder: KanaKanjiDecoder
+    private var hopBuffer: [Float]
+    private var hopFill = 0
+    private var frameBuffer: [Float]
+    private var haveFirstHop = false
+    private var logProbs: [Float]
+    private var utteranceStartedAt: CFAbsoluteTime = 0.0
+    private var utteranceSamples = 0
 
     /// 音声の蓄積と無音判定だけを行う軽いキュー
     private let audioQueue = DispatchQueue(label: "mictrans.audio")
-    /// 認識 (特徴量抽出・SNN・ビーム探索) を行う重いキュー
+    /// 認識 (特徴量抽出・SNN・ビーム探索) を行う直列キュー
     private let recognizeQueue = DispatchQueue(label: "mictrans.recognize")
-    /// 認識中に次の途中結果を積まないための印 (audioQueue から触る)
-    private var recognizing = false
-    private var pending: [Float] = []
     private var silenceRun = 0
     private var speechRun = 0
     private var utteranceIndex = 0
@@ -500,21 +514,28 @@ final class Transcriber: @unchecked Sendable {
         self.minSpeechSamples = Int(minSpeechSeconds * 16000.0)
         self.maxSpeechSamples = Int(maxSpeechSeconds * 16000.0)
 
+        // 束ね数は重みの入力次元から決める (学習と同じ 512 = 128 × 4)
+        var stack = network.inputDim / StreamingFeatureFrontEnd.tapDim
+        if stack < 1 {
+            stack = 1
+        }
+        self.frontEnd = StreamingFeatureFrontEnd(frameStack: stack)
         self.workspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
             outputDim: network.outputDim,
             inputDim: network.inputDim,
             numLayers: network.numLayers
         )
-        self.acousticDecoder = AcousticDecoder(
-            network: network
-        )
-        self.beamDecoder = CTCBeamDecoder(
+        self.acousticDecoder = AcousticDecoder(network: network)
+        self.ctcDecoder = CTCStreamingDecoder(
             vocabulary: phoneticVocabulary,
             blankId: TextVocabulary.padId,
             beamWidth: 16
         )
         self.kanaDecoder = KanaKanjiDecoder(dictionary: dictionary, languageBonus: 0.0)
+        self.hopBuffer = [Float](repeating: 0.0, count: frontEnd.hopSize)
+        self.frameBuffer = [Float](repeating: 0.0, count: frontEnd.frameSize)
+        self.logProbs = [Float](repeating: 0.0, count: network.outputDim)
     }
 
     /// マイクスレッドから呼ぶ。蓄積と無音判定だけを音声キューで行う
@@ -524,42 +545,23 @@ final class Transcriber: @unchecked Sendable {
         }
     }
 
-    /// 取り込み終了時に、溜まっているぶんを吐き出す。
+    /// 取り込み終了時に、途中の発話を確定する。
     /// 認識が長引いても終了操作を待たせないよう、待ち時間に上限を設ける
     func flushRemaining(timeout: TimeInterval = 2.0) {
         let gate = DispatchSemaphore(value: 0)
         audioQueue.async {
-            let snapshot = self.pending
-            self.pending.removeAll(keepingCapacity: true)
+            let longEnough = (self.minSpeechSamples <= self.speechRun)
+            self.speechRun = 0
+            self.silenceRun = 0
+            self.samplesSincePartial = 0
             self.recognizeQueue.async {
-                if self.minSpeechSamples <= snapshot.count {
-                    self.recognize(snapshot, isFinal: true)
+                if longEnough {
+                    self.finishUtterance()
                 }
                 gate.signal()
             }
         }
         _ = gate.wait(timeout: .now() + timeout)
-    }
-
-    /// 認識を重いキューへ投げる。
-    /// 途中結果は前の認識が終わっていなければ捨てる (積み上がると遅延が増え続ける)
-    private func schedule(_ pcm: [Float], isFinal: Bool) {
-        if isFinal != true {
-            if recognizing {
-                return
-            }
-            recognizing = true
-            recognizeQueue.async {
-                self.recognize(pcm, isFinal: false)
-                self.audioQueue.async {
-                    self.recognizing = false
-                }
-            }
-            return
-        }
-        recognizeQueue.async {
-            self.recognize(pcm, isFinal: true)
-        }
     }
 
     private func consume(_ samples: [Float]) {
@@ -585,7 +587,10 @@ final class Transcriber: @unchecked Sendable {
                 if 10 <= meterBlocks {
                     let bars = Int(min(24.0, meterPeak * 400.0))
                     let bar = String(repeating: "=", count: max(0, bars))
-                    let mark = (0 < speechRun) ? "有声" : "無音"
+                    var mark = "無音"
+                    if 0 < speechRun {
+                        mark = "有声"
+                    }
                     // 行末はエスケープで消すので詰め物は要らない
                     let text = String(
                         format: "[音量] %.4f x%.1f 有声度 %.2f 底 %.5f %@ ",
@@ -601,12 +606,19 @@ final class Transcriber: @unchecked Sendable {
                 }
             }
 
-            // 発話前の無音は溜め込まない (認識対象を短く保つ)
+            // 発話前の無音は認識に入れない
             if isSpeech != true && speechRun == 0 {
                 continue
             }
+            if speechRun == 0 {
+                recognizeQueue.async {
+                    self.beginUtterance()
+                }
+            }
 
-            pending.append(contentsOf: block)
+            recognizeQueue.async {
+                self.pushSamples(block)
+            }
             if isSpeech {
                 speechRun += block.count
                 silenceRun = 0
@@ -616,10 +628,11 @@ final class Transcriber: @unchecked Sendable {
 
             let longEnough = (minSpeechSamples <= speechRun)
             let endedBySilence = (silenceSamples <= silenceRun)
-            let endedByLength = (maxSpeechSamples <= pending.count)
+            let endedByLength = (maxSpeechSamples <= (speechRun + silenceRun))
             if (longEnough && endedBySilence) || endedByLength {
-                schedule(pending, isFinal: true)
-                pending.removeAll(keepingCapacity: true)
+                recognizeQueue.async {
+                    self.finishUtterance()
+                }
                 speechRun = 0
                 silenceRun = 0
                 samplesSincePartial = 0
@@ -627,19 +640,19 @@ final class Transcriber: @unchecked Sendable {
             }
             // 短い有声のまま無音が続いたら雑音として捨てる
             if longEnough != true && endedBySilence {
-                pending.removeAll(keepingCapacity: true)
                 speechRun = 0
                 silenceRun = 0
                 samplesSincePartial = 0
                 continue
             }
 
-            // 話している間も一定間隔で途中結果を出す。
-            // 窓を伸ばして毎回作り直すため、結果は一括処理と厳密に一致する
+            // 話している間は一定間隔で途中結果を出す。溜まった仮説を読むだけなので軽い
             samplesSincePartial += block.count
             if longEnough && partialIntervalSamples <= samplesSincePartial {
                 samplesSincePartial = 0
-                schedule(pending, isFinal: false)
+                recognizeQueue.async {
+                    self.showPartial()
+                }
             }
         }
     }
@@ -647,8 +660,8 @@ final class Transcriber: @unchecked Sendable {
     /// 適応 VAD による有声判定。
     ///
     /// 録音レベルが小さいマイクでも拾えるよう、直近の音量から入力ゲインを
-    /// 見積もって VAD へ渡す窓だけを増幅する (蓄積する音声は元のまま。
-    /// 特徴量抽出側で発話単位の正規化が改めて行われる)
+    /// 見積もって VAD へ渡す窓だけを増幅する (認識側は発話開始からの走行 RMS で
+    /// 改めて正規化する)
     private func judgeSpeech(block: [Float], rms: Float) -> Bool {
         // 窓をホップぶんずらして新しいブロックを末尾へ入れる
         let window = Transcriber.vadWindowSamples
@@ -668,7 +681,11 @@ final class Transcriber: @unchecked Sendable {
 
         // ゆっくり減衰する最大音量から、目標レベルへ寄せるゲインを決める
         let decayed = recentPeakRMS * 0.995
-        recentPeakRMS = (decayed < rms) ? rms : decayed
+        if decayed < rms {
+            recentPeakRMS = rms
+        } else {
+            recentPeakRMS = decayed
+        }
         var gain: Float = 1.0
         if 1e-5 < recentPeakRMS {
             gain = min(20.0, max(1.0, Transcriber.vadTargetRMS / recentPeakRMS))
@@ -695,50 +712,97 @@ final class Transcriber: @unchecked Sendable {
         }
     }
 
-    private func recognize(_ pcm: [Float], isFinal: Bool) {
-        let started = CFAbsoluteTimeGetCurrent()
-        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm, frameStack: frameStack)
-        if features.isEmpty {
-            return
-        }
+    // MARK: 逐次認識 (recognizeQueue)
 
-        // 毎回ゼロから積分し直す。膜電位を持ち越すと前の発話の状態が混ざる
+    /// 発話の始まり。特徴・膜電位・ビームをすべて初期化する
+    private func beginUtterance() {
+        frontEnd.beginUtterance()
         workspace.resetHiddenState()
+        ctcDecoder.reset()
+        hopFill = 0
+        haveFirstHop = false
+        utteranceSamples = 0
+        utteranceStartedAt = CFAbsoluteTimeGetCurrent()
+    }
 
-        let frameProbs = acousticDecoder.decodeSequence(
-            featuresSeq: features,
-            workspace: workspace
-        )
-        let outDim = network.outputDim
-        var logProbs = [[Float]](
-            repeating: [Float](repeating: 0.0, count: outDim),
-            count: frameProbs.count
-        )
-        var f = 0
-        while f < frameProbs.count {
-            let probs = frameProbs[f].probabilities
-            var c = 0
-            while c < outDim {
-                logProbs[f][c] = log(max(1e-30, probs[c]))
-                c += 1
+    /// 音声を 10ms ホップにまとめ、20ms 窓 (前ホップ + 今ホップ) ごとに 1 フレーム進める
+    private func pushSamples(_ samples: [Float]) {
+        utteranceSamples += samples.count
+        let hop = frontEnd.hopSize
+        var i = 0
+        while i < samples.count {
+            hopBuffer[hopFill] = samples[i]
+            hopFill += 1
+            i += 1
+            if hopFill < hop {
+                continue
             }
-            f += 1
-        }
-
-        let kana = beamDecoder.decode(logProbs: logProbs).text
-        if kana.isEmpty {
-            return
-        }
-
-        // 途中結果はかなだけ。漢字変換は文の区切りが要るので確定時に行う
-        if isFinal != true {
-            let seconds = Double(pcm.count) / 16000.0
-            switch display {
-            case .some(let d):
-                d.setResult(String(format: "[…] (%.1fs) %@", seconds, kana))
+            hopFill = 0
+            // frameBuffer = [前ホップ | 今ホップ]
+            var k = 0
+            while k < hop {
+                frameBuffer[k] = frameBuffer[hop + k]
+                frameBuffer[hop + k] = hopBuffer[k]
+                k += 1
+            }
+            if haveFirstHop != true {
+                haveFirstHop = true
+                continue
+            }
+            let stacked = frameBuffer.withUnsafeBufferPointer { buf in
+                frontEnd.pushRawFrame(pcmPtr: buf.baseAddress!, count: frontEnd.frameSize)
+            }
+            switch stacked {
+            case .some(let features):
+                advanceFrame(features)
             case .none:
                 break
             }
+        }
+    }
+
+    /// 1 フレーム (40ms 相当) を SNN と CTC ビームに通す
+    private func advanceFrame(_ features: [Float]) {
+        let probs = acousticDecoder.decodeFrame(features: features, workspace: workspace).probabilities
+        var c = 0
+        while c < logProbs.count {
+            logProbs[c] = log(max(1e-30, probs[c]))
+            c += 1
+        }
+        ctcDecoder.push(frame: logProbs)
+    }
+
+    /// 発話の末尾。3-tap を確定させてから残りのフレームを流す
+    private func flushFrontEnd() {
+        switch frontEnd.flush() {
+        case .some(let features):
+            advanceFrame(features)
+        case .none:
+            break
+        }
+    }
+
+    private func showPartial() {
+        let kana = ctcDecoder.best.text
+        if kana.isEmpty {
+            return
+        }
+        let seconds = Double(utteranceSamples) / 16000.0
+        switch display {
+        case .some(let d):
+            d.setResult(String(format: "[…] (%.1fs) %@", seconds, kana))
+        case .none:
+            break
+        }
+    }
+
+    private func finishUtterance() {
+        flushFrontEnd()
+        let kana = ctcDecoder.best.text
+        let seconds = Double(utteranceSamples) / 16000.0
+        let elapsed = (CFAbsoluteTimeGetCurrent() - utteranceStartedAt) * 1000.0
+        beginUtterance()
+        if kana.isEmpty {
             return
         }
 
@@ -747,8 +811,6 @@ final class Transcriber: @unchecked Sendable {
         if hasDictionary {
             kanji = kanaDecoder.decode(kanaText: kana)
         }
-        let elapsed = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
-        let seconds = Double(pcm.count) / 16000.0
 
         utteranceIndex += 1
         let body: String
@@ -763,10 +825,9 @@ final class Transcriber: @unchecked Sendable {
 
         switch display {
         case .some(let d):
-            d.setResult(String(format: "[%d] (%.1fs/%.0fms) %@", utteranceIndex, seconds, elapsed, body))
+            d.setResult(String(format: "[%d] (%.1fs) %@", utteranceIndex, seconds, body))
         case .none:
-            print("")
-            print(String(format: "[%d] (%.1f 秒の音声を %.0f ms で認識)", utteranceIndex, seconds, elapsed))
+            print(String(format: "[%d] (%.1f 秒, 発話開始から %.0f ms)", utteranceIndex, seconds, elapsed))
             print("  → \(body)")
         }
     }
@@ -775,9 +836,10 @@ final class Transcriber: @unchecked Sendable {
 // 端末に出しているときは固定行を書き換える表示にする。
 // --meter を付けると音量行が 1 行増える
 let isTerminal = (isatty(1) == 1)
-let statusDisplay: StatusDisplay? = isTerminal
-    ? StatusDisplay(live: true, hasLevel: showMeter)
-    : nil
+var statusDisplay: StatusDisplay? = nil
+if isTerminal && wavInputPath.isEmpty {
+    statusDisplay = StatusDisplay(live: true, hasLevel: showMeter)
+}
 
 let transcriber = Transcriber(
     network: network,
@@ -790,6 +852,29 @@ let transcriber = Transcriber(
     showMeter: showMeter,
     display: statusDisplay
 )
+
+// MARK: - WAV 入力 (動作確認用)
+
+if wavInputPath.isEmpty != true {
+    guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavInputPath)),
+          let wav = try? WavParser().parse(bytes: [UInt8](fileData)) else {
+        print("エラー: 音声を読み込めません: \(wavInputPath)")
+        exit(1)
+    }
+    let pcm = SpeechDataset.resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
+    print("WAV 入力: \(String(format: "%.1f", Double(pcm.count) / 16000.0)) 秒を 10ms ずつ流します")
+    let started = CFAbsoluteTimeGetCurrent()
+    var offset = 0
+    while offset < pcm.count {
+        let end = min(offset + 160, pcm.count)
+        transcriber.append(Array(pcm[offset..<end]))
+        offset = end
+    }
+    transcriber.flushRemaining(timeout: 30.0)
+    let elapsed = CFAbsoluteTimeGetCurrent() - started
+    print(String(format: "処理時間 %.2f 秒 (RTF %.4f)", elapsed, elapsed / (Double(pcm.count) / 16000.0)))
+    exit(0)
+}
 
 // MARK: - マイク入力
 
