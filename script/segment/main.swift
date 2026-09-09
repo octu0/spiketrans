@@ -307,7 +307,8 @@ func parseSRT(_ text: String) -> [TimedLine] {
     return cues
 }
 
-var pieces: [(span: SpeechChunker.Span, text: String, chars: Int)] = []
+/// 区間の由来。cue は SRT の時刻どおり (整列は正しい)、vad は VAD 分割 + 文の配分 (整列は推定)
+var pieces: [(span: SpeechChunker.Span, text: String, chars: Int, exact: Bool)] = []
 let timed = parseSRT(transcript)
 let modeDescription: String
 if timed.isEmpty {
@@ -318,7 +319,9 @@ if timed.isEmpty {
         warn("エラー: 十分な長さの有声区間がありません")
         exit(1)
     }
-    pieces = assign(sentences: splitSentences(transcript, atLeast: spans.count), to: spans)
+    pieces = assign(sentences: splitSentences(transcript, atLeast: spans.count), to: spans).map {
+        (span: $0.span, text: $0.text, chars: $0.chars, exact: false)
+    }
 } else {
     modeDescription = "SRT"
     var skipped = 0
@@ -331,7 +334,7 @@ if timed.isEmpty {
         }
         let span = SpeechChunker.Span(start: start, end: end)
         if span.seconds <= maxSegmentSeconds {
-            pieces.append((span: span, text: line.text, chars: speechLength(line.text)))
+            pieces.append((span: span, text: line.text, chars: speechLength(line.text), exact: true))
             continue
         }
         // 上限を超える行だけ、その中を VAD で割って文を配分する
@@ -339,10 +342,12 @@ if timed.isEmpty {
             SpeechChunker.Span(start: $0.start + start, end: $0.end + start)
         }
         if sub.isEmpty {
-            pieces.append((span: span, text: line.text, chars: speechLength(line.text)))
+            pieces.append((span: span, text: line.text, chars: speechLength(line.text), exact: true))
             continue
         }
-        pieces += assign(sentences: splitSentences(line.text, atLeast: sub.count), to: sub)
+        pieces += assign(sentences: splitSentences(line.text, atLeast: sub.count), to: sub).map {
+            (span: $0.span, text: $0.text, chars: $0.chars, exact: false)
+        }
     }
     if 0 < skipped {
         warn("警告: 音声の範囲外などで \(skipped) 行を飛ばしました")
@@ -408,8 +413,13 @@ while index < pieces.count {
         exit(1)
     }
     let escaped = piece.text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-    print("{\"path\": \"\(outPath)\", \"text\": \"\(escaped)\"}")
-    if plausibleCharsPerSecond.contains(rate) != true {
+    // source と cps (文字/秒) は呼び出し側が整列の怪しい区間を落とすのに使う。学習側は path と text だけ読む
+    var source = "vad"
+    if piece.exact {
+        source = "cue"
+    }
+    print(String(format: "{\"path\": \"%@\", \"text\": \"%@\", \"source\": \"%@\", \"cps\": %.2f}", outPath, escaped, source, rate))
+    if piece.exact != true && plausibleCharsPerSecond.contains(rate) != true {
         flagged += 1
         warn(String(format: "  要確認 seg%03d [%.1f -> %.1f]: %d 文字 = %.1f 文字/秒: %@",
                     index + 1, Float(piece.span.start) / sampleRate, Float(piece.span.end) / sampleRate,
