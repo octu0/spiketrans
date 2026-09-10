@@ -66,8 +66,8 @@ final class KanjiConverterTests: XCTestCase {
 
     func testTokenizeIncludesNumberReadings() {
         let converter = KanjiConverter()
-        XCTAssertEqual(converter.convertToHiragana("１４７３年"), "せんよんひゃくななじゅうさんねん")
-        XCTAssertEqual(converter.convertToHiragana("２０億円"), "にじゅうおくえん")
+        XCTAssertEqual(converter.convertToHiragana("１４７３年"), "せんよんひゃくななじゅーさんねん")
+        XCTAssertEqual(converter.convertToHiragana("２０億円"), "にじゅーおくえん")
     }
 
     // MARK: - 長音符「ー」復元と正規化テスト
@@ -109,20 +109,27 @@ final class KanjiConverterTests: XCTestCase {
         XCTAssertEqual(converter.kanaOnly("あ――"), "あーー")
     }
 
-    func testWagoKangoNotProlonged() {
+    func testPronunciationNormalization() {
         let converter = KanjiConverter()
 
-        // 和語・漢語はマクロンが出力されないため「ー」化しないことを保証
-        XCTAssertEqual(converter.convertToHiragana("東京"), "とうきょう")
-        XCTAssertEqual(converter.convertToHiragana("とうきょう"), "とうきょう")
-        XCTAssertEqual(converter.convertToHiragana("京都"), "きょうと")
-        XCTAssertEqual(converter.convertToHiragana("学校"), "がっこう")
-        XCTAssertEqual(converter.convertToHiragana("大きい"), "おおきい")
-        XCTAssertEqual(converter.convertToHiragana("おおきい"), "おおきい")
-        XCTAssertEqual(converter.convertToHiragana("おじいさん"), "おじいさん")
-        XCTAssertEqual(converter.convertToHiragana("妹"), "いもうと")
-        XCTAssertEqual(converter.convertToHiragana("弟"), "おとうと")
-        XCTAssertEqual(converter.convertToHiragana("氷"), "こおり")
+        // 同じ母音の連なりは長音に寄せる (表記ではなく音に対応させる)
+        XCTAssertEqual(converter.convertToHiragana("東京"), "とーきょー")
+        XCTAssertEqual(converter.convertToHiragana("先生"), "せんせー")
+        XCTAssertEqual(converter.convertToHiragana("映画"), "えーが")
+        XCTAssertEqual(converter.convertToHiragana("大きい"), "おーきー")
+        XCTAssertEqual(converter.convertToHiragana("おじいさん"), "おじーさん")
+        XCTAssertEqual(converter.convertToHiragana("おばあさん"), "おばーさん")
+        XCTAssertEqual(converter.convertToHiragana("氷"), "こーり")
+        XCTAssertEqual(converter.convertToHiragana("空気"), "くーき")
+        // 動詞語尾の「う」は母音として残す
+        XCTAssertEqual(converter.convertToHiragana("思う"), "おもう")
+        XCTAssertEqual(converter.convertToHiragana("買う"), "かう")
+        // 助詞と旧仮名
+        XCTAssertEqual(converter.convertToHiragana("これは水を飲む"), "これわみずおのむ")
+        XCTAssertEqual(converter.convertToHiragana("東京へ行く"), "とーきょーえいく")
+        XCTAssertEqual(converter.convertToHiragana("続く"), "つずく")
+        // 語彙にも「を」「ぢ」「づ」は現れない
+        XCTAssertFalse(converter.convertToHiragana("鼻血を出す").contains("ぢ"))
     }
 
     func testAlphabetTokenProtectionAndBilingualSeed() {
@@ -176,7 +183,7 @@ final class KanjiConverterTests: XCTestCase {
 
         // 混在文のひらがな変換
         let mixed = converter.convertToHiragana("iPhoneとMacBookを使って作業する")
-        XCTAssertEqual(mixed, "あいふぉーんとまっくぶっくをつかってさぎょうする")
+        XCTAssertEqual(mixed, "あいふぉーんとまっくぶっくおつかってさぎょーする")
     }
 
     // MARK: - フェーズ2: 境界値・悪意のある入力・不整合の検証テスト
@@ -218,7 +225,7 @@ final class KanjiConverterTests: XCTestCase {
         let complexText = "iPhone 15の価格は１４万円〜１５万円です。"
         let hira = converter.convertToHiragana(complexText)
         XCTAssertTrue(hira.contains("あいふぉーん"))
-        XCTAssertTrue(hira.contains("じゅうご"))
+        XCTAssertTrue(hira.contains("じゅーご"))
         XCTAssertTrue(hira.contains("ー"))
 
         // 8. 全角ハイフン・各種ダッシュ結合英単語 (Wi-Fiバリエーション)
@@ -256,5 +263,49 @@ final class KanjiConverterTests: XCTestCase {
         XCTAssertFalse(phoneIds.isEmpty)
         let phonemes = converter.toPhonemes("Wi-Fi")
         XCTAssertEqual(phonemes, ["w", "a", "i", "h", "a", "i"])
+    }
+
+    func testReadingOverrides() {
+        let converter = KanjiConverter()
+        // 形態素解析器の読みを話し言葉に揃える
+        XCTAssertEqual(converter.convertToHiragana("私は皆と日本へ行く"), "わたしわみんなとにほんえいく")
+        XCTAssertEqual(converter.convertToHiragana("皆さん、明日と一昨日"), "みなさんあしたとおととい")
+        XCTAssertEqual(converter.convertToHiragana("そういうことだと言う"), "そーゆーことだとゆー")
+        XCTAssertEqual(converter.convertToHiragana("言いました"), "いーました")
+        // 複合語の併合
+        XCTAssertEqual(converter.convertToHiragana("お母さんとお父さんとお兄さんとお姉さん"), "おかーさんとおとーさんとおにーさんとおねーさん")
+        XCTAssertEqual(converter.convertToHiragana("木曜日と日曜日"), "もくよーびとにちよーび")
+        XCTAssertEqual(converter.convertToHiragana("世界中"), "せかいじゅー")
+        XCTAssertEqual(converter.tokenize("お母さん").count, 1)
+        // 国名 + 人は「じん」、数詞 + 人は「にん」
+        XCTAssertEqual(converter.convertToHiragana("日本人とフランス人と外国人"), "にほんじんとふらんすじんとがいこくじん")
+        XCTAssertEqual(converter.convertToHiragana("3人と何人"), "さんにんとなんにん")
+        // 何: 助詞・動詞が続けば「なに」、助数詞や「で」は「なん」
+        XCTAssertEqual(converter.convertToHiragana("何が何を何してる"), "なにがなにおなにしてる")
+        XCTAssertEqual(converter.convertToHiragana("何で何回"), "なんでなんかい")
+    }
+
+    func testCounterSandhi() {
+        let converter = KanjiConverter()
+        // 促音化と半濁音化 (算用数字も漢数字も同じ)
+        XCTAssertEqual(converter.convertToHiragana("1本10本100回1週間"), "いっぽんじゅっぽんひゃっかいいっしゅーかん")
+        XCTAssertEqual(converter.convertToHiragana("一杯六杯八匹十分"), "いっぱいろっぱいはっぴきじゅっぷん")
+        XCTAssertEqual(converter.convertToHiragana("1か月1キロ10ページ"), "いっかげついっきろじゅっぺーじ")
+        // ん の後は濁音 (本・杯・匹) と半濁音 (分・歩・発)
+        XCTAssertEqual(converter.convertToHiragana("3本三杯何本千本3分三歩"), "さんぼんさんばいなんぼんせんぼんさんぷんさんぽ")
+        // 四・七・九・二・五は変化しない (解析器が「四本/よんぽん」と返す癖も直す)
+        XCTAssertEqual(converter.convertToHiragana("4本7本9本2分4分"), "よんほんななほんきゅーほんにふんよんぷん")
+        // 六・百はか行・は行だけ促音化
+        XCTAssertEqual(converter.convertToHiragana("六冊百冊六回"), "ろくさつひゃくさつろっかい")
+        // 外来語の単位の は行 は促音化しない
+        XCTAssertEqual(converter.convertToHiragana("1ヘクタール1パーセント"), "いちへくたーるいっぱーせんと")
+        // 数によって読みが変わる助数詞
+        XCTAssertEqual(converter.convertToHiragana("4月4日4時"), "しがつよっかよじ")
+        XCTAssertEqual(converter.convertToHiragana("9月10日7時"), "くがつとーかしちじ")
+        XCTAssertEqual(converter.convertToHiragana("11日20日24日"), "じゅーいちにちはつかにじゅーよっか")
+        XCTAssertEqual(converter.convertToHiragana("1人2人4人3人"), "ひとりふたりよにんさんにん")
+        XCTAssertEqual(converter.convertToHiragana("1つ3つ四つ八つ"), "ひとつみっつよっつやっつ")
+        // 数詞ではない「位置」は促音化しない
+        XCTAssertEqual(converter.convertToHiragana("位置確認"), "いちかくにん")
     }
 }

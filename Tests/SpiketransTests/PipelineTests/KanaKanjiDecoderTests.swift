@@ -131,10 +131,18 @@ final class KanaKanjiDecoderTests: XCTestCase {
         ]
         dict.buildFromCorpus(rawTexts: corpus)
 
-        // コーパス由来の語が引けること (形態素「人工」「天気」等)
-        let jinkouHits = dict.lookupExact(reading: "じんこう")
+        // コーパス由来の語が引けること (形態素「人工」「天気」等)。読みは発音かな (おう → おー)
+        let jinkouHits = dict.lookupExact(reading: "じんこー")
         XCTAssertFalse(jinkouHits.isEmpty)
         XCTAssertEqual(jinkouHits.first?.surface, "人工")
+
+        // 話し言葉の別読みも同じ表層に戻せる
+        dict.buildFromCorpus(rawTexts: ["私は皆と行く。"])
+        XCTAssertEqual(dict.lookupExact(reading: "わたし").first?.surface, "私")
+        XCTAssertEqual(dict.lookupExact(reading: "あたし").first?.surface, "私")
+        XCTAssertEqual(dict.lookupExact(reading: "わたくし").first?.surface, "私")
+        XCTAssertEqual(dict.lookupExact(reading: "みんな").first?.surface, "皆")
+        XCTAssertEqual(dict.lookupExact(reading: "みな").first?.surface, "皆")
 
         let tenkiHits = dict.lookupExact(reading: "てんき")
         XCTAssertFalse(tenkiHits.isEmpty)

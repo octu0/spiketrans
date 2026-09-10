@@ -73,7 +73,9 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
 
     /// エントリを追加 (同じ読み・表層の組は出現回数を加算する)
     public func addEntry(_ entry: KanaKanjiEntry) {
-        let reading = entry.reading
+        // シード語彙の読みも音響側と同じ発音かなに揃える (えいち → えーち)。
+        // 第1段の出力と辞書のキーが同じ表記でなければ引けない
+        let reading = KanjiConverter.pronunciation(surface: entry.surface, reading: entry.reading)
         var list = entriesByReading[reading] ?? []
 
         var found = false
@@ -240,6 +242,10 @@ public final class KanaKanjiDictionary: @unchecked Sendable {
                 }
 
                 addEntry(KanaKanjiEntry(reading: reading, surface: surface, frequency: 1))
+                // 話し言葉の別読み (あたし → 私) も同じ表層で引けるようにする
+                for variant in KanjiConverter.readingVariants[surface] ?? [] {
+                    addEntry(KanaKanjiEntry(reading: variant, surface: surface, frequency: 1))
+                }
                 wordOccurrences[surface, default: 0] += 1
                 lastContentWord = surface
 

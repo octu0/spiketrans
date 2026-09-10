@@ -338,7 +338,7 @@ public struct KanjiConverter: Sendable {
 
             // 数字トークンの読みは位取りのかな読みを直接生成する
             if let numReading = Self.numberReading(surface) {
-                tokens.append(Token(surface: surface, reading: numReading))
+                tokens.append(Token(surface: surface, reading: Self.pronunciation(surface: surface, reading: numReading)))
                 continue
             }
 
@@ -361,10 +361,394 @@ public struct KanjiConverter: Sendable {
                 reading = normalizeKana(surface)
             }
 
-            tokens.append(Token(surface: surface, reading: kanaOnly(reading)))
+            tokens.append(Token(surface: surface, reading: kanaOnly(Self.pronunciation(surface: surface, reading: reading))))
         }
 
-        return tokens
+        return Self.applyReadingOverrides(tokens)
+    }
+
+    /// 形態素解析器の読みを話し言葉の読みへ置き換える表層 (形態素 1 つ)。値は表記の読みで `pronunciation` を通す
+    static let readingOverrides: [String: String] = [
+        "私": "わたし",
+        "日本": "にほん",
+        "明日": "あした",
+        "皆": "みんな",
+        "言う": "ゆー",
+        "いう": "ゆー",
+    ]
+
+    /// 話し言葉で複数の読みがある表層の、`readingOverrides` 以外の読み。
+    /// 教師かなは 1 つに決めるしかないので (話者が「あたし」と言ったかは文脈では分からない)、
+    /// 第2段の辞書にだけ登録し、音響モデルがどの読みを出しても同じ表層に戻せるようにする
+    public static let readingVariants: [String: [String]] = [
+        "私": ["あたし", "わたくし"],
+        "皆": ["みな"],
+    ]
+
+    /// 連続する形態素の表層を連結して照合し、1 つの形態素に併合する表。
+    /// 形態素解析器が「お/母/さん」「木曜/日」のように切ると各片の読みが単独語の読みになるため
+    static let phraseOverrides: [String: String] = [
+        "お母さん": "おかあさん",
+        "お父さん": "おとうさん",
+        "お兄さん": "おにいさん",
+        "お姉さん": "おねえさん",
+        "皆さん": "みなさん",
+        "皆様": "みなさま",
+        "一昨日": "おととい",
+        "一昨年": "おととし",
+        "二日": "ふつか",
+        "四人": "よにん",
+        "世界中": "せかいじゅう",
+        "日本中": "にほんじゅう",
+        "一日中": "いちにちじゅう",
+    ]
+
+    static let maxPhraseTokens = 3
+
+    /// 直前の数によらず同じ読みが返る助数詞の基本読み (「本/ぽん」等を揃える)
+    static let counterBaseReadings: [String: String] = [
+        "本": "ほん", "杯": "はい", "匹": "ひき", "分": "ふん", "歩": "ほ",
+        "発": "はつ", "泊": "はく", "品": "ひん", "敗": "はい", "拍": "はく",
+    ]
+
+    /// ん で終わる数 (さん・せん・まん・なん) の後で濁音になる助数詞。表内の他の助数詞は半濁音 (さんぷん)
+    static let voicedAfterNasal: Set<String> = ["本", "杯", "匹"]
+
+    /// 数 + 助数詞で数ごとに読みが変わるもの (日付・月・時・人・つ)。値は表記の読みで `pronunciation` を通す。
+    /// 日付は表にない日も「N にち」(形態素解析器は 11 日を「じゅういち か」と読む)
+    static let numeralCounterReadings: [String: [Int: String]] = [
+        "日": [1: "いちにち", 2: "ふつか", 3: "みっか", 4: "よっか", 5: "いつか", 6: "むいか", 7: "なのか", 8: "ようか",
+               9: "ここのか", 10: "とおか", 14: "じゅうよっか", 20: "はつか", 24: "にじゅうよっか"],
+        "月": [4: "しがつ", 7: "しちがつ", 9: "くがつ"],
+        "時": [4: "よじ", 7: "しちじ", 9: "くじ"],
+        "人": [1: "ひとり", 2: "ふたり", 4: "よにん"],
+        "つ": [1: "ひとつ", 2: "ふたつ", 3: "みっつ", 4: "よっつ", 5: "いつつ", 6: "むっつ", 7: "ななつ", 8: "やっつ",
+               9: "ここのつ", 10: "とお"],
+    ]
+
+    static let kanjiNumeralValues: [String: Int] = [
+        "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+        "十四": 14, "二十": 20, "二十四": 24,
+    ]
+
+    /// 数詞の表層の値。算用数字と 24 までの漢数字
+    static func numeralValue(_ surface: String) -> Int? {
+        if let values = digitValues(surface) {
+            if 4 < values.count {
+                return nil
+            }
+            var v = 0
+            for d in values {
+                v = v * 10 + d
+            }
+            return v
+        }
+        return kanjiNumeralValues[surface]
+    }
+
+    /// 数と助数詞の組の読み。「1人/れん」のように解析器が併合したトークンも表層を分けて扱う
+    static func numeralCounterReading(numeral: String, numeralReading: String, counter: String) -> String? {
+        guard let table = numeralCounterReadings[counter], let value = numeralValue(numeral) else {
+            return nil
+        }
+        if let reading = table[value] {
+            return reading
+        }
+        if counter == "日" {
+            return numeralReading + "にち"
+        }
+        return nil
+    }
+
+    /// 末尾 1 文字が助数詞表の見出しで、その前が数詞の表層 (「1人」「10日」) なら分ける
+    static func splitNumeralCounter(_ surface: String) -> (String, String)? {
+        guard 1 < surface.count, let last = surface.last, numeralCounterReadings[String(last)] != nil else {
+            return nil
+        }
+        let numeral = String(surface.dropLast())
+        if numeralValue(numeral) == nil {
+            return nil
+        }
+        return (numeral, String(last))
+    }
+
+    /// 数詞の表層か (算用数字・漢数字・何・数・幾)
+    static func isNumeralSurface(_ surface: String) -> Bool {
+        if surface.isEmpty {
+            return false
+        }
+        for scalar in surface.unicodeScalars {
+            switch scalar.value {
+            case 0x30...0x39, 0xFF10...0xFF19:
+                continue
+            default:
+                break
+            }
+            if "〇一二三四五六七八九十百千万億兆何数幾".unicodeScalars.contains(scalar) != true {
+                return false
+            }
+        }
+        return true
+    }
+
+    static func isKanji(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x4E00...0x9FFF, 0x3400...0x4DBF:
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func isKatakana(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x30A1...0x30FA:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 表層の先頭が漢字・カタカナか
+    static func startsWithKanjiOrKatakana(_ surface: String) -> Bool {
+        guard let first = surface.unicodeScalars.first else {
+            return false
+        }
+        return isKanji(first) || isKatakana(first)
+    }
+
+    /// か・さ・た・は・ぱ行で始まる読みか (数詞の促音化が起きる子音)
+    static func startsWithVoicelessObstruent(_ reading: String) -> Bool {
+        guard let first = reading.first else {
+            return false
+        }
+        return "かきくけこさしすせそたちつてとはひふへほぱぴぷぺぽ".contains(first)
+    }
+
+    /// は行 → ぱ行 / ば行 の置き換え
+    static func replacingHRow(_ reading: String, with row: String) -> String {
+        guard let first = reading.first, let idx = "はひふへほ".firstIndex(of: first) else {
+            return reading
+        }
+        let offset = "はひふへほ".distance(from: "はひふへほ".startIndex, to: idx)
+        let rowChars = Array(row)
+        return String(rowChars[offset]) + String(reading.dropFirst())
+    }
+
+    /// 数詞 + 助数詞の連声。数詞の末尾の促音化 (いち → いっ) と助数詞頭の半濁音・濁音化 (ほん → ぽん・ぼん)
+    static func counterSandhi(numeral: Token, counter: Token) -> (String, String)? {
+        if isNumeralSurface(numeral.surface) != true || startsWithKanjiOrKatakana(counter.surface) != true {
+            if counter.surface.hasPrefix("か月") != true {
+                return nil
+            }
+        }
+        var base = counter.reading
+        if let known = counterBaseReadings[counter.surface] {
+            base = known
+        }
+        // 外来語の単位は促音化しない (いちへくたーる)
+        if let first = counter.surface.unicodeScalars.first, isKatakana(first), let head = base.first, "はひふへほ".contains(head) {
+            return nil
+        }
+        let n = numeral.reading
+        let geminating: [(String, String, Bool)] = [
+            ("いち", "いっ", true), ("はち", "はっ", true), ("じゅー", "じゅっ", true),
+            ("ろく", "ろっ", false), ("ひゃく", "ひゃっ", false),
+        ]
+        for (tail, geminated, allRows) in geminating {
+            if n.hasSuffix(tail) != true || startsWithVoicelessObstruent(base) != true {
+                continue
+            }
+            let isKOrH = "かきくけこはひふへほ".contains(base.first!)
+            if allRows != true && isKOrH != true {
+                return nil
+            }
+            return (String(n.dropLast(tail.count)) + geminated, replacingHRow(base, with: "ぱぴぷぺぽ"))
+        }
+        if counterBaseReadings[counter.surface] == nil {
+            return nil
+        }
+        for tail in ["さん", "せん", "まん", "なん"] {
+            if n.hasSuffix(tail) != true {
+                continue
+            }
+            if voicedAfterNasal.contains(counter.surface) {
+                return (n, replacingHRow(base, with: "ばびぶべぼ"))
+            }
+            return (n, replacingHRow(base, with: "ぱぴぷぺぽ"))
+        }
+        if n.hasSuffix("よん") && voicedAfterNasal.contains(counter.surface) != true {
+            return (n, replacingHRow(base, with: "ぱぴぷぺぽ"))
+        }
+        return (n, base)
+    }
+
+    /// 形態素解析器の読みのうち、話し言葉として一定でないものを上書きする。
+    ///
+    /// 解析器は「私/わたくし」「皆/みな」「日本/にっぽん」を返し、複合語を「お/母/さん」
+    /// 「木曜/日」に切って片ごとの読みを付け、助数詞の連声 (いっぽん・さんぼん) を扱わない。
+    /// 音響モデルの教師は実際に発音された音でなければならないので、ここで揃える
+    static func applyReadingOverrides(_ tokens: [Token]) -> [Token] {
+        var result: [Token] = []
+        var i = 0
+        while i < tokens.count {
+            // 1. 連結表層の照合 (長い並びから)
+            var span = min(maxPhraseTokens, tokens.count - i)
+            var merged = false
+            while 1 < span {
+                var surface = ""
+                var k = 0
+                while k < span {
+                    surface += tokens[i + k].surface
+                    k += 1
+                }
+                if let reading = phraseOverrides[surface] {
+                    result.append(Token(surface: surface, reading: pronunciation(surface: surface, reading: reading)))
+                    i += span
+                    merged = true
+                    break
+                }
+                span -= 1
+            }
+            if merged {
+                continue
+            }
+            var token = tokens[i]
+            // 2. 単一形態素の置き換え
+            if let reading = readingOverrides[token.surface] {
+                token = Token(surface: token.surface, reading: pronunciation(surface: token.surface, reading: reading))
+            }
+            // 3. 曜日: 「木曜/もくよう」+「日/ひ」→ もくようび
+            if i + 1 < tokens.count && token.surface.hasSuffix("曜") && tokens[i + 1].surface == "日" {
+                result.append(Token(surface: token.surface + "日", reading: token.reading + "び"))
+                i += 2
+                continue
+            }
+            // 4. 数ごとに読みが変わる助数詞 (ついたち・しがつ・よじ・ひとり・みっつ)
+            if i + 1 < tokens.count, isNumeralSurface(token.surface),
+               let reading = numeralCounterReading(numeral: token.surface, numeralReading: token.reading, counter: tokens[i + 1].surface) {
+                let surface = token.surface + tokens[i + 1].surface
+                result.append(Token(surface: surface, reading: pronunciation(surface: surface, reading: reading)))
+                i += 2
+                continue
+            }
+            if let (numeral, counter) = splitNumeralCounter(token.surface),
+               let reading = numeralCounterReading(numeral: numeral, numeralReading: pronunciation(surface: numeral, reading: numberReading(numeral) ?? ""), counter: counter) {
+                result.append(Token(surface: token.surface, reading: pronunciation(surface: token.surface, reading: reading)))
+                i += 1
+                continue
+            }
+            // 5. 数詞 + 助数詞の連声
+            if i + 1 < tokens.count, let (numeral, counter) = counterSandhi(numeral: token, counter: tokens[i + 1]) {
+                result.append(Token(surface: token.surface, reading: numeral))
+                result.append(Token(surface: tokens[i + 1].surface, reading: counter))
+                i += 2
+                continue
+            }
+            // 6. 国名・集団名 + 人 → じん (数詞の後の「三人/さんにん」は除く)
+            if token.surface == "人" && token.reading == "にん", let prev = result.last,
+               startsWithKanjiOrKatakana(prev.surface) && isNumeralSurface(prev.surface) != true {
+                token = Token(surface: token.surface, reading: "じん")
+            }
+            // 7. 何: 助詞・動詞が続くときは「なに」(何が・何を・何して)、助数詞や「何で」は「なん」のまま
+            if token.surface == "何" && i + 1 < tokens.count, let next = tokens[i + 1].surface.first {
+                if "がをもよしや".contains(next) {
+                    token = Token(surface: token.surface, reading: "なに")
+                }
+            }
+            result.append(token)
+            i += 1
+        }
+        return result
+    }
+
+    /// かなの母音 (あ/い/う/え/お)。ん・っ・ー・記号は nil
+    static func vowel(of kana: Character) -> Character? {
+        switch kana {
+        case "あ", "か", "が", "さ", "ざ", "た", "だ", "な", "は", "ば", "ぱ", "ま", "や", "ら", "わ", "ぁ", "ゃ", "ゎ":
+            return "あ"
+        case "い", "き", "ぎ", "し", "じ", "ち", "ぢ", "に", "ひ", "び", "ぴ", "み", "り", "ゐ", "ぃ":
+            return "い"
+        case "う", "く", "ぐ", "す", "ず", "つ", "づ", "ぬ", "ふ", "ぶ", "ぷ", "む", "ゆ", "る", "ぅ", "ゅ", "ゔ":
+            return "う"
+        case "え", "け", "げ", "せ", "ぜ", "て", "で", "ね", "へ", "べ", "ぺ", "め", "れ", "ゑ", "ぇ":
+            return "え"
+        case "お", "こ", "ご", "そ", "ぞ", "と", "ど", "の", "ほ", "ぼ", "ぽ", "も", "よ", "ろ", "を", "ぉ", "ょ":
+            return "お"
+        default:
+            return nil
+        }
+    }
+
+    /// 表記の読みを発音のかなに揃える。
+    ///
+    /// 音響モデルの教師は音に対応していなければならない。表記のままだと同じ音 [oː] が
+    /// 「おう」「おお」「ー」と 3 通りに書かれ、助詞の「は」「を」は「わ」「お」と読む。
+    /// 表記から音を当てる負担を SNN に負わせないよう、ここで 1 通りに寄せる。
+    /// 第2段のかな漢字辞書も同じ読みで作るので、経路全体で一貫する。
+    ///   - 助詞の「は」「へ」(単独トークン) → わ・え、「を」→ お
+    ///   - ぢ・づ → じ・ず
+    ///   - 同じ母音の連なり (おう・おお・えい・ええ・ああ・いい・うう) の 2 文字目 → ー。
+    ///     ただし終止形が「う」で終わる動詞 (思う・追う・食う) の語末は残す。
+    ///     意向形 (行こう) やかな表記の「そう・もう・ありがとう」は長音にする
+    /// 語末の「う」を長音にしない動詞 (終止形が お段・う段 + う)。
+    /// 意向形 (行こう・見よう) やかな表記の「そう・もう・ありがとう」は長音なので、表にあるものだけ残す
+    static let uEndingVerbs: Set<String> = [
+        "思う", "追う", "問う", "酔う", "沿う", "食う", "吸う", "縫う", "乞う", "負う", "覆う", "請う",
+        "装う", "添う", "集う", "揃う", "争う", "救う", "狂う", "通う", "見舞う", "住まう", "買う", "会う",
+    ]
+
+    static func pronunciation(surface: String, reading: String) -> String {
+        switch surface {
+        case "は":
+            return "わ"
+        case "へ":
+            return "え"
+        default:
+            break
+        }
+        let chars = Array(reading)
+        var result: [Character] = []
+        result.reserveCapacity(chars.count)
+        let keepsFinalU = Self.uEndingVerbs.contains(surface)
+        var i = 0
+        while i < chars.count {
+            var c = chars[i]
+            switch c {
+            case "を":
+                c = "お"
+            case "ぢ":
+                c = "じ"
+            case "づ":
+                c = "ず"
+            default:
+                break
+            }
+            if 0 < i, let prevVowel = Self.vowel(of: result[result.count - 1]) {
+                let isLast = (i == chars.count - 1)
+                var lengthens = false
+                switch c {
+                case "う":
+                    lengthens = (prevVowel == "お" || prevVowel == "う") && (isLast && keepsFinalU) != true
+                case "い":
+                    lengthens = (prevVowel == "え" || prevVowel == "い")
+                case "え":
+                    lengthens = (prevVowel == "え")
+                case "お":
+                    lengthens = (prevVowel == "お")
+                case "あ":
+                    lengthens = (prevVowel == "あ")
+                default:
+                    break
+                }
+                if lengthens {
+                    c = "ー"
+                }
+            }
+            result.append(c)
+            i += 1
+        }
+        return String(result)
     }
 
     /// ひらがなと長音のみを残す。
