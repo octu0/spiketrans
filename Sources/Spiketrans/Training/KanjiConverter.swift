@@ -405,6 +405,36 @@ public struct KanjiConverter: Sendable {
         "皆": "みんな",
         "言う": "ゆー",
         "いう": "ゆー",
+        "良い": "いい",
+        "得る": "える",
+        "近々": "ちかぢか",
+        "白髪": "しらが",
+        "玩具": "おもちゃ",
+        "獰猛": "どうもう",
+        "寝惚け": "ねぼけ",
+        "貴女": "あなた",
+        "蛙": "かえる",
+    ]
+
+    /// 解析器が特定の読みを返したときだけ置き換える表 ((表層, 発音かなの読み) → 読み)。
+    /// 「下」は文脈で した・か・げ と変わるので、話し言葉で稀な「もと」だけ直す
+    static let readingSpecificOverrides: [String: [String: String]] = [
+        "下": ["もと": "した"],
+        "米": ["べー": "こめ"],
+    ]
+
+    /// 直後に助詞が続くときだけ読みが変わる語 (他の → ほかの、数は → かずは)
+    static let beforeParticleOverrides: [String: String] = [
+        "他": "ほか",
+        "数": "かず",
+    ]
+    static let particles: Set<String> = ["の", "は", "が", "を", "も", "に", "へ", "と", "で", "から", "まで", "より"]
+
+    /// 名詞に後接すると連濁する語 (ビル作り → づくり、多摩川 → がわ)。
+    /// 直前の形態素が漢字・カタカナで終わる (名詞) ときだけ適用し、「この通り」「深い川」は変えない
+    static let rendakuSuffixes: [String: String] = [
+        "川": "がわ", "作り": "づくり", "造り": "づくり", "好き": "ずき", "通り": "どおり",
+        "時計": "どけい", "頃": "ごろ", "不足": "ぶそく", "気味": "ぎみ", "部屋": "べや", "会社": "がいしゃ",
     ]
 
     /// 話し言葉で複数の読みがある表層の、`readingOverrides` 以外の読み。
@@ -424,6 +454,14 @@ public struct KanjiConverter: Sendable {
         "お姉さん": "おねえさん",
         "皆さん": "みなさん",
         "皆様": "みなさま",
+        "兄さん": "にいさん",
+        "姉さん": "ねえさん",
+        "兄ちゃん": "にいちゃん",
+        "姉ちゃん": "ねえちゃん",
+        "父さん": "とうさん",
+        "母さん": "かあさん",
+        "爺ちゃん": "じいちゃん",
+        "婆ちゃん": "ばあちゃん",
         "一昨日": "おととい",
         "一昨年": "おととし",
         "二日": "ふつか",
@@ -547,6 +585,14 @@ public struct KanjiConverter: Sendable {
         return isKanji(first) || isKatakana(first)
     }
 
+    /// 表層の末尾が漢字・カタカナか (活用語尾のかなで終わる動詞・形容詞を除くための判定)
+    static func endsWithKanjiOrKatakana(_ surface: String) -> Bool {
+        guard let last = surface.unicodeScalars.last else {
+            return false
+        }
+        return isKanji(last) || isKatakana(last)
+    }
+
     /// か・さ・た・は・ぱ行で始まる読みか (数詞の促音化が起きる子音)
     static func startsWithVoicelessObstruent(_ reading: String) -> Bool {
         guard let first = reading.first else {
@@ -648,6 +694,15 @@ public struct KanjiConverter: Sendable {
             if let reading = readingOverrides[token.surface] {
                 token = Token(surface: token.surface, reading: pronunciation(surface: token.surface, reading: reading))
             }
+            if let reading = readingSpecificOverrides[token.surface]?[token.reading] {
+                token = Token(surface: token.surface, reading: pronunciation(surface: token.surface, reading: reading))
+            }
+            if let reading = beforeParticleOverrides[token.surface], i + 1 < tokens.count, particles.contains(tokens[i + 1].surface) {
+                token = Token(surface: token.surface, reading: pronunciation(surface: token.surface, reading: reading))
+            }
+            if let reading = rendakuSuffixes[token.surface], let prev = result.last, endsWithKanjiOrKatakana(prev.surface) {
+                token = Token(surface: token.surface, reading: pronunciation(surface: token.surface, reading: reading))
+            }
             // 3. 曜日: 「木曜/もくよう」+「日/ひ」→ もくようび
             if i + 1 < tokens.count && token.surface.hasSuffix("曜") && tokens[i + 1].surface == "日" {
                 result.append(Token(surface: token.surface + "日", reading: token.reading + "び"))
@@ -680,9 +735,9 @@ public struct KanjiConverter: Sendable {
                startsWithKanjiOrKatakana(prev.surface) && isNumeralSurface(prev.surface) != true {
                 token = Token(surface: token.surface, reading: "じん")
             }
-            // 7. 何: 助詞・動詞が続くときは「なに」(何が・何を・何して)、助数詞や「何で」は「なん」のまま
+            // 7. 何: 助詞・動詞が続くときは「なに」(何が・何を・何か・何して)、助数詞や「何で」は「なん」のまま
             if token.surface == "何" && i + 1 < tokens.count, let next = tokens[i + 1].surface.first {
-                if "がをもよしや".contains(next) {
+                if "がをもよしやか".contains(next) {
                     token = Token(surface: token.surface, reading: "なに")
                 }
             }

@@ -283,6 +283,19 @@ final class KanjiConverterTests: XCTestCase {
         // 何: 助詞・動詞が続けば「なに」、助数詞や「で」は「なん」
         XCTAssertEqual(converter.convertToHiragana("何が何を何してる"), "なにがなにおなにしてる")
         XCTAssertEqual(converter.convertToHiragana("何で何回"), "なんでなんかい")
+        XCTAssertEqual(converter.convertToHiragana("何か"), "なにか")
+        // 良い・得る、読み限定 (下/もと → した)、助詞の前 (他の → ほかの、数は → かずは)
+        XCTAssertEqual(converter.convertToHiragana("良い天気"), "いーてんき")
+        XCTAssertEqual(converter.convertToHiragana("雲の下で"), "くものしたで")
+        XCTAssertEqual(converter.convertToHiragana("米を炊く"), "こめおたく")
+        XCTAssertEqual(converter.convertToHiragana("他の人と他に"), "ほかのひととほかに")
+        XCTAssertEqual(converter.convertToHiragana("その数は"), "そのかずわ")
+        XCTAssertEqual(converter.convertToHiragana("数か月"), "すーかげつ")
+        // 名詞に後接する連濁。かなで終わる語 (この・深い) の後は変えない
+        XCTAssertEqual(converter.convertToHiragana("ビル作りと多摩川"), "びるずくりとたまがわ")
+        XCTAssertEqual(converter.convertToHiragana("ゲーム好きと腕時計と十時頃"), "げーむずきとうでどけーとじゅーじごろ")
+        XCTAssertEqual(converter.convertToHiragana("この通り、深い川"), "このとーりふかいかわ")
+        XCTAssertEqual(converter.convertToHiragana("兄ちゃんと姉さん"), "にーちゃんとねーさん")
     }
 
     func testCounterSandhi() {
