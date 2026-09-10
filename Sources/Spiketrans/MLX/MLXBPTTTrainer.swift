@@ -132,6 +132,9 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                     let upperIdx = l - 1
                     let denseCur = matmul(s[l - 1], network.wLayers[upperIdx]) + network.bHLayers[upperIdx]
 
+                    // MLXFast.rmsNorm の融合カーネルは valueAndGrad + compile の中で使うと、本番規模
+                    // (B=64, T=256) の初回ステップで Metal の生存バッファ上限 (499000) を超えて落ちる。
+                    // 小さな形のテストでは通るので、ここは素の演算のまま
                     let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
                     let rms = sqrt(meanSq + rmsNormEpsilon)
                     let normCur = (denseCur / rms) * network.gammaRMS[upperIdx]

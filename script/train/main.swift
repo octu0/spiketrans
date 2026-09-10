@@ -1635,6 +1635,14 @@ func printExamples(_ title: String, _ list: [EvalResult]) {
 printExamples("未学習セット 良い例 Top 5", top5Best)
 printExamples("未学習セット 悪い例 Top 5", top5Worst)
 
+// 未学習セットが小さいときは全件を出す。配信の評価セットで、区間ごとの音の条件と CER を突き合わせるため
+if unseenResults.count <= 200 {
+    print("\n--- [未学習セット 全件] fileId かなCER 漢字CER ---")
+    for r in unseenResults {
+        print("  \(r.fileId)\t\(String(format: "%.1f", r.kanaCer * 100.0))\t\(String(format: "%.1f", r.cer * 100.0))")
+    }
+}
+
 
 
 // レポートファイルの生成
