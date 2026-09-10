@@ -169,6 +169,36 @@ public struct KanjiConverter: Sendable {
         return result
     }
 
+    /// 括弧 (半角・全角) の中身に「笑」を含む注記 (笑・爆笑・冷笑) を取り除く。
+    /// 笑い声の種類を示す書き起こしの記号で「わらい」とは言っていない。中身は 6 文字までとし、
+    /// 台詞の引用のような長い括弧書きは残す。単独の「w」は除かない (「だぶりゅー」と発音されている)
+    static func removeLaughAnnotations(_ text: String) -> String {
+        let chars = Array(text)
+        var out: [Character] = []
+        out.reserveCapacity(chars.count)
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "(" || c == "（" {
+                var j = i + 1
+                var hasLaugh = false
+                while j < chars.count && j - i <= 7 && chars[j] != ")" && chars[j] != "）" {
+                    if chars[j] == "笑" {
+                        hasLaugh = true
+                    }
+                    j += 1
+                }
+                if hasLaugh && j < chars.count && (chars[j] == ")" || chars[j] == "）") {
+                    i = j + 1
+                    continue
+                }
+            }
+            out.append(c)
+            i += 1
+        }
+        return String(out)
+    }
+
     /// ハイフン・ダッシュまたは引き伸ばし記号のスパンか判定
     static func isHyphenSpan(_ surface: String) -> Bool {
         if surface.count != 1 {
@@ -273,8 +303,8 @@ public struct KanjiConverter: Sendable {
             return []
         }
 
-        // 引き伸ばし記号（〜等）の正規化
-        let cleanText = Self.normalizeProlongedMarks(text)
+        // 引き伸ばし記号（〜等）の正規化と、発音されない笑いの注記の除去
+        let cleanText = Self.removeLaughAnnotations(Self.normalizeProlongedMarks(text))
 
         let loc = Locale(identifier: "ja_JP") as CFLocale
         let nsText = cleanText as NSString

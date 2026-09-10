@@ -308,4 +308,16 @@ final class KanjiConverterTests: XCTestCase {
         // 数詞ではない「位置」は促音化しない
         XCTAssertEqual(converter.convertToHiragana("位置確認"), "いちかくにん")
     }
+
+    func testTranscriptionMarkersAreSilent() {
+        let converter = KanjiConverter()
+        // 「(笑)」「(爆笑)」「(冷笑)」は笑いの注記で発音されない
+        XCTAssertEqual(converter.convertToHiragana("(笑)ん?撮ってない?"), "んとってない")
+        XCTAssertEqual(converter.convertToHiragana("やられた(爆笑)駆除した（冷笑）ね"), "やられたくじょしたね")
+        // 笑を含まない括弧書きは残る
+        XCTAssertEqual(converter.convertToHiragana("彼(兄)が来た"), "かれあにがきた")
+        // 単独の w は読み上げで「だぶりゅー」と発音されるので残す
+        XCTAssertEqual(converter.convertToHiragana("それなw"), "それなだぶりゅー")
+        XCTAssertEqual(converter.convertToHiragana("Wi-Fiとweb"), "わいふぁいとうぇぶ")
+    }
 }
