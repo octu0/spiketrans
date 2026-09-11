@@ -79,7 +79,7 @@ public final class CharLanguageModel: @unchecked Sendable {
                 vPrev: &vPrev,
                 sPrev: &sPrev,
                 aPrev: &aPrev,
-                spikeSum: &spikeSum,
+                readoutSum: &spikeSum,
                 logits: &logits,
                 probabilities: &probs,
                 scratch: scratch

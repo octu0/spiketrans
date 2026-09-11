@@ -80,7 +80,7 @@ final class Tier3CombinationTests: XCTestCase {
 
             filterbank.extractFeatures(pcmPtr: framePtr, count: config.frameSize, workspace: workspace)
 
-            snn.forward(features: workspace.featureBuffer, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+            snn.forward(features: workspace.featureBuffer, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
 
             XCTAssertEqual(probs.count, 64)
             var sumP: Float = 0.0
@@ -121,7 +121,7 @@ final class Tier3CombinationTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, readoutSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
             engine.predict(features: feat, workspace: workspace, outputProbs: &quantProbs)
 
             var topFloat = 0
@@ -177,7 +177,7 @@ final class Tier3CombinationTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, readoutSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
             engine.predict(features: feat, workspace: workspace, outputProbs: &quantProbs)
 
             var topFloat = 0

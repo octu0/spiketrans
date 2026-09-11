@@ -156,12 +156,17 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                     l += 1
                 }
 
-                // 最終層のスパイクを積算
-                sSumFinal = sSumFinal + s[numLayers - 1]
+                // 最終層の膜電位を積算する (膜電位読み出し)。スパイクの 0/1 は閾値以下の情報を
+                // 捨てるが、膜電位はそれを保つ。出力層は発火しないので線形層で読む
+                sSumFinal = sSumFinal + v[numLayers - 1]
                 step += 1
             }
 
-            let sAvg_t = sSumFinal / Float(tSteps)
+            // 膜電位は ±20 まで振れてスパイク (0/1) より桁が大きく、そのまま線形層に入れると
+            // 損失が発散する。上位層の電流と同じく RMSNorm で単位スケールに揃える (利得は wOut が吸収)
+            let vAvg_t = sSumFinal / Float(tSteps)
+            let vMeanSq = mean(vAvg_t * vAvg_t, axis: -1, keepDims: true)
+            let sAvg_t = vAvg_t / sqrt(vMeanSq + rmsNormEpsilon)
             sAvgList.append(sAvg_t)
             t += 1
         }

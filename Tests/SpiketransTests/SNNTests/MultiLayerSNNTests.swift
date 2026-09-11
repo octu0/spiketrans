@@ -90,11 +90,12 @@ final class MultiLayerSNNTests: XCTestCase {
         while t < frames {
             cpuNet.forward(
                 features: features[t], vPrev: &vPrev, sPrev: &sPrev, aPrev: &aPrev,
-                spikeSum: &spikeSum, logits: &logits, probabilities: &probs, scratch: scratch
+                readoutSum: &spikeSum, logits: &logits, probabilities: &probs, scratch: scratch
             )
+            // 読み出しは膜電位なので、上位層の発火は状態 sPrev (最終層のオフセット) で数える
             var k = 0
             while k < hidden {
-                upperLayerSpikes += spikeSum[k]
+                upperLayerSpikes += sPrev[hidden + k]
                 k += 1
             }
             var c = 0

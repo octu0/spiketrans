@@ -29,7 +29,7 @@ final class SpikingNetworkTests: XCTestCase {
             features: features,
             vPrev: &vPrev1,
             sPrev: &sPrev1,
-            spikeSum: &spikeSum1,
+            readoutSum: &spikeSum1,
             logits: &logits1,
             probabilities: &probs1
         )
@@ -62,7 +62,7 @@ final class SpikingNetworkTests: XCTestCase {
             features: features,
             vPrev: &vPrev2,
             sPrev: &sPrev2,
-            spikeSum: &spikeSum2,
+            readoutSum: &spikeSum2,
             logits: &logits2,
             probabilities: &probs2
         )
@@ -104,7 +104,7 @@ final class SpikingNetworkTests: XCTestCase {
                 features: features,
                 vPrev: &vPrev,
                 sPrev: &sPrev,
-                spikeSum: &spikeSum,
+                readoutSum: &spikeSum,
                 logits: &logits,
                 probabilities: &probs
             )

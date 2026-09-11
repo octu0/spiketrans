@@ -34,7 +34,7 @@ final class Tier2BoundaryTests: XCTestCase {
 
         let emptyFeatures: [Float] = []
         // Should safely return without crashing
-        net.forward(features: emptyFeatures, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: emptyFeatures, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertEqual(probs.count, 64)
     }
 
@@ -109,7 +109,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var logits = [Float](repeating: 0.0, count: 64)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertEqual(probs.count, 64)
     }
 
@@ -552,7 +552,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var logits = [Float](repeating: 0.0, count: 64)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
 
         var sumP: Float = 0.0
         var i = 0
@@ -573,7 +573,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var logits = [Float](repeating: 0.0, count: 64)
         var probs = [Float](repeating: 0.0, count: 64)
 
-        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
 
         var sumP: Float = 0.0
         var i = 0
@@ -733,7 +733,7 @@ final class Tier2BoundaryTests: XCTestCase {
         var sPrev = [Float](repeating: 0.0, count: 256)
         var spikeSum = [Float](repeating: 0.0, count: 256)
 
-        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertFalse(probs[0].isNaN)
     }
 

@@ -427,7 +427,7 @@ final class M2ChallengerStressTests: XCTestCase {
             features: features,
             vPrev: &v,
             sPrev: &s,
-            spikeSum: &sp,
+            readoutSum: &sp,
             logits: &logit,
             probabilities: &prob
         )

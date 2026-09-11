@@ -169,7 +169,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, readoutSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
             engine32.predict(features: feat, workspace: workspace32, outputProbs: &quantProbs)
 
             var topF = 0
@@ -225,7 +225,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
             var vp = [Float](repeating: 0.0, count: 64)
             var sp = [Float](repeating: 0.0, count: 64)
-            net.forward(features: feat, vPrev: &vp, sPrev: &sp, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+            net.forward(features: feat, vPrev: &vp, sPrev: &sp, readoutSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
             engine16.predict(features: feat, workspace: workspace16, outputProbs: &quantProbs)
 
             var topF = 0
@@ -271,7 +271,7 @@ final class Tier5AdversarialTests: XCTestCase {
 
         var step = 0
         while step < 100 {
-            net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+            net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
             var i = 0
             while i < 256 {
                 totalSpikes += spikeSum[i]
@@ -326,12 +326,12 @@ final class Tier5AdversarialTests: XCTestCase {
 
         // Micro input (1e-35)
         let microFeat = [Float](repeating: 1e-35, count: 32)
-        net.forward(features: microFeat, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: microFeat, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertFalse(probs[0].isNaN)
 
         // Huge input (1e30)
         let hugeFeat = [Float](repeating: 1e30, count: 32)
-        net.forward(features: hugeFeat, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+        net.forward(features: hugeFeat, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertFalse(probs[0].isNaN)
     }
 

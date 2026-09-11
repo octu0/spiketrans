@@ -186,7 +186,7 @@ final class Tier4RealWorldTests: XCTestCase {
             d += 1
         }
 
-        net.forward(features: feat, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
+        net.forward(features: feat, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &floatProbs)
         engine16.predict(features: feat, workspace: workspace16, outputProbs: &quantProbs)
 
         XCTAssertFalse(quantProbs[0].isNaN)

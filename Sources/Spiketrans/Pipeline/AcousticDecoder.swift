@@ -5,7 +5,7 @@ public final class AcousticWorkspace: @unchecked Sendable {
     public var vPrev: [Float]
     public var sPrev: [Float]
     public var aPrev: [Float]
-    public var spikeSum: [Float]
+    public var readoutSum: [Float]
     public var logits: [Float]
     public var probabilities: [Float]
     public var quantizedWorkspace: QuantizedWorkspace?
@@ -19,7 +19,7 @@ public final class AcousticWorkspace: @unchecked Sendable {
         self.vPrev = [Float](repeating: 0.0, count: stateSize)
         self.sPrev = [Float](repeating: 0.0, count: stateSize)
         self.aPrev = [Float](repeating: 0.0, count: stateSize)
-        self.spikeSum = [Float](repeating: 0.0, count: maxHiddenDim)
+        self.readoutSum = [Float](repeating: 0.0, count: maxHiddenDim)
         self.logits = [Float](repeating: 0.0, count: outputDim)
         self.probabilities = [Float](repeating: 0.0, count: outputDim)
         self.quantizedWorkspace = QuantizedWorkspace(
@@ -44,8 +44,8 @@ public final class AcousticWorkspace: @unchecked Sendable {
     public func reset() {
         resetHiddenState()
         var i = 0
-        while i < spikeSum.count {
-            spikeSum[i] = 0.0
+        while i < readoutSum.count {
+            readoutSum[i] = 0.0
             i += 1
         }
         i = 0
@@ -123,7 +123,7 @@ public final class AcousticDecoder: @unchecked Sendable {
                 vPrev: &workspace.vPrev,
                 sPrev: &workspace.sPrev,
                 aPrev: &workspace.aPrev,
-                spikeSum: &workspace.spikeSum,
+                readoutSum: &workspace.readoutSum,
                 logits: &workspace.logits,
                 probabilities: &workspace.probabilities,
                 scratch: workspace.scratch

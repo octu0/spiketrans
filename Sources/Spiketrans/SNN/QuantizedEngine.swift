@@ -85,18 +85,20 @@ public final class QuantizedWorkspace: @unchecked Sendable {
     public var sPrev: ContiguousArray<Int32>
     public var vNext: ContiguousArray<Int32>
     public var sNext: ContiguousArray<Int32>
-    public var spikeSum: ContiguousArray<Int32>
+    public var membraneSum: ContiguousArray<Int64>
     public var inputInt: ContiguousArray<Int32>
-    public var logitsInt: ContiguousArray<Int64>
+    public var readoutNorm: ContiguousArray<Float>
+    public var logitsFloat: ContiguousArray<Float>
 
     public init(maxHiddenDim: Int, inputDim: Int, outputDim: Int) {
         self.vPrev = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
         self.sPrev = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
         self.vNext = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
         self.sNext = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
-        self.spikeSum = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
+        self.membraneSum = ContiguousArray<Int64>(repeating: 0, count: maxHiddenDim)
         self.inputInt = ContiguousArray<Int32>(repeating: 0, count: inputDim)
-        self.logitsInt = ContiguousArray<Int64>(repeating: 0, count: outputDim)
+        self.readoutNorm = ContiguousArray<Float>(repeating: 0.0, count: maxHiddenDim)
+        self.logitsFloat = ContiguousArray<Float>(repeating: 0.0, count: outputDim)
     }
 
     @inline(__always)
@@ -107,7 +109,7 @@ public final class QuantizedWorkspace: @unchecked Sendable {
             sPrev[i] = 0
             vNext[i] = 0
             sNext[i] = 0
-            spikeSum[i] = 0
+            membraneSum[i] = 0
             i += 1
         }
     }
@@ -231,7 +233,7 @@ public final class QuantizedEngine: @unchecked Sendable {
 
                 workspace.vNext[i] = vNext
                 workspace.sNext[i] = sNext
-                workspace.spikeSum[i] += sNext
+                workspace.membraneSum[i] += Int64(vNext)
                 i += 1
             }
 
@@ -246,34 +248,42 @@ public final class QuantizedEngine: @unchecked Sendable {
             t += 1
         }
 
-        // 3. リードアウト層整数計算
+        // 3. リードアウト (膜電位平均を RMSNorm してから線形層。SpikingNetwork.forward と同じ式)。
+        //    ニューロン動態は整数のまま、読み出しだけ浮動小数点に戻す
+        let invTScale = 1.0 / (Float(timeSteps) * scale)
+        var vSumSq: Float = 0.0
+        var i = 0
+        while i < hSize {
+            let vAvg = Float(workspace.membraneSum[i]) * invTScale
+            workspace.readoutNorm[i] = vAvg
+            vSumSq += vAvg * vAvg
+            i += 1
+        }
+        let invRms = 1.0 / ((vSumSq / Float(hSize)) + rmsNormEpsilon).squareRoot()
+        let invScale = 1.0 / scale
 
-        var maxLogit: Int64 = -1 << 60
+        var maxLogit: Float = -Float.greatestFiniteMagnitude
         var c = 0
         while c < weights.outputDim {
-            var sum = Int64(weights.bOut[c]) * Int64(timeSteps)
+            var sum = Float(weights.bOut[c]) * invScale
             let wOffset = c * weights.maxHiddenDim
-            var i = 0
+            i = 0
             while i < hSize {
-                let sCount = workspace.spikeSum[i]
-                if 0 < sCount {
-                    sum += Int64(weights.wOut[wOffset + i]) * Int64(sCount)
-                }
+                sum += Float(weights.wOut[wOffset + i]) * invScale * workspace.readoutNorm[i] * invRms
                 i += 1
             }
-            workspace.logitsInt[c] = sum
+            workspace.logitsFloat[c] = sum
             if maxLogit < sum {
                 maxLogit = sum
             }
             c += 1
         }
 
-        // 4. スケーリング Softmax
-        let normFactor = 1.0 / (scale * Float(timeSteps))
+        // 4. Softmax
         var sumExp: Float = 0.0
         c = 0
         while c < weights.outputDim {
-            var diff = Float(workspace.logitsInt[c] - maxLogit) * normFactor
+            var diff = workspace.logitsFloat[c] - maxLogit
             if diff < -50.0 {
                 diff = -50.0
             }

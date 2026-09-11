@@ -968,7 +968,7 @@ final class Tier1FeatureTests: XCTestCase {
                 features: features,
                 vPrev: &vPrev,
                 sPrev: &sPrev,
-                spikeSum: &spikeSum,
+                readoutSum: &spikeSum,
                 logits: &logits,
                 probabilities: &probs
             )
@@ -997,7 +997,7 @@ final class Tier1FeatureTests: XCTestCase {
 
         var iter = 0
         while iter < 1000 {
-            net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, spikeSum: &spikeSum, logits: &logits, probabilities: &probs)
+            net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
             iter += 1
         }
         XCTAssertEqual(probs.count, 64)

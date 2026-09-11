@@ -119,7 +119,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                 vPrev: &vLM,
                 sPrev: &sLM,
                 aPrev: &aLM,
-                spikeSum: &spikeSumLM,
+                readoutSum: &spikeSumLM,
                 logits: &logitsLM,
                 probabilities: &probsLM,
                 scratch: scratchLM
@@ -251,7 +251,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                     vPrev: &vLM,
                     sPrev: &sLM,
                     aPrev: &aLM,
-                    spikeSum: &spikeSumLM,
+                    readoutSum: &spikeSumLM,
                     logits: &logitsLM,
                     probabilities: &probsLM,
                     scratch: scratchLM
@@ -390,7 +390,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                 vPrev: &vLM,
                 sPrev: &sLM,
                 aPrev: &aLM,
-                spikeSum: &spikeSumLM,
+                readoutSum: &spikeSumLM,
                 logits: &logitsLM,
                 probabilities: &probsLM,
                 scratch: scratchLM
@@ -456,7 +456,7 @@ public final class LanguageDecoder: @unchecked Sendable {
                 vPrev: &vLM,
                 sPrev: &sLM,
                 aPrev: &aLM,
-                spikeSum: &spikeSumLM,
+                readoutSum: &spikeSumLM,
                 logits: &logitsLM,
                 probabilities: &probsLM,
                 scratch: scratchLM

@@ -254,7 +254,7 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
             features: features,
             vPrev: &vPrevBase,
             sPrev: &sPrevBase,
-            spikeSum: &spikeSumBase,
+            readoutSum: &spikeSumBase,
             logits: &logitsBase,
             probabilities: &probsBase
         )
@@ -279,7 +279,7 @@ final class M2ChallengerReducedSizeStressTests: XCTestCase {
             features: features,
             vPrev: &vPrevMiddle,
             sPrev: &sPrevMiddle,
-            spikeSum: &spikeSumMiddle,
+            readoutSum: &spikeSumMiddle,
             logits: &logitsMiddle,
             probabilities: &probsMiddle
         )

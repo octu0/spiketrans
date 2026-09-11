@@ -262,7 +262,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         vPrev: inout [Float],
         sPrev: inout [Float],
         aPrev: inout [Float],
-        spikeSum: inout [Float],
+        readoutSum: inout [Float],
         logits: inout [Float],
         probabilities: inout [Float],
         scratch: ForwardScratch
@@ -278,10 +278,10 @@ public final class SpikingNetwork: @unchecked Sendable {
             aPrev = [Float](repeating: 0.0, count: totalStateSize)
         }
 
-        // 1. 各ニューロンのスパイク積算リセット
+        // 1. 読み出し用の膜電位積算をリセット
         var i = 0
         while i < hSize {
-            spikeSum[i] = 0.0
+            readoutSum[i] = 0.0
             i += 1
         }
 
@@ -413,18 +413,14 @@ public final class SpikingNetwork: @unchecked Sendable {
                 sPrev.withUnsafeMutableBufferPointer { sBuf in
                     aPrev.withUnsafeMutableBufferPointer { aBuf in
                         scratch.stepCurrents.withUnsafeBufferPointer { curBuf in
-                            spikeSum.withUnsafeMutableBufferPointer { sumBuf in
-                                var sumTarget: UnsafeMutablePointer<Float>? = nil
-                                if numLayers == 1 {
-                                    sumTarget = sumBuf.baseAddress!
-                                }
+                            readoutSum.withUnsafeMutableBufferPointer { sumBuf in
                                 LIFNeuronEngine.stepAdaptiveSIMD8(
                                     config: lifConfig,
                                     vPtr: vBuf.baseAddress!,
                                     sPtr: sBuf.baseAddress!,
                                     aPtr: aBuf.baseAddress!,
                                     curPtr: curBuf.baseAddress!,
-                                    spikeSumPtr: sumTarget,
+                                    spikeSumPtr: nil,
                                     count: hSize
                                 )
                             }
@@ -568,23 +564,18 @@ public final class SpikingNetwork: @unchecked Sendable {
                 }
 
                 // 上位層 LIF 更新
-                let isFinalLayer = (layerIdx + 1) == numLayers
                 vPrev.withUnsafeMutableBufferPointer { vBuf in
                     sPrev.withUnsafeMutableBufferPointer { sBuf in
                         aPrev.withUnsafeMutableBufferPointer { aBuf in
                             scratch.stepCurrents.withUnsafeBufferPointer { curBuf in
-                                spikeSum.withUnsafeMutableBufferPointer { sumBuf in
-                                    var sumTarget: UnsafeMutablePointer<Float>? = nil
-                                    if isFinalLayer {
-                                        sumTarget = sumBuf.baseAddress!
-                                    }
+                                readoutSum.withUnsafeMutableBufferPointer { sumBuf in
                                     LIFNeuronEngine.stepAdaptiveSIMD8(
                                         config: lifConfig,
                                         vPtr: vBuf.baseAddress!.advanced(by: thisLayerOffset),
                                         sPtr: sBuf.baseAddress!.advanced(by: thisLayerOffset),
                                         aPtr: aBuf.baseAddress!.advanced(by: thisLayerOffset),
                                         curPtr: curBuf.baseAddress!,
-                                        spikeSumPtr: sumTarget,
+                                        spikeSumPtr: nil,
                                         count: hSize
                                     )
                                 }
@@ -596,17 +587,41 @@ public final class SpikingNetwork: @unchecked Sendable {
                 layerIdx += 1
             }
 
+            // 3.3 最終層の膜電位を積算 (学習側 MLXBPTTTrainer.logitsBatch と同じ膜電位読み出し)
+            let finalOffset = (numLayers - 1) * hSize
+            vPrev.withUnsafeBufferPointer { vBuf in
+                readoutSum.withUnsafeMutableBufferPointer { sumBuf in
+                    let vFinal = vBuf.baseAddress!.advanced(by: finalOffset)
+                    let sum = sumBuf.baseAddress!
+                    var n = 0
+                    while n < hSize {
+                        sum[n] += vFinal[n]
+                        n += 1
+                    }
+                }
+            }
+
             t += 1
         }
 
         // 4. リードアウト層計算 (Event-driven 疎加算 & スケール正規化)
+        //    膜電位平均を RMSNorm で単位スケールに揃える (学習側 logitsBatch と同じ式)
         let invT = 1.0 / Float(timeSteps)
         let biasData = pBOut.data
 
-        var activeOutCount = 0
+        var vSumSq: Float = 0.0
         var k = 0
         while k < hSize {
-            let sRate = spikeSum[k] * invT
+            let vAvg = readoutSum[k] * invT
+            vSumSq += vAvg * vAvg
+            k += 1
+        }
+        let invRms = 1.0 / (Float(vSumSq / Float(hSize)) + rmsNormEpsilon).squareRoot()
+
+        var activeOutCount = 0
+        k = 0
+        while k < hSize {
+            let sRate = readoutSum[k] * invT * invRms
             if sRate != 0.0 {
                 scratch.activeReadoutIndices[activeOutCount] = k
                 scratch.activeRates[activeOutCount] = sRate
@@ -699,7 +714,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         features: [Float],
         vPrev: inout [Float],
         sPrev: inout [Float],
-        spikeSum: inout [Float],
+        readoutSum: inout [Float],
         logits: inout [Float],
         probabilities: inout [Float]
     ) {
@@ -710,7 +725,7 @@ public final class SpikingNetwork: @unchecked Sendable {
             vPrev: &vPrev,
             sPrev: &sPrev,
             aPrev: &aPrev,
-            spikeSum: &spikeSum,
+            readoutSum: &readoutSum,
             logits: &logits,
             probabilities: &probabilities,
             scratch: scratch

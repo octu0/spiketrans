@@ -132,7 +132,7 @@ do {
             vPrev: &v,
             sPrev: &s,
             aPrev: &a,
-            spikeSum: &sum,
+            readoutSum: &sum,
             logits: &logits,
             probabilities: &probs,
             scratch: scratch

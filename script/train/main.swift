@@ -1569,40 +1569,6 @@ if 0 < rawPairs.count {
     }
 }
 
-// ==================================================
-// === 第2段 Viterbi の選択内訳 (正解かな入力) ===
-// ==================================================
-// 正解かなを入れても誤る発話について、どの区間でどの語がどの経路・何点で
-// 選ばれたかを出す。配点のどこが誤選択を招いているかを特定するため。
-do {
-    // 正解かな入力時の CER が高い順に数件を選ぶ
-    let worstGold = trainResults
-        .filter { 0.0 < $0.goldKanaKanjiCerNoPunct }
-        .sorted { b, a in a.goldKanaKanjiCerNoPunct < b.goldKanaKanjiCerNoPunct }
-    let sampleCount = min(3, worstGold.count)
-
-    print("\n==================================================")
-    print("=== [第2段 診断] 正解かな入力時の Viterbi 選択内訳 (誤り上位 \(sampleCount) 件) ===")
-    print("==================================================")
-
-    var d = 0
-    while d < sampleCount {
-        let r = worstGold[d]
-        let diagDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
-        let produced = diagDecoder.decode(kanaText: r.targetKana)
-
-        print("\n[\(r.fileId)] 句読点除外 CER: \(String(format: "%.1f", r.goldKanaKanjiCerNoPunct * 100.0))%")
-        print("  正解かな: \"\(r.targetKana)\"")
-        print("  正解漢字: \"\(r.targetText)\"")
-        print("  第2段出力: \"\(produced)\"")
-        print("  選択内訳:")
-        for seg in diagDecoder.lastTrace {
-            print("    \(seg.kanaRange) → \(seg.emitted)  [\(seg.kind)] \(String(format: "%+.1f", seg.stepScore))")
-        }
-        d += 1
-    }
-}
-
 print("\n==================================================")
 print("=== [かな文字単位エラー分析] 学習セット ===")
 print("==================================================")
