@@ -85,9 +85,8 @@ public final class QuantizedWorkspace: @unchecked Sendable {
     public var sPrev: ContiguousArray<Int32>
     public var vNext: ContiguousArray<Int32>
     public var sNext: ContiguousArray<Int32>
-    public var membraneSum: ContiguousArray<Int64>
     public var inputInt: ContiguousArray<Int32>
-    public var readoutNorm: ContiguousArray<Float>
+    public var readoutSum: ContiguousArray<Float>
     public var logitsFloat: ContiguousArray<Float>
 
     public init(maxHiddenDim: Int, inputDim: Int, outputDim: Int) {
@@ -95,9 +94,8 @@ public final class QuantizedWorkspace: @unchecked Sendable {
         self.sPrev = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
         self.vNext = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
         self.sNext = ContiguousArray<Int32>(repeating: 0, count: maxHiddenDim)
-        self.membraneSum = ContiguousArray<Int64>(repeating: 0, count: maxHiddenDim)
         self.inputInt = ContiguousArray<Int32>(repeating: 0, count: inputDim)
-        self.readoutNorm = ContiguousArray<Float>(repeating: 0.0, count: maxHiddenDim)
+        self.readoutSum = ContiguousArray<Float>(repeating: 0.0, count: maxHiddenDim)
         self.logitsFloat = ContiguousArray<Float>(repeating: 0.0, count: outputDim)
     }
 
@@ -109,7 +107,7 @@ public final class QuantizedWorkspace: @unchecked Sendable {
             sPrev[i] = 0
             vNext[i] = 0
             sNext[i] = 0
-            membraneSum[i] = 0
+            readoutSum[i] = 0.0
             i += 1
         }
     }
@@ -218,22 +216,23 @@ public final class QuantizedEngine: @unchecked Sendable {
                     j += 1
                 }
 
-                // ビットシフト減衰
-                var vEffective: Int64 = Int64(workspace.vPrev[i])
-                if workspace.sPrev[i] != 0 {
-                    vEffective = 0
-                }
-                let vDecayed = Int32((vEffective * decayNum) >> decayBits)
-                let vNext = vDecayed + current
-
+                let vDecayed = Int32((Int64(workspace.vPrev[i]) * decayNum) >> decayBits)
+                let vIntegrated = vDecayed + current
                 var sNext: Int32 = 0
-                if vThInt <= vNext {
+                if vThInt <= vIntegrated {
                     sNext = 1
+                }
+                workspace.readoutSum[i] += LIFNeuronEngine.scaleReadout(
+                    Float(vIntegrated),
+                    vTh: Float(vThInt)
+                )
+                var vNext = vIntegrated
+                if sNext != 0 {
+                    vNext -= vThInt
                 }
 
                 workspace.vNext[i] = vNext
                 workspace.sNext[i] = sNext
-                workspace.membraneSum[i] += Int64(vNext)
                 i += 1
             }
 
@@ -248,18 +247,7 @@ public final class QuantizedEngine: @unchecked Sendable {
             t += 1
         }
 
-        // 3. リードアウト (膜電位平均を RMSNorm してから線形層。SpikingNetwork.forward と同じ式)。
-        //    ニューロン動態は整数のまま、読み出しだけ浮動小数点に戻す
-        let invTScale = 1.0 / (Float(timeSteps) * scale)
-        var vSumSq: Float = 0.0
-        var i = 0
-        while i < hSize {
-            let vAvg = Float(workspace.membraneSum[i]) * invTScale
-            workspace.readoutNorm[i] = vAvg
-            vSumSq += vAvg * vAvg
-            i += 1
-        }
-        let invRms = 1.0 / ((vSumSq / Float(hSize)) + rmsNormEpsilon).squareRoot()
+        let invT = 1.0 / Float(timeSteps)
         let invScale = 1.0 / scale
 
         var maxLogit: Float = -Float.greatestFiniteMagnitude
@@ -267,9 +255,9 @@ public final class QuantizedEngine: @unchecked Sendable {
         while c < weights.outputDim {
             var sum = Float(weights.bOut[c]) * invScale
             let wOffset = c * weights.maxHiddenDim
-            i = 0
+            var i = 0
             while i < hSize {
-                sum += Float(weights.wOut[wOffset + i]) * invScale * workspace.readoutNorm[i] * invRms
+                sum += Float(weights.wOut[wOffset + i]) * invScale * workspace.readoutSum[i] * invT
                 i += 1
             }
             workspace.logitsFloat[c] = sum

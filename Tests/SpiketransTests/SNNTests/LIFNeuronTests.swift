@@ -190,4 +190,92 @@ final class LIFNeuronTests: XCTestCase {
             i += 1
         }
     }
+
+    // MARK: - 最終層の閾値単位読み出し
+
+    func testReadoutKeepsSubthresholdAndClipsSpike() {
+        XCTAssertEqual(LIFNeuronEngine.scaleReadout(0.4, vTh: 1.0), 0.4, accuracy: 1e-6)
+        XCTAssertEqual(LIFNeuronEngine.scaleReadout(-0.7, vTh: 1.0), -0.7, accuracy: 1e-6)
+        XCTAssertEqual(LIFNeuronEngine.scaleReadout(1.5, vTh: 1.0), 1.0, accuracy: 1e-6)
+        XCTAssertEqual(LIFNeuronEngine.scaleReadout(20.0, vTh: 1.0), 1.0, accuracy: 1e-6)
+        XCTAssertEqual(LIFNeuronEngine.scaleReadout(-20.0, vTh: 1.0), -1.0, accuracy: 1e-6)
+    }
+
+    func testReadoutLayerKeepsRemainderAfterSpike() {
+        let config = LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0)
+        let fired = LIFNeuronEngine.stepReadoutScalarAdaptive(
+            config: config, vPrev: 0.0, sPrev: 0.0, aPrev: 0.0, inputCurrent: 1.5
+        )
+        XCTAssertEqual(fired.sNext, 1.0)
+        XCTAssertEqual(fired.readout, 1.0, accuracy: 1e-6)
+        XCTAssertEqual(fired.vNext, 0.5, accuracy: 1e-6)
+
+        let rest = LIFNeuronEngine.stepReadoutScalarAdaptive(
+            config: config, vPrev: fired.vNext, sPrev: fired.sNext, aPrev: fired.aNext, inputCurrent: 0.0
+        )
+        XCTAssertEqual(rest.sNext, 0.0)
+        XCTAssertEqual(rest.vNext, 0.4, accuracy: 1e-6)
+        XCTAssertEqual(rest.readout, 0.4, accuracy: 1e-6)
+    }
+
+    func testReadoutSIMD8MatchesScalar() {
+        let config = LIFConfig(beta: 0.92, vTh: 1.0, vReset: 0.0, alpha: 2.0)
+        let count = 17
+        var v = [Float](repeating: 0.0, count: count)
+        var s = [Float](repeating: 0.0, count: count)
+        var a = [Float](repeating: 0.0, count: count)
+        var cur = [Float](repeating: 0.0, count: count)
+        var readout = [Float](repeating: 0.0, count: count)
+        var i = 0
+        while i < count {
+            v[i] = sin(Float(i) * 0.4) * 2.0
+            if i % 4 == 0 {
+                s[i] = 1.0
+            }
+            cur[i] = cos(Float(i) * 0.3) * 1.8
+            i += 1
+        }
+        var vRef = v
+        var sRef = s
+        var aRef = a
+        var readoutRef = readout
+        i = 0
+        while i < count {
+            let res = LIFNeuronEngine.stepReadoutScalarAdaptive(
+                config: config, vPrev: vRef[i], sPrev: sRef[i], aPrev: aRef[i], inputCurrent: cur[i]
+            )
+            vRef[i] = res.vNext
+            sRef[i] = res.sNext
+            aRef[i] = res.aNext
+            readoutRef[i] += res.readout
+            i += 1
+        }
+        v.withUnsafeMutableBufferPointer { vBuf in
+            s.withUnsafeMutableBufferPointer { sBuf in
+                a.withUnsafeMutableBufferPointer { aBuf in
+                    cur.withUnsafeBufferPointer { curBuf in
+                        readout.withUnsafeMutableBufferPointer { sumBuf in
+                            LIFNeuronEngine.stepReadoutAdaptiveSIMD8(
+                                config: config,
+                                vPtr: vBuf.baseAddress!,
+                                sPtr: sBuf.baseAddress!,
+                                aPtr: aBuf.baseAddress!,
+                                curPtr: curBuf.baseAddress!,
+                                readoutSumPtr: sumBuf.baseAddress!,
+                                count: count
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        i = 0
+        while i < count {
+            XCTAssertEqual(v[i], vRef[i], accuracy: 1e-6)
+            XCTAssertEqual(s[i], sRef[i], accuracy: 1e-6)
+            XCTAssertEqual(a[i], aRef[i], accuracy: 1e-6)
+            XCTAssertEqual(readout[i], readoutRef[i], accuracy: 1e-6)
+            i += 1
+        }
+    }
 }

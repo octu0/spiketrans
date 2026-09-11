@@ -133,4 +133,46 @@ final class MultiLayerSNNTests: XCTestCase {
         let after = mlxNet.exportWeights()
         XCTAssertNotEqual(after.gammaRMS[0], [Float](repeating: 1.0, count: 64))
     }
+
+    func testOneLayerForwardMatchesBetweenMLXAndPureSwift() {
+        let inputDim = 16
+        let hidden = 32
+        let outputDim = 8
+        let frames = 6
+        let mlxNet = MLXSpikingNetwork(
+            numLayers: 1, inputDim: inputDim, maxHiddenDim: hidden, outputDim: outputDim, timeSteps: 4
+        )
+        mlxNet.wIn = mlxNet.wIn * 3.0
+        let cpuNet = SpikingNetwork(weights: mlxNet.exportWeights())
+        let features = makeFeatures(frames: frames, dim: inputDim)
+        var flat: [Float] = []
+        for frame in features {
+            flat.append(contentsOf: frame)
+        }
+        let trainer = MLXBPTTTrainer(network: mlxNet, bpttWindow: 4)
+        let mlxLogits = trainer.logitsBatch(network: mlxNet, features: MLXArray(flat, [1, frames, inputDim]))
+        eval(mlxLogits)
+        let mlxFlat = mlxLogits.asArray(Float.self)
+
+        var vPrev = [Float](repeating: 0.0, count: hidden)
+        var sPrev = [Float](repeating: 0.0, count: hidden)
+        var aPrev = [Float](repeating: 0.0, count: hidden)
+        var readoutSum = [Float](repeating: 0.0, count: hidden)
+        var logits = [Float](repeating: 0.0, count: outputDim)
+        var probs = [Float](repeating: 0.0, count: outputDim)
+        let scratch = ForwardScratch(maxHiddenDim: hidden)
+        var t = 0
+        while t < frames {
+            cpuNet.forward(
+                features: features[t], vPrev: &vPrev, sPrev: &sPrev, aPrev: &aPrev,
+                readoutSum: &readoutSum, logits: &logits, probabilities: &probs, scratch: scratch
+            )
+            var c = 0
+            while c < outputDim {
+                XCTAssertEqual(logits[c], mlxFlat[t * outputDim + c], accuracy: 1e-3, "frame \(t) class \(c)")
+                c += 1
+            }
+            t += 1
+        }
+    }
 }

@@ -78,6 +78,9 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let alpha = network.lifConfig.alpha
         let rho = network.lifConfig.rho
         let gamma = network.lifConfig.gamma
+        let vMin = LIFNeuronEngine.vClampMin
+        let vMax = LIFNeuronEngine.vClampMax
+        let readoutK = LIFNeuronEngine.readoutClipInThresholdUnits
 
         // 層 0 の入力電流系列: [B, T, hMax] = [B, T, inputDim] @ [inputDim, hMax] + bH
         let currentSeq0 = matmul(features, network.wIn) + network.bH
@@ -86,13 +89,13 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
         var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
 
-        var sAvgList: [MLXArray] = []
-        sAvgList.reserveCapacity(seqLen)
+        var readoutList: [MLXArray] = []
+        readoutList.reserveCapacity(seqLen)
 
         var t = 0
         while t < seqLen {
             let current0_t = currentSeq0[0..., t, 0...]
-            var sSumFinal = MLXArray.zeros([batchSize, hMax])
+            var readoutSum = MLXArray.zeros([batchSize, hMax])
 
             // 切り詰め BPTT: bpttWindow フレームごとに勾配を切り離す。
             if (t % bpttWindow) == 0 {
@@ -107,74 +110,48 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
             var step = 0
             while step < tSteps {
-                // 層 0: 再帰 LIF 層 (時間文脈を担う)
-                let rec0 = matmul(s[0], network.wRec)
-                let totalCurrent0 = current0_t + rec0
-                let vDecayed0 = (v[0] * beta) * (1.0 - s[0])
-                v[0] = clip(vDecayed0 + totalCurrent0, min: LIFNeuronEngine.vClampMin, max: LIFNeuronEngine.vClampMax)
-
-                a[0] = (a[0] * rho) + (s[0] * gamma)
-                let dynVTh0 = vTh + a[0]
-
-                let vRel0 = (v[0] - dynVTh0) * alpha
-                let sSurrogate0 = 0.5 * (vRel0 / (1.0 + abs(vRel0)) + 1.0)
-                let sHard0 = (dynVTh0 .<= v[0]).asType(.float32)
-                s[0] = stopGradient(sHard0 - sSurrogate0) + sSurrogate0
-
-                var prevCurrent = totalCurrent0
-
-                // 層 1 以降: 前層スパイクを受けるフィードフォワード LIF 層。
-                // 前層の発火は疎で電流の分散が小さすぎるため RMSNorm で単位スケールに揃え、
-                // 前層の入力電流を加算する (電流空間の残差)。サロゲート勾配が閾値近傍の
-                // 外で 0 になっても、この加算経路を通って下位層へ勾配が届く
-                var l = 1
+                // 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差。
+                // 最終層だけハードリセットせず、閾値単位の膜電位を読んでから余りを残す。
+                var current = current0_t + matmul(s[0], network.wRec)
+                var l = 0
                 while l < numLayers {
-                    let upperIdx = l - 1
-                    let denseCur = matmul(s[l - 1], network.wLayers[upperIdx]) + network.bHLayers[upperIdx]
+                    if 0 < l {
+                        let upperIdx = l - 1
+                        let denseCur = matmul(s[l - 1], network.wLayers[upperIdx]) + network.bHLayers[upperIdx]
+                        // MLXFast.rmsNorm は valueAndGrad + compile で Metal 生存バッファ上限を超える
+                        let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
+                        let rms = sqrt(meanSq + rmsNormEpsilon)
+                        current = (denseCur / rms) * network.gammaRMS[upperIdx] + current
+                    }
 
-                    // MLXFast.rmsNorm の融合カーネルは valueAndGrad + compile の中で使うと、本番規模
-                    // (B=64, T=256) の初回ステップで Metal の生存バッファ上限 (499000) を超えて落ちる。
-                    // 小さな形のテストでは通るので、ここは素の演算のまま
-                    let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
-                    let rms = sqrt(meanSq + rmsNormEpsilon)
-                    let normCur = (denseCur / rms) * network.gammaRMS[upperIdx]
-
-                    let totalCurrent_l = normCur + prevCurrent
-                    prevCurrent = totalCurrent_l
-
-                    let vDecayed_l = (v[l] * beta) * (1.0 - s[l])
-                    v[l] = clip(vDecayed_l + totalCurrent_l, min: LIFNeuronEngine.vClampMin, max: LIFNeuronEngine.vClampMax)
+                    let isLast = (l + 1) == numLayers
+                    if isLast {
+                        v[l] = clip(v[l] * beta + current, min: vMin, max: vMax)
+                    } else {
+                        v[l] = clip((v[l] * beta) * (1.0 - s[l]) + current, min: vMin, max: vMax)
+                    }
 
                     a[l] = (a[l] * rho) + (s[l] * gamma)
-                    let dynVTh_l = vTh + a[l]
+                    let dynVTh = vTh + a[l]
+                    let vRel = (v[l] - dynVTh) * alpha
+                    let sSurrogate = 0.5 * (vRel / (1.0 + abs(vRel)) + 1.0)
+                    let sHard = (dynVTh .<= v[l]).asType(.float32)
+                    s[l] = stopGradient(sHard - sSurrogate) + sSurrogate
 
-                    let vRel_l = (v[l] - dynVTh_l) * alpha
-                    let sSurrogate_l = 0.5 * (vRel_l / (1.0 + abs(vRel_l)) + 1.0)
-                    let sHard_l = (dynVTh_l .<= v[l]).asType(.float32)
-                    s[l] = stopGradient(sHard_l - sSurrogate_l) + sSurrogate_l
-
+                    if isLast {
+                        readoutSum = readoutSum + clip(v[l] / vTh, min: -readoutK, max: readoutK)
+                        v[l] = clip(v[l] - sHard * vTh, min: vMin, max: vMax)
+                    }
                     l += 1
                 }
-
-                // 最終層の膜電位を積算する (膜電位読み出し)。スパイクの 0/1 は閾値以下の情報を
-                // 捨てるが、膜電位はそれを保つ。出力層は発火しないので線形層で読む
-                sSumFinal = sSumFinal + v[numLayers - 1]
                 step += 1
             }
 
-            // 膜電位は ±20 まで振れてスパイク (0/1) より桁が大きく、そのまま線形層に入れると
-            // 損失が発散する。上位層の電流と同じく RMSNorm で単位スケールに揃える (利得は wOut が吸収)
-            let vAvg_t = sSumFinal / Float(tSteps)
-            let vMeanSq = mean(vAvg_t * vAvg_t, axis: -1, keepDims: true)
-            let sAvg_t = vAvg_t / sqrt(vMeanSq + rmsNormEpsilon)
-            sAvgList.append(sAvg_t)
+            readoutList.append(readoutSum / Float(tSteps))
             t += 1
         }
 
-        // [B, T, hMax]
-        let sAvgSeq = stacked(sAvgList, axis: 1)
-
-        return matmul(sAvgSeq, network.wOut) + network.bOut
+        return matmul(stacked(readoutList, axis: 1), network.wOut) + network.bOut
     }
 
     /// バッチ（複数発話）に対するフレーム整列教師の交差エントロピー損失

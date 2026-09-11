@@ -59,6 +59,27 @@ public enum LIFNeuronEngine {
     public static let vClampMin: Float = -20.0
     public static let vClampMax: Float = 20.0
 
+    /// 読み出しのクリップ幅 (V / vTh)。
+    /// 閾値下は (-1, 1) のアナログ、発火は 1.0。±20 の飽和を線形層に入れない。
+    public static let readoutClipInThresholdUnits: Float = 1.0
+
+    /// 膜電位を閾値単位にして読み出し用にクリップする。
+    @inline(__always)
+    public static func scaleReadout(_ v: Float, vTh: Float) -> Float {
+        let k = readoutClipInThresholdUnits
+        var scaled: Float = 0.0
+        if vTh != 0.0 {
+            scaled = v / vTh
+        }
+        if scaled < -k {
+            return -k
+        }
+        if k < scaled {
+            return k
+        }
+        return scaled
+    }
+
     @inline(__always)
     public static func clampMembrane(_ v: Float) -> Float {
         if v < vClampMin {
@@ -69,6 +90,7 @@ public enum LIFNeuronEngine {
         }
         return v
     }
+
     /// 1 ニューロンのスカラー更新ステップ
     @inline(__always)
     public static func stepScalar(
@@ -106,12 +128,8 @@ public enum LIFNeuronEngine {
         return (vNext: vNext, sNext: sNext, aNext: aNext)
     }
 
-    /// ALIF 状態を SIMD8 で一括更新する。
-    ///
-    /// 状態配列 (v, s, a) をポインタ経由で直接更新する。層ごとの状態は 1 本の配列の
-    /// 区間なので、呼び出し側が先頭ポインタをずらして層を選ぶ。spikeSumPtr が nil の
-    /// 層は積算しない (リードアウトに使うのは最終層だけ)。
-    /// 演算はニューロンごとに独立なので、スカラー版と結果はビット一致する。
+    /// 隠れ層の ALIF を SIMD8 で一括更新する (発火時ハードリセット)。
+    /// 層ごとの状態は 1 本の配列の区間なので、呼び出し側が先頭ポインタをずらす。
     @inline(__always)
     public static func stepAdaptiveSIMD8(
         config: LIFConfig,
@@ -119,7 +137,6 @@ public enum LIFNeuronEngine {
         sPtr: UnsafeMutablePointer<Float>,
         aPtr: UnsafeMutablePointer<Float>,
         curPtr: UnsafePointer<Float>,
-        spikeSumPtr: UnsafeMutablePointer<Float>?,
         count: Int
     ) {
         let limit = count - (count % 8)
@@ -159,22 +176,6 @@ public enum LIFNeuronEngine {
             let dynVTh = vThVec + aNext
             let sNext = zeroVec.replacing(with: oneVec, where: dynVTh .<= vNext)
 
-            switch spikeSumPtr {
-            case .some(let sumPtr):
-                let sumPrev = SIMD8<Float>(
-                    sumPtr[i+0], sumPtr[i+1], sumPtr[i+2], sumPtr[i+3],
-                    sumPtr[i+4], sumPtr[i+5], sumPtr[i+6], sumPtr[i+7]
-                )
-                let sumNext = sumPrev + sNext
-                var lane = 0
-                while lane < 8 {
-                    sumPtr[i+lane] = sumNext[lane]
-                    lane += 1
-                }
-            case .none:
-                break
-            }
-
             var lane = 0
             while lane < 8 {
                 vPtr[i+lane] = vNext[lane]
@@ -195,12 +196,121 @@ public enum LIFNeuronEngine {
             vPtr[i] = res.vNext
             sPtr[i] = res.sNext
             aPtr[i] = res.aNext
-            switch spikeSumPtr {
-            case .some(let sumPtr):
-                sumPtr[i] += res.sNext
-            case .none:
-                break
+            i += 1
+        }
+    }
+
+    /// 最終層の 1 ニューロン: リークのみ → 読み出し → subtractive reset。
+    /// 発火の商はクリップで 1.0、余りは膜電位に残して次の内部ステップへ渡す。
+    @inline(__always)
+    public static func stepReadoutScalarAdaptive(
+        config: LIFConfig,
+        vPrev: Float,
+        sPrev: Float,
+        aPrev: Float,
+        inputCurrent: Float
+    ) -> (vNext: Float, sNext: Float, aNext: Float, readout: Float) {
+        let vIntegrated = clampMembrane(config.beta * vPrev + inputCurrent)
+        let aNext = (config.rho * aPrev) + (config.gamma * sPrev)
+        let dynVTh = config.vTh + aNext
+        var sNext: Float = 0.0
+        if dynVTh <= vIntegrated {
+            sNext = 1.0
+        }
+        let readout = scaleReadout(vIntegrated, vTh: config.vTh)
+        let vNext = clampMembrane(vIntegrated - sNext * config.vTh)
+        return (vNext: vNext, sNext: sNext, aNext: aNext, readout: readout)
+    }
+
+    /// 最終層の SIMD8 更新。隠れ層のハードリセット LIF とは別に、余りを残す。
+    @inline(__always)
+    public static func stepReadoutAdaptiveSIMD8(
+        config: LIFConfig,
+        vPtr: UnsafeMutablePointer<Float>,
+        sPtr: UnsafeMutablePointer<Float>,
+        aPtr: UnsafeMutablePointer<Float>,
+        curPtr: UnsafePointer<Float>,
+        readoutSumPtr: UnsafeMutablePointer<Float>,
+        count: Int
+    ) {
+        let limit = count - (count % 8)
+        let betaVec = SIMD8<Float>(repeating: config.beta)
+        let oneVec = SIMD8<Float>(repeating: 1.0)
+        let rhoVec = SIMD8<Float>(repeating: config.rho)
+        let gammaVec = SIMD8<Float>(repeating: config.gamma)
+        let vThVec = SIMD8<Float>(repeating: config.vTh)
+        let lowVec = SIMD8<Float>(repeating: vClampMin)
+        let highVec = SIMD8<Float>(repeating: vClampMax)
+        let zeroVec = SIMD8<Float>(repeating: 0.0)
+        let k = readoutClipInThresholdUnits
+        let negKVec = SIMD8<Float>(repeating: -k)
+        let posKVec = SIMD8<Float>(repeating: k)
+        var invThVec = SIMD8<Float>(repeating: 0.0)
+        if config.vTh != 0.0 {
+            invThVec = SIMD8<Float>(repeating: 1.0 / config.vTh)
+        }
+
+        var i = 0
+        while i < limit {
+            let vPrev = SIMD8<Float>(
+                vPtr[i+0], vPtr[i+1], vPtr[i+2], vPtr[i+3],
+                vPtr[i+4], vPtr[i+5], vPtr[i+6], vPtr[i+7]
+            )
+            let sPrev = SIMD8<Float>(
+                sPtr[i+0], sPtr[i+1], sPtr[i+2], sPtr[i+3],
+                sPtr[i+4], sPtr[i+5], sPtr[i+6], sPtr[i+7]
+            )
+            let aPrev = SIMD8<Float>(
+                aPtr[i+0], aPtr[i+1], aPtr[i+2], aPtr[i+3],
+                aPtr[i+4], aPtr[i+5], aPtr[i+6], aPtr[i+7]
+            )
+            let inCur = SIMD8<Float>(
+                curPtr[i+0], curPtr[i+1], curPtr[i+2], curPtr[i+3],
+                curPtr[i+4], curPtr[i+5], curPtr[i+6], curPtr[i+7]
+            )
+
+            let vRaw = (betaVec * vPrev) + inCur
+            var vIntegrated = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
+            vIntegrated = vIntegrated.replacing(with: highVec, where: highVec .< vIntegrated)
+            let aNext = (rhoVec * aPrev) + (gammaVec * sPrev)
+            let dynVTh = vThVec + aNext
+            let sNext = zeroVec.replacing(with: oneVec, where: dynVTh .<= vIntegrated)
+
+            var scaled = vIntegrated * invThVec
+            scaled = scaled.replacing(with: negKVec, where: scaled .< negKVec)
+            scaled = scaled.replacing(with: posKVec, where: posKVec .< scaled)
+            let sumPrev = SIMD8<Float>(
+                readoutSumPtr[i+0], readoutSumPtr[i+1], readoutSumPtr[i+2], readoutSumPtr[i+3],
+                readoutSumPtr[i+4], readoutSumPtr[i+5], readoutSumPtr[i+6], readoutSumPtr[i+7]
+            )
+            let sumNext = sumPrev + scaled
+
+            let vSub = vIntegrated - (sNext * vThVec)
+            var vNext = vSub.replacing(with: lowVec, where: vSub .< lowVec)
+            vNext = vNext.replacing(with: highVec, where: highVec .< vNext)
+
+            var lane = 0
+            while lane < 8 {
+                vPtr[i+lane] = vNext[lane]
+                sPtr[i+lane] = sNext[lane]
+                aPtr[i+lane] = aNext[lane]
+                readoutSumPtr[i+lane] = sumNext[lane]
+                lane += 1
             }
+            i += 8
+        }
+        while i < count {
+            let res = stepReadoutScalarAdaptive(
+                config: config,
+                vPrev: vPtr[i],
+                sPrev: sPtr[i],
+                aPrev: aPtr[i],
+                inputCurrent: curPtr[i]
+            )
+            vPtr[i] = res.vNext
+            sPtr[i] = res.sNext
+            aPtr[i] = res.aNext
+            readoutSumPtr[i] += res.readout
             i += 1
         }
     }
