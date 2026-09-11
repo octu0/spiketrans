@@ -134,6 +134,31 @@ final class MultiLayerSNNTests: XCTestCase {
         XCTAssertNotEqual(after.gammaRMS[0], [Float](repeating: 1.0, count: 64))
     }
 
+    /// 2 ニューロン・1 ステップで、読み出しが机上の式どおりロジットになることを固定する。
+    ///
+    /// ニューロン 0 は I=20 でクリップ飽和、ニューロン 1 は I=0.4 で沈黙。
+    /// wOut = 1、bOut = 0 ならロジットは読み出しの和そのもの。
+    ///
+    /// - スパイク回数だけ読むと 1 + 0 = 1.0（閾値下 0.4 が消える）
+    /// - 膜電位を生で足すと 20 + 0.4 = 20.4（c628b90 が発散した桁）
+    /// - clip(v/vTh, -1, 1) なら 1.0 + 0.4 = 1.4
+    func testLastLayerLogitIsThresholdUnitsNotRawVoltageOrSpikeCount() {
+        let net = makeTwoNeuronReadoutProbe()
+        let logit = swiftLogit(network: net)
+        XCTAssertEqual(logit, 1.4, accuracy: 1e-4)
+        XCTAssertGreaterThan(abs(logit - 1.0), 0.2, "subthreshold 0.4 must reach the logit")
+        XCTAssertGreaterThan(abs(logit - 20.4), 10.0, "raw ±20 membrane must not reach the logit")
+
+        let mlxNet = MLXSpikingNetwork(weights: net.exportWeights())
+        let trainer = MLXBPTTTrainer(network: mlxNet, bpttWindow: 4)
+        let mlxLogits = trainer.logitsBatch(
+            network: mlxNet,
+            features: MLXArray([Float](repeating: 0.0, count: 1), [1, 1, 1])
+        )
+        eval(mlxLogits)
+        XCTAssertEqual(mlxLogits.asArray(Float.self)[0], 1.4, accuracy: 1e-3)
+    }
+
     func testOneLayerForwardMatchesBetweenMLXAndPureSwift() {
         let inputDim = 16
         let hidden = 32
@@ -174,5 +199,55 @@ final class MultiLayerSNNTests: XCTestCase {
             }
             t += 1
         }
+    }
+
+    /// wIn=wRec=0。電流はバイアスだけ。timeSteps=1 で読み出しが 1 回分の clip(v/vTh)。
+    private func makeTwoNeuronReadoutProbe() -> SpikingNetwork {
+        let net = SpikingNetwork(
+            numLayers: 1,
+            inputDim: 1,
+            maxHiddenDim: 2,
+            outputDim: 1,
+            timeSteps: 1,
+            lifConfig: LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0)
+        )
+        var i = 0
+        while i < net.pWIn.data.count {
+            net.pWIn.data[i] = 0.0
+            i += 1
+        }
+        i = 0
+        while i < net.pWRec.data.count {
+            net.pWRec.data[i] = 0.0
+            i += 1
+        }
+        net.pBH.data[0] = 20.0
+        net.pBH.data[1] = 0.4
+        net.pWOut.data[0] = 1.0
+        net.pWOut.data[1] = 1.0
+        net.pBOut.data[0] = 0.0
+        net.rebuildInferenceLayout()
+        return net
+    }
+
+    private func swiftLogit(network: SpikingNetwork) -> Float {
+        var vPrev = [Float](repeating: 0.0, count: 2)
+        var sPrev = [Float](repeating: 0.0, count: 2)
+        var aPrev = [Float](repeating: 0.0, count: 2)
+        var readoutSum = [Float](repeating: 0.0, count: 2)
+        var logits = [Float](repeating: 0.0, count: 1)
+        var probs = [Float](repeating: 0.0, count: 1)
+        let scratch = ForwardScratch(maxHiddenDim: 2)
+        network.forward(
+            features: [0.0],
+            vPrev: &vPrev,
+            sPrev: &sPrev,
+            aPrev: &aPrev,
+            readoutSum: &readoutSum,
+            logits: &logits,
+            probabilities: &probs,
+            scratch: scratch
+        )
+        return logits[0]
     }
 }

@@ -192,10 +192,16 @@ final class LIFNeuronTests: XCTestCase {
     }
 
     // MARK: - 最終層の閾値単位読み出し
+    //
+    // c628b90 は ±20 の膜電位を RMSNorm して線形層へ渡し、38 万件学習の 3 epoch 目で
+    // CTC 損失が 1e25 になった。スパイク回数に戻すと閾値下 (0.4) は 0 になる。
+    // 正しい読み出しは clip(v/vTh, -1, 1): 沈黙はアナログ、発火は 1.0、飽和も 1.0。
 
     func testReadoutKeepsSubthresholdAndClipsSpike() {
+        // 沈黙: スパイク回数なら 0。膜電位なら 0.4 のまま
         XCTAssertEqual(LIFNeuronEngine.scaleReadout(0.4, vTh: 1.0), 0.4, accuracy: 1e-6)
         XCTAssertEqual(LIFNeuronEngine.scaleReadout(-0.7, vTh: 1.0), -0.7, accuracy: 1e-6)
+        // 発火の商は 1.0。1.5 もクリップ上限 20 も同じ 1.0 で、±20 は線形層に入らない
         XCTAssertEqual(LIFNeuronEngine.scaleReadout(1.5, vTh: 1.0), 1.0, accuracy: 1e-6)
         XCTAssertEqual(LIFNeuronEngine.scaleReadout(20.0, vTh: 1.0), 1.0, accuracy: 1e-6)
         XCTAssertEqual(LIFNeuronEngine.scaleReadout(-20.0, vTh: 1.0), -1.0, accuracy: 1e-6)
@@ -203,6 +209,7 @@ final class LIFNeuronTests: XCTestCase {
 
     func testReadoutLayerKeepsRemainderAfterSpike() {
         let config = LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0)
+        // I=1.5 → 発火。ハードリセットなら次は 0。subtractive なら余り 0.5 が残る
         let fired = LIFNeuronEngine.stepReadoutScalarAdaptive(
             config: config, vPrev: 0.0, sPrev: 0.0, aPrev: 0.0, inputCurrent: 1.5
         )
