@@ -65,6 +65,7 @@ fastlane/test_output
 .vscode/settings.json
 .tmp/
 .agents/
+.claude/
 .antigravitycli/*
 
 ./script/benchmark/benchmark_runner
