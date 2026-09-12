@@ -1,6 +1,6 @@
 import Foundation
 
-/// DSP 各段が共有する事前確保バッファ。ハミング窓は `maxFrameSize` 点（既定 1024）。
+/// DSP 各段が共有する事前確保バッファ。ハミング窓は `maxFrameSize`
 public final class DSPWorkspace: @unchecked Sendable {
     public let maxFrameSize: Int
     public let lpcOrder: Int

@@ -1,6 +1,5 @@
 import Foundation
 
-/// 統合学習サマリー
 public struct TrainingSummary: Sendable {
     public let acousticEpochs: [EpochResult]
     public let languageEpochs: [EpochResult]
@@ -99,6 +98,7 @@ public final class Trainer: @unchecked Sendable {
 /// 推論実行精度モード
 public enum ExecutionPrecision: String, Sendable, CaseIterable {
     case float32 = "Float32"
+    case float16 = "Float16"
     case int32   = "Int32"
     case int16   = "Int16"
 }
@@ -129,6 +129,12 @@ extension Trainer {
         switch precision {
         case .float32:
             break
+        case .float16:
+            let qWeights = QuantizedEngine.quantize(
+                network: acousticTrainer.network,
+                config: .float16Config()
+            )
+            qEngine = QuantizedEngine(weights: qWeights, timeSteps: acousticTrainer.network.timeSteps)
         case .int32:
             let qWeights = QuantizedEngine.quantize(
                 network: acousticTrainer.network,

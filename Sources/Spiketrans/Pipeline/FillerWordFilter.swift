@@ -2,7 +2,7 @@ import Foundation
 
 /// フィラーフィルタの動作モード
 public enum FillerFilterMode: Sendable, Equatable {
-    case remove       // フィラーを完全に除去
+    case remove       // フィラーを除去
     case mark         // フィラーをマーキング (例: "(えー)")
     case disabled     // フィルタリングを行わない
 }
@@ -258,7 +258,7 @@ public struct FillerWordFilter: Sendable {
             }
         }
 
-        // 先頭に残った不要な読点・句点・空白のサニタイズ (O(1) サブストリングトリミング)
+        // 先頭に残った不要な読点・句点・空白のサニタイズ
         var slice = output[...]
         trimLeading: while let first = slice.first {
             switch first {

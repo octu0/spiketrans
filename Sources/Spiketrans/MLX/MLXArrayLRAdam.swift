@@ -13,9 +13,9 @@ public struct ArrayLRAdamState: Updatable {
     }
 }
 
-/// 学習率を MLXArray で持つ Adam (バイアス補正なし。更新式は mlx-swift の Adam と同じ)。
+/// 学習率を MLXArray で持つ Adam (バイアス補正なし)。
 ///
-/// compile() した学習ステップに学習率を入力配列として渡すためのもの。mlx-swift の
+/// compile() した学習ステップに学習率を入力配列として渡すためのもの。
 /// Adam は学習率が Float で、compile のトレース時の値がグラフに焼き込まれるため、
 /// キャッシュした関数を使い続けるとコサインスケジュールが効かなくなる。
 /// OptimizerBase は他モジュールから継承できない (初期化子が internal) ので Optimizer を直接実装する
@@ -40,8 +40,7 @@ public final class ArrayLRAdam: Optimizer {
         let (b1, b2) = betas
         let lr = learningRate
         let epsValue = eps
-        let (newParameters, newStates) = gradients.mapValues(model.parameters(), stateStorage) {
-            (gradient: MLXArray, parameter: MLXArray?, state: ArrayLRAdamState?) -> (MLXArray, ArrayLRAdamState?) in
+        let (newParameters, newStates) = gradients.mapValues(model.parameters(), stateStorage) { (gradient: MLXArray, parameter: MLXArray?, state: ArrayLRAdamState?) -> (MLXArray, ArrayLRAdamState?) in
             let p = parameter!
             let mPrev: MLXArray
             let vPrev: MLXArray

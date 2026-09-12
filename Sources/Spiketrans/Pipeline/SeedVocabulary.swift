@@ -5,9 +5,9 @@ public struct SeedVocabulary: Sendable {
     /// かな漢字変換用シードエントリ一覧
     public static let entries: [KanaKanjiEntry] = [
         // MARK: - 略称・通称 (Colloquial & Abbreviations)
-        KanaKanjiEntry(reading: "えあびー", surface: "AirBnB", frequency: 100),
-        KanaKanjiEntry(reading: "えあびーあんどびー", surface: "AirBnB", frequency: 100),
-        KanaKanjiEntry(reading: "えあびーえぬびー", surface: "AirBnB", frequency: 100),
+        KanaKanjiEntry(reading: "えあびー", surface: "Airbnb", frequency: 100),
+        KanaKanjiEntry(reading: "えあびーあんどびー", surface: "Airbnb", frequency: 100),
+        KanaKanjiEntry(reading: "えあびーえぬびー", surface: "Airbnb", frequency: 100),
         KanaKanjiEntry(reading: "めすか", surface: "メルカリ", frequency: 100),
         KanaKanjiEntry(reading: "めるかり", surface: "メルカリ", frequency: 100),
         KanaKanjiEntry(reading: "めるかり", surface: "Mercari", frequency: 80),

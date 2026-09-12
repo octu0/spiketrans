@@ -84,8 +84,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         self.importWeights(from: weights)
     }
 
-    /// Pure Swift の SpikingNetworkWeights から重みをインポート。
-    /// Pure Swift 側は [出力, 入力] の行優先なので転置して持つ
+    /// SpikingNetworkWeights から重みをインポート。
+    /// [出力, 入力] の行優先なので転置して持つ
     public func importWeights(from data: SpikingNetworkWeights) {
         let hSize = data.maxHiddenDim
         self.wIn = MLXArray(data.wIn, [hSize, data.inputDim]).transposed()
@@ -108,7 +108,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         eval(arraysToEval)
     }
 
-    /// Pure Swift の SpikingNetworkWeights へ重みをエクスポート
+    /// SpikingNetworkWeights へ重みをエクスポート
     public func exportWeights(vocabulary: TextVocabulary? = nil) -> SpikingNetworkWeights {
         var arraysToEval: [MLXArray] = [self.wIn, self.wRec, self.bH, self.wOut, self.bOut]
         var l = 0

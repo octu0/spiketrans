@@ -92,7 +92,6 @@ public final class FeatureDiskCache: @unchecked Sendable {
         return true
     }
 
-    /// 64-bit FNV-1a ハッシュ計算 (高速かつ決定論的)
     private static func fnv1a64(_ string: String, seed: UInt64) -> UInt64 {
         var hash = seed
         for byte in string.utf8 {
@@ -115,7 +114,7 @@ public final class FeatureDiskCache: @unchecked Sendable {
         return "\(baseDirectory)/\(prefix1)/\(prefix2)/\(hex).feat"
     }
 
-    /// キャッシュファイルのヘッダー情報からフレーム数のみを高速取得 (32 バイト読込)
+    /// キャッシュファイルのヘッダー情報からフレーム数のみを取得
     ///
     /// データセット初期化時に全 WAV を展開することなく、瞬時にフレーム数を確定する
     public func getFrameCount(path: String, frameStack: Int) -> Int? {
@@ -272,7 +271,7 @@ public final class FeatureDiskCache: @unchecked Sendable {
         return false
     }
 
-    /// 指定されたフレーム数とスタック数におけるキャッシュファイル容量（バイト数）を算出
+    /// 指定されたフレーム数とスタック数におけるキャッシュファイル容量
     public static func estimateFileBytes(frameCount: Int, frameStack: Int) -> Int64 {
         let fDim = StreamingFeatureFrontEnd.tapDim * frameStack
         let (elemCount, overflow1) = frameCount.multipliedReportingOverflow(by: fDim)

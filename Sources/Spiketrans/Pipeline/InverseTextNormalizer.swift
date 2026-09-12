@@ -34,6 +34,7 @@ public struct InverseTextNormalizer: Sendable {
         ("よんがつ", 4),
         ("ごがつ", 5),
         ("ろくがつ", 6),
+        ("ひちがつ", 7), // 方言
         ("しちがつ", 7),
         ("なながつ", 7),
         ("はちがつ", 8),
@@ -68,6 +69,7 @@ public struct InverseTextNormalizer: Sendable {
         ("ごふん", 5),
         ("ろっぷん", 6),
         ("ななふん", 7),
+        ("しちふん", 7),
         ("はっぷん", 8),
         ("きゅうふん", 9)
     ]
