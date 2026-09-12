@@ -9,7 +9,7 @@ public final class FeatureDiskCache: @unchecked Sendable {
     /// 32 バイト固定ヘッダー定義およびバリデーション
     private struct Header {
         static let magic: UInt32 = 0x53504B46 // "SPKF"
-        static let version: UInt32 = 2
+        static let version: UInt32 = 1
         static let size = 32
 
         let frameStack: Int

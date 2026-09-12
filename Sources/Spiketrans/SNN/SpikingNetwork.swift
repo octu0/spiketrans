@@ -32,7 +32,7 @@ public final class SpikingNetwork: @unchecked Sendable {
     public let pWOut: Parameter        // [outputDim, maxHiddenDim]
     public let pBOut: Parameter
 
-    /// 音響本線の `inputDim` は `StreamingFeatureFrontEnd.acousticInputDim()` (既定 264 = 132 × 2)。
+    /// 音響本線の `inputDim` は `StreamingFeatureFrontEnd.acousticInputDim()` (既定 512)。
     public init(
         numLayers: Int = 1,
         inputDim: Int = 64,

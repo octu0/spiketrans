@@ -409,11 +409,13 @@ final class FeatureDiskCacheTests: XCTestCase {
         let frameStack = 4
         let numFrames = 25
         let estimated = FeatureDiskCache.estimateFileBytes(frameCount: numFrames, frameStack: frameStack)
-        let frameDim = StreamingFeatureFrontEnd.tapDim * frameStack
-        XCTAssertEqual(estimated, Int64(32 + numFrames * frameDim * MemoryLayout<Float>.size))
 
+        // 128 * 4 = 512 次元, 512 * 4 = 2048 バイト/フレーム, 25 フレーム = 51,200 バイト + 32 バイトヘッダー = 51,232 バイト
+        XCTAssertEqual(estimated, 51232)
+
+        // 実際にディスクへ書き込み、ファイル実バイト数と一致することを検証
         let cache = FeatureDiskCache(baseDirectory: tempDir)
-        let dummy = [[Float]](repeating: [Float](repeating: 1.0, count: frameDim), count: numFrames)
+        let dummy = [[Float]](repeating: [Float](repeating: 1.0, count: 512), count: numFrames)
         let testPath = "/path/to/estimate_test.wav"
         let saved = cache.save(path: testPath, frameStack: frameStack, features: dummy)
         XCTAssertTrue(saved)
