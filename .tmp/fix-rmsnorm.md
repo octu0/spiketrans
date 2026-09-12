@@ -218,7 +218,27 @@ WavPCM.decode(...)          どちらの経路も同じモノラル Float
 
 ---
 
-## 9. マージ後に残る仕事（この PR に入れない）
+## 9. `@inline(__always)` を付ける範囲
+
+LIF / SIMD / Filterbank / FFT には既に付いている。足りなかったのは DSP のホップ単位の小関数と PCM デコードの内側である。
+
+超低遅延エンコーダでは全関数に付けた方が LLVM より速いことが多かった。あれは 48 kHz のサンプルループが小さく閉じていて、関数境界が LICM と SIMD を止めていた。SpikeTrans はそうではない。
+
+- 学習 CTC は MLX / Metal。Swift の inline は効かない
+- `SpikingNetwork.forward` は 10 ms に 1 回で、本体が太い。強制すると I キャッシュが悪化する
+- 同一モジュールの `private` は WMO が既定でインラインする
+- `mictrans` からライブラリをまたぐなら `@inlinable` が必要で、`__always` だけでは本体が相手モジュールに出ない
+
+付けたのは次だけである。小さい、ループの中、LLVM がサイズで躊躇し得る、の三つが揃うところ。
+
+- `StreamingFeatureFrontEnd`: `gainForRMS`, `pushRawFrame`, `updateGain`, `applyPreemphasis`, `ingestMelFromPreemph`, `writeThreeTap`, `pushTapIntoStack`
+- `WavPCM.decode` とその 16/24/32-bit・float 本体、`int16LE` / `int32LE` / `isChunk`
+
+`WavFormat.parse` / `read`、`FileHandle` の読み、`forward`、`predict` には付けない。
+
+---
+
+## 10. マージ後に残る仕事（この PR に入れない）
 
 1. 特徴量キャッシュなしの学習時間。38 万件は `--cache-features` が前提。ヘルプにも推奨と書いてある。
 2. GPU CTC の番兵混入ガード。CPU 側は `-inf` を `uCount * 5` に置き換えている。GPU 側にも同じ除外があれば、誤ラベル 1 件で epoch 平均が死なない。

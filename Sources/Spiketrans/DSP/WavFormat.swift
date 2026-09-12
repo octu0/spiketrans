@@ -197,6 +197,7 @@ enum WavPCM {
     static let pcmScale: Float = 1.0 / 32768.0
 
     /// `raw` は data チャンク先頭。書いたモノラルサンプル数を返す。
+    @inline(__always)
     static func decode(
         raw: UnsafePointer<UInt8>,
         byteCount: Int,
@@ -230,6 +231,7 @@ enum WavPCM {
         return totalSamples
     }
 
+    @inline(__always)
     private static func decodeWideInteger(
         raw: UnsafePointer<UInt8>,
         dst: UnsafeMutablePointer<Float>,
@@ -260,6 +262,7 @@ enum WavPCM {
         }
     }
 
+    @inline(__always)
     private static func decodeFloat32(
         raw: UnsafePointer<UInt8>,
         dst: UnsafeMutablePointer<Float>,
@@ -291,6 +294,7 @@ enum WavPCM {
         }
     }
 
+    @inline(__always)
     private static func decodeMono16(
         raw: UnsafePointer<UInt8>,
         dst: UnsafeMutablePointer<Float>,
@@ -329,6 +333,7 @@ enum WavPCM {
         }
     }
 
+    @inline(__always)
     private static func decodeStereo16(
         raw: UnsafePointer<UInt8>,
         dst: UnsafeMutablePointer<Float>,
@@ -350,22 +355,27 @@ enum WavPCM {
     }
 }
 
+@inline(__always)
 private func isChunk(_ bytes: [UInt8], _ offset: Int, _ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Bool {
     return bytes[offset] == a && bytes[offset + 1] == b && bytes[offset + 2] == c && bytes[offset + 3] == d
 }
 
+@inline(__always)
 private func isChunk(_ data: Data, _ offset: Int, _ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Bool {
     return data[offset] == a && data[offset + 1] == b && data[offset + 2] == c && data[offset + 3] == d
 }
 
+@inline(__always)
 private func int16LE(_ bytes: [UInt8], _ offset: Int) -> Int {
     return Int(bytes[offset]) | (Int(bytes[offset + 1]) << 8)
 }
 
+@inline(__always)
 private func int32LE(_ bytes: [UInt8], _ offset: Int) -> Int {
     return Int(bytes[offset]) | (Int(bytes[offset + 1]) << 8) | (Int(bytes[offset + 2]) << 16) | (Int(bytes[offset + 3]) << 24)
 }
 
+@inline(__always)
 private func int32LE(_ data: Data, _ offset: Int) -> Int {
     return Int(data[offset]) | (Int(data[offset + 1]) << 8) | (Int(data[offset + 2]) << 16) | (Int(data[offset + 3]) << 24)
 }

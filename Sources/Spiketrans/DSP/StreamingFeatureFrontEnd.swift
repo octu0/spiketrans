@@ -16,10 +16,12 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     /// ほぼ無音のクリップでノイズだけを増幅しない上限
     public static let maxGain: Float = 20.0
 
+    @inline(__always)
     public static func acousticInputDim(stack: Int = defaultStack) -> Int {
         return tapDim * max(1, stack)
     }
 
+    @inline(__always)
     public static func gainForRMS(_ rms: Float) -> Float {
         if 1e-6 < rms {
             let g = targetRMS / rms
@@ -104,6 +106,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     }
 
     /// 1 ホップ入れる。`frameStack` 本そろうまで nil。戻り値は次の push / flush で上書きされる。
+    @inline(__always)
     public func pushRawFrame(pcmPtr: UnsafePointer<Float>, count: Int) -> [Float]? {
         if count < frameSize {
             return nil
@@ -144,6 +147,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         return nil
     }
 
+    @inline(__always)
     private func updateGain(pcmPtr: UnsafePointer<Float>, count: Int) {
         if gainFrozen {
             return
@@ -177,6 +181,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         gain = Self.gainForRMS(rms)
     }
 
+    @inline(__always)
     private func applyPreemphasis(pcmPtr: UnsafePointer<Float>, count: Int) {
         let coeff = preemphasisCoeff
         if utteranceFirstFrame {
@@ -193,6 +198,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         streamRawPrev = pcmPtr[hopSize - 1]
     }
 
+    @inline(__always)
     private func ingestMelFromPreemph() -> Bool {
         let mel = preemphBuf.withUnsafeBufferPointer { buf in
             return filterbank.extractFeatures(
@@ -219,6 +225,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         return true
     }
 
+    @inline(__always)
     private func writeThreeTap(prev: [Float], curr: [Float], next: [Float]) {
         var c = 0
         while c < Self.melChannels {
@@ -231,6 +238,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         }
     }
 
+    @inline(__always)
     private func pushTapIntoStack() -> [Float]? {
         let dim = Self.tapDim
         let offset = stackFill * dim
