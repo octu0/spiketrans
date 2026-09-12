@@ -82,8 +82,7 @@ print("==================================================")
 
 // 1. 音声の読み込み
 let loadStart = CFAbsoluteTimeGetCurrent()
-guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
-      let wavData = try? WavParser().parse(bytes: [UInt8](fileData)) else {
+guard let wavData = SpeechDataset.loadWavFile(path: wavPath) else {
     print("エラー: 音声ファイルを読み込めません: \(wavPath)")
     exit(1)
 }

@@ -195,7 +195,30 @@ swift test --filter 'LIFNeuronTests|MultiLayerSNNTests|SpikingNetworkTests|Quant
 
 ---
 
-## 8. マージ後に残る仕事（この PR に入れない）
+## 8. WAV 読みの配線
+
+Go の `io.ReadCloser` をまねた `ReadCloser.swift` は消した。ファイルは `FileHandle`、メモリ上のバイト列は `WavParser.parse(bytes:)` である。
+
+以前はヘッダの解釈が二つあった。`WavParser` はチャンクを歩いて `fmt` / `data` を探す。`WavStreamReader` は先頭 44 バイト固定で、LIST や fact が入った 16-bit ファイルを誤読する。学習は前者、ストリーマは未使用だった。
+
+いまは形式の解釈が一本である。
+
+```
+WavFormat.parse(bytes:)     メモリ。data オフセットを返す
+WavFormat.read(from:handle) ファイル。ハンドルを data 先頭に置く
+WavPCM.decode(...)          どちらの経路も同じモノラル Float
+```
+
+- メモリ: `WavParser.parse(bytes:)` → `WavFormat.parse` → `WavPCM.decode`（テスト、`fromWavPairs`）
+- ファイル: `SpeechDataset.loadWavFile` → `WavStreamReader` → `WavFormat.read` → チャンクごとに `WavPCM.decode`
+
+`loadFeatures`、学習の評価、transcribe / segment / screen / mictrans のファイル入力はすべて `loadWavFile` に寄せた。全ファイルを `Data` に載せてから `[UInt8]` にコピーすることはしない。PCM `[Float]` は特徴抽出のため残る。
+
+証明は `WavStreamReaderTests.testJunkChunkBeforeFmtMatchesParser`（JUNK のあとに fmt がある 16-bit で、パーサとストリーマの PCM が一致）と `testInt24MatchesParser` / `testFloat32MatchesParser`。44 バイト固定のままなら JUNK ファイルはゴミ PCM になる。
+
+---
+
+## 9. マージ後に残る仕事（この PR に入れない）
 
 1. 特徴量キャッシュなしの学習時間。38 万件は `--cache-features` が前提。ヘルプにも推奨と書いてある。
 2. GPU CTC の番兵混入ガード。CPU 側は `-inf` を `uCount * 5` に置き換えている。GPU 側にも同じ除外があれば、誤ラベル 1 件で epoch 平均が死なない。

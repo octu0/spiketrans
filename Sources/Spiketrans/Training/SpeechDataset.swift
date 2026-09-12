@@ -149,6 +149,17 @@ public final class SpeechDataset: @unchecked Sendable {
         )
     }
 
+    /// ファイルから WAV を読む。チャンク探索は `WavStreamReader`（全ファイルを Data に載せない）。
+    public static func loadWavFile(path: String) -> WavData? {
+        do {
+            let reader = try WavStreamReader(filePath: path)
+            defer { try? reader.close() }
+            return try reader.readToEnd()
+        } catch {
+            return nil
+        }
+    }
+
     /// WAV ファイルまたはディスクキャッシュから音響特徴量をロードする
     public static func loadFeatures(
         path: String,
@@ -159,16 +170,14 @@ public final class SpeechDataset: @unchecked Sendable {
         if let c = cache, let cached = c.load(path: path, frameStack: frameStack) {
             var pcm16k: [Float] = []
             if loadPCM {
-                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                   let wav = try? WavParser().parse(bytes: [UInt8](data)) {
+                if let wav = loadWavFile(path: path) {
                     pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
                 }
             }
             return (pcm16k, cached)
         }
 
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let wav = try? WavParser().parse(bytes: [UInt8](data)) else {
+        guard let wav = loadWavFile(path: path) else {
             return ([], [])
         }
         let pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)

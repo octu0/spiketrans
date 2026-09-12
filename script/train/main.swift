@@ -1176,7 +1176,6 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
     )
 }
 
-let parser = WavParser()
 let dummyEval = EvalResult(index: 0, fileId: "", corpus: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0, goldKanaKanji: "", goldKanaKanjiCer: 1.0, goldKanaKanjiCerNoPunct: 1.0, goldExactNoPunct: false)
 
 final class BatchEvalBuffer: @unchecked Sendable {
@@ -1243,8 +1242,7 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
         if FileManager.default.fileExists(atPath: wavPath) != true {
             return
         }
-        guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
-              let wavData = try? parser.parse(bytes: [UInt8](fileData)) else {
+        guard let wavData = SpeechDataset.loadWavFile(path: wavPath) else {
             return
         }
 
@@ -1511,8 +1509,7 @@ if 0 < rawPairs.count {
     while benchIdx < benchCount {
         let pair = rawPairs[benchIdx]
         let wavPath = pair.path
-        if let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
-           let wavData = try? parser.parse(bytes: [UInt8](fileData)) {
+        if let wavData = SpeechDataset.loadWavFile(path: wavPath) {
             let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
             benchAudioSeconds += Double(pcm16k.count) / 16000.0
             benchFeatures.append(SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: Defaults.frameStack))

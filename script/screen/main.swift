@@ -109,8 +109,7 @@ final class Screener {
     let workspace = DSPWorkspace(maxFrameSize: 1024, lpcOrder: dspConfig.lpcOrder, melChannels: dspConfig.melChannels)
 
     func measure(path: String, textLength: Int) -> ScreenStats? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let wav = try? WavParser().parse(bytes: [UInt8](data)) else {
+        guard let wav = SpeechDataset.loadWavFile(path: path) else {
             return nil
         }
         let pcm = SpeechDataset.resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)

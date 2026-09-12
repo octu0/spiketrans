@@ -80,8 +80,7 @@ if FileManager.default.fileExists(atPath: textArg) {
     transcript = t
 }
 
-guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavPath)),
-      let wav = try? WavParser().parse(bytes: [UInt8](fileData)) else {
+guard let wav = SpeechDataset.loadWavFile(path: wavPath) else {
     warn("エラー: 音声を読めません: \(wavPath)")
     exit(1)
 }

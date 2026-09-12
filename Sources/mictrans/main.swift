@@ -856,8 +856,7 @@ let transcriber = Transcriber(
 // MARK: - WAV 入力 (動作確認用)
 
 if wavInputPath.isEmpty != true {
-    guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: wavInputPath)),
-          let wav = try? WavParser().parse(bytes: [UInt8](fileData)) else {
+    guard let wav = SpeechDataset.loadWavFile(path: wavInputPath) else {
         print("エラー: 音声を読み込めません: \(wavInputPath)")
         exit(1)
     }
