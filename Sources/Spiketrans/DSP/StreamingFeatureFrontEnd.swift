@@ -8,13 +8,23 @@ import Foundation
 public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     public static let melChannels = 64
     /// 平滑 64 + 時間差分 64
-    public static let tapDim = 128
-    /// 10 ms hop を 4 本束ねて 40 ms。CTC には 10 ms が細かすぎ、逐次ステップが学習時間に効く
-    public static let defaultStack = 4
+    public static let melTapDim = 128
+    /// logF0, ΔlogF0, 有声, HNR。はし／こうえんの高低は Mel に乗らない
+    public static let prosodyDim = 4
+    public static let tapDim = melTapDim + prosodyDim
+    /// 10 ms hop を 2 本束ねて 20 ms。4 本 (40 ms) だと促音「っ」が潰れる。
+    /// 1 本 (10 ms) は CTC ステップが増えすぎる
+    public static let defaultStack = 2
     /// JSUT 相当の入力電流レンジへ揃える目標 RMS
     public static let targetRMS: Float = 0.05
     /// ほぼ無音のクリップでノイズだけを増幅しない上限
     public static let maxGain: Float = 20.0
+    /// F0 50 Hz → 0、400 Hz → 1 (log スケール)
+    public static let f0RefHz: Float = 50.0
+    public static let f0Span = logf(8.0)
+    /// 自己相関に必要な長さ。既定 frameSize 320 では maxPitchLag 320 だと検出不能
+    public static let pitchWindowSize = 640
+    public static let pitchMaxLag = 200
 
     @inline(__always)
     public static func acousticInputDim(stack: Int = defaultStack) -> Int {
@@ -39,6 +49,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     public let frameSize: Int
 
     private let filterbank: Filterbank
+    private let pitchDetector: PitchDetector
     private let workspace: DSPWorkspace
     private let preemphasisCoeff: Float
 
@@ -47,6 +58,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     private var tapFrame: [Float]
     private var stackBuf: [Float]
     private var preemphBuf: [Float]
+    private var pitchWindow: [Float]
 
     private var hasPrevMel: Bool = false
     private var hasCurrMel: Bool = false
@@ -58,6 +70,9 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     private var gainFrozen: Bool = false
     private var rmsSumSquares: Float = 0.0
     private var rmsSampleCount: Int = 0
+    private var pitchFilled: Int = 0
+    private var prevPitch = HopPitch()
+    private var currPitch = HopPitch()
 
     public init(frameStack: Int = defaultStack, dspConfig: DSPConfig = DSPConfig()) {
         let stack = max(1, frameStack)
@@ -67,16 +82,30 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         self.frameSize = dspConfig.frameSize
         self.preemphasisCoeff = dspConfig.preemphasisCoeff
         self.filterbank = Filterbank(config: dspConfig)
+        self.pitchDetector = PitchDetector(config: DSPConfig(
+            sampleRate: dspConfig.sampleRate,
+            frameSize: Self.pitchWindowSize,
+            hopSize: dspConfig.hopSize,
+            lpcOrder: dspConfig.lpcOrder,
+            melChannels: dspConfig.melChannels,
+            minPitchLag: dspConfig.minPitchLag,
+            maxPitchLag: min(dspConfig.maxPitchLag, Self.pitchMaxLag),
+            preemphasisCoeff: dspConfig.preemphasisCoeff,
+            vadEnergyThresholdRatio: dspConfig.vadEnergyThresholdRatio,
+            vadZcrThreshold: dspConfig.vadZcrThreshold,
+            vadVoicingRatioThreshold: dspConfig.vadVoicingRatioThreshold
+        ))
         self.workspace = DSPWorkspace(
             lpcOrder: dspConfig.lpcOrder,
             melChannels: Self.melChannels,
-            maxPitchLag: dspConfig.maxPitchLag
+            maxPitchLag: max(dspConfig.maxPitchLag, Self.pitchMaxLag)
         )
         self.prevMel = [Float](repeating: 0.0, count: Self.melChannels)
         self.currMel = [Float](repeating: 0.0, count: Self.melChannels)
         self.tapFrame = [Float](repeating: 0.0, count: Self.tapDim)
         self.stackBuf = [Float](repeating: 0.0, count: Self.tapDim * stack)
         self.preemphBuf = [Float](repeating: 0.0, count: dspConfig.frameSize)
+        self.pitchWindow = [Float](repeating: 0.0, count: Self.pitchWindowSize)
     }
 
     /// オフライン用。クリップ RMS が先に分かるとき、以降の走行 RMS 更新を止める。
@@ -93,6 +122,9 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         emittedStackCount = 0
         utteranceFirstFrame = true
         streamRawPrev = 0.0
+        pitchFilled = 0
+        prevPitch = HopPitch()
+        currPitch = HopPitch()
         if gainFrozen != true {
             gain = 1.0
             rmsSumSquares = 0.0
@@ -101,6 +133,11 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         var i = 0
         while i < stackBuf.count {
             stackBuf[i] = 0.0
+            i += 1
+        }
+        i = 0
+        while i < pitchWindow.count {
+            pitchWindow[i] = 0.0
             i += 1
         }
     }
@@ -126,8 +163,10 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         }
         if hasPrevMel != true {
             writeThreeTap(prev: currMel, curr: currMel, next: currMel)
+            writeProsody(prev: currPitch, curr: currPitch)
         } else {
             writeThreeTap(prev: prevMel, curr: currMel, next: currMel)
+            writeProsody(prev: prevPitch, curr: currPitch)
         }
         hasCurrMel = false
         hasPrevMel = false
@@ -207,22 +246,61 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
                 workspace: workspace
             )
         }
+        let pitch = estimatePitch()
         if hasCurrMel != true {
             currMel = mel
+            currPitch = pitch
             hasCurrMel = true
             return false
         }
         if hasPrevMel != true {
             writeThreeTap(prev: currMel, curr: currMel, next: mel)
+            writeProsody(prev: currPitch, curr: currPitch)
             prevMel = currMel
+            prevPitch = currPitch
             currMel = mel
+            currPitch = pitch
             hasPrevMel = true
             return true
         }
         writeThreeTap(prev: prevMel, curr: currMel, next: mel)
+        writeProsody(prev: prevPitch, curr: currPitch)
         prevMel = currMel
+        prevPitch = currPitch
         currMel = mel
+        currPitch = pitch
         return true
+    }
+
+    @inline(__always)
+    private func estimatePitch() -> HopPitch {
+        let hop = hopSize
+        let win = Self.pitchWindowSize
+        if hop < win {
+            var i = 0
+            while i < win - hop {
+                pitchWindow[i] = pitchWindow[i + hop]
+                i += 1
+            }
+        }
+        let srcStart = max(0, frameSize - hop)
+        var d = 0
+        while d < hop {
+            var s: Float = 0.0
+            if srcStart + d < preemphBuf.count {
+                s = preemphBuf[srcStart + d]
+            }
+            pitchWindow[win - hop + d] = s
+            d += 1
+        }
+        pitchFilled = min(win, pitchFilled + hop)
+        if pitchFilled < win {
+            return HopPitch()
+        }
+        let result = pitchWindow.withUnsafeBufferPointer { buf in
+            return pitchDetector.detectPitch(ptr: buf.baseAddress!, count: win, workspace: workspace)
+        }
+        return HopPitch.encode(result)
     }
 
     @inline(__always)
@@ -236,6 +314,19 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
             tapFrame[Self.melChannels + c] = 0.5 * (xNext - xPrev)
             c += 1
         }
+    }
+
+    @inline(__always)
+    private func writeProsody(prev: HopPitch, curr: HopPitch) {
+        let o = Self.melTapDim
+        tapFrame[o + 0] = curr.logF0
+        var delta: Float = 0.0
+        if 0.5 <= curr.voiced && 0.5 <= prev.voiced {
+            delta = curr.logF0 - prev.logF0
+        }
+        tapFrame[o + 1] = delta
+        tapFrame[o + 2] = curr.voiced
+        tapFrame[o + 3] = curr.hnr
     }
 
     @inline(__always)
@@ -254,5 +345,32 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         stackFill = 0
         emittedStackCount += 1
         return stackBuf
+    }
+}
+
+private struct HopPitch {
+    var logF0: Float = 0.0
+    var voiced: Float = 0.0
+    var hnr: Float = 0.0
+
+    static func encode(_ r: PitchResult) -> HopPitch {
+        if r.isVoiced != true || r.f0 <= StreamingFeatureFrontEnd.f0RefHz {
+            return HopPitch()
+        }
+        var logF0 = logf(r.f0 / StreamingFeatureFrontEnd.f0RefHz) / StreamingFeatureFrontEnd.f0Span
+        if logF0 < 0.0 {
+            logF0 = 0.0
+        }
+        if 1.0 < logF0 {
+            logF0 = 1.0
+        }
+        var hnr = r.hnr / 40.0
+        if 1.0 < hnr {
+            hnr = 1.0
+        }
+        if hnr < 0.0 {
+            hnr = 0.0
+        }
+        return HopPitch(logF0: logF0, voiced: 1.0, hnr: hnr)
     }
 }

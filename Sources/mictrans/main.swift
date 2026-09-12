@@ -514,7 +514,7 @@ final class Transcriber: @unchecked Sendable {
         self.minSpeechSamples = Int(minSpeechSeconds * 16000.0)
         self.maxSpeechSamples = Int(maxSpeechSeconds * 16000.0)
 
-        // 束ね数は重みの入力次元から決める (学習と同じ 512 = 128 × 4)
+        // 束ね数は重みの入力次元から決める (学習と同じ tapDim × stack)
         var stack = network.inputDim / StreamingFeatureFrontEnd.tapDim
         if stack < 1 {
             stack = 1

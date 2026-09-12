@@ -404,7 +404,7 @@ let trainConfig = TrainingConfig(
 )
 
 let acousticInputDim = Defaults.acousticInputDim
-print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
+print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel+韻律 × \(Defaults.frameStack) フレーム束ね)")
 
 print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers)")
 
@@ -1616,7 +1616,7 @@ var reportContent = """
 - **評価対象**: `\(datasetPath)` \(evalPairs.count) 発話 (学習セットは間引き / 未学習セットは全件)
 - **モデル**: `-s \(sampleLimit) -e \(epochs)` で学習した直接漢字音響 SNN (学習セット \(sampleLimit) 発話)
 - **第1段 LIF**: beta = \(Defaults.lifConfig.beta), rho = \(Defaults.lifConfig.rho), gamma = \(Defaults.lifConfig.gamma)
-- **特徴量**: \(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね = \(Defaults.acousticInputDim) 次元
+- **特徴量**: \(Defaults.melFrameDim) 次元 3-tap Mel+韻律 × \(Defaults.frameStack) フレーム束ね = \(Defaults.acousticInputDim) 次元
 - **学習**: CTC 損失, 切り詰め BPTT 窓 \(Defaults.bpttWindow), 学習率 \(Defaults.lrMax) → \(Defaults.lrMin)
 - **語彙・かな漢字辞書**: 学習セット \(trainTextLines.count) 件のみから構築 (未学習セットの正解テキストは不使用)
 - **サンプリング**: 48kHz $\to$ 16kHz リサンプリング (アンチエイリアス 3:1 間引き)
