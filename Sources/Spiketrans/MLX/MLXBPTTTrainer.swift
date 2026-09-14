@@ -149,7 +149,12 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                     s[l] = stopGradient(sHard - sSurrogate) + sSurrogate
 
                     if isLast {
-                        readoutSum = readoutSum + clip(v[l] / vTh, min: -readoutK, max: readoutK)
+                        // 読み出しは閾値単位でクリップするが、勾配はクリップ前の値を通す (straight-through)。
+                        // clip の勾配は |v| >= vTh で 0 になり、発火しているニューロンから勾配が流れず
+                        // 学習が 4 倍以上遅くなった (JSUT 20ep 未学習 16.7% → 43.4%)
+                        let scaled = v[l] / vTh
+                        let clipped = clip(scaled, min: -readoutK, max: readoutK)
+                        readoutSum = readoutSum + stopGradient(clipped - scaled) + scaled
                         v[l] = clip(v[l] - sHard * vTh, min: vMin, max: vMax)
                     }
                     l += 1
