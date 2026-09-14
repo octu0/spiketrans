@@ -36,6 +36,15 @@ enum Defaults {
     /// Cosine 学習率スケジュール
     static let lrMax: Float = 0.003
     static let lrMin: Float = 0.0005
+    /// コサイン減衰に使うステップ数の上限。epoch 数を増やしても高い学習率の持続時間が
+    /// 伸びないようにする。38 万件 (1 epoch 約 6,000 ステップ) で lrMax 付近を 4 epoch 超
+    /// 維持すると損失が上がり始めたので、減衰を約 8 epoch で lrMin に到達させる
+    static let lrDecaySteps = 50_000
+    /// epoch 平均損失がこの回数続けて上がったら、最良の重みへ巻き戻して学習率を下げる
+    static let lossRiseEpochs = 2
+    /// 巻き戻しの学習率倍率と、巻き戻しの最大回数 (超えたら学習を打ち切る)
+    static let lrRollbackFactor: Float = 0.5
+    static let maxLRRollbacks = 2
 
     /// LIF 設定。ALIF (gamma > 0) は損失・CER とも悪化したため無効。
     static let lifConfig = LIFConfig(beta: 0.92, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
@@ -581,10 +590,24 @@ if epochs == 0 {
     // 総ステップの 1/50 だが下限を設ける。2000 件 × 20 epoch (640 ステップ) では暖機 12 ステップとなり
     // lr 0.003 で暖機中に発散した。100 万件規模 (暖機 1000 ステップ超) には影響しない
     let warmupSteps = min(max(Defaults.minWarmupSteps, totalSteps / Defaults.warmupStepDivisor), max(1, totalSteps / 2))
-    print("  学習ステップ数: \(totalSteps) (暖機 \(warmupSteps) ステップ)")
+    // 減衰はステップ数で決める。総ステップが上限を超える長い学習では、上限に達した後は lrMin で続ける
+    let decaySteps = min(totalSteps - warmupSteps, Defaults.lrDecaySteps)
+    let scheduleSteps = warmupSteps + decaySteps
+    print("  学習ステップ数: \(totalSteps) (暖機 \(warmupSteps) ステップ、減衰 \(decaySteps) ステップ、以後 lrMin)")
 
     let checkpointInterval = min(Defaults.checkpointEvery, max(1, epochs / 6))
     print("  チェックポイント間隔: \(checkpointInterval) エポックごと")
+
+    // 損失の上昇監視。epoch 平均損失が続けて上がるのは学習率が大きすぎる合図で、
+    // そのまま続けても戻らない (28 epoch で ep4 の 64.2 から ep13 の 69.6 まで上がり、
+    // 最後まで ep4 に戻らなかった)。最良の重みへ巻き戻して学習率を半分にする
+    var bestLoss = Float.greatestFiniteMagnitude
+    var bestEpoch = 0
+    var bestWeights: SpikingNetworkWeights? = nil
+    var prevLoss = Float.greatestFiniteMagnitude
+    var riseStreak = 0
+    var lrScale: Float = 1.0
+    var rollbacks = 0
 
     var globalStep = 0
     var ep = 1
@@ -595,7 +618,7 @@ if epochs == 0 {
         // 数千ステップが 1 秒未満の断片だけで埋まって blank 一色に崩れる
         batchGroups.shuffle()
         var curLR = scheduler.learningRate(
-            step: globalStep + 1, totalSteps: totalSteps, warmupSteps: warmupSteps)
+            step: globalStep + 1, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
 
         var epLossSum: Float = 0.0
         var batchCount = 0
@@ -624,7 +647,7 @@ if epochs == 0 {
 
             globalStep += 1
             curLR = scheduler.learningRate(
-                step: globalStep, totalSteps: totalSteps, warmupSteps: warmupSteps)
+                step: globalStep, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
             mlxTrainer.updateLearningRate(curLR)
 
             let res = mlxTrainer.trainBatchCTC(
@@ -650,6 +673,32 @@ if epochs == 0 {
         let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
         print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
 
+        if avgLoss < bestLoss {
+            bestLoss = avgLoss
+            bestEpoch = ep
+            bestWeights = mlxNet.exportWeights(vocabulary: phoneticVocabulary)
+        }
+        if prevLoss < avgLoss {
+            riseStreak += 1
+        } else {
+            riseStreak = 0
+        }
+        prevLoss = avgLoss
+
+        if Defaults.lossRiseEpochs <= riseStreak {
+            if let best = bestWeights, rollbacks < Defaults.maxLRRollbacks {
+                rollbacks += 1
+                lrScale *= Defaults.lrRollbackFactor
+                riseStreak = 0
+                prevLoss = bestLoss
+                mlxTrainer.rollback(to: best)
+                print("    ↩ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇。epoch \(bestEpoch) の重み (損失 \(String(format: "%.4f", bestLoss))) へ巻き戻し、学習率を \(String(format: "%.2f", lrScale)) 倍にする (\(rollbacks)/\(Defaults.maxLRRollbacks) 回目)")
+            } else {
+                print("    ■ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇し、巻き戻しの回数も使い切ったので学習を打ち切る (最良は epoch \(bestEpoch))")
+                break
+            }
+        }
+
         // 定期チェックポイント: 長時間実行が途中で止まっても成果を失わないようにする。
         // エポック数が少ない大規模学習では 10 エポックごとだと 1 度も保存されないため、
         // 全体の 1/6 を上限に間隔を詰める
@@ -668,6 +717,12 @@ if epochs == 0 {
             }
         }
         ep += 1
+    }
+
+    // 最後の epoch が最良でなければ、最良の重みで終える
+    if let best = bestWeights, bestLoss < prevLoss {
+        mlxNet.importWeights(from: best)
+        print("  最終 epoch より epoch \(bestEpoch) (損失 \(String(format: "%.4f", bestLoss))) の方が良いので、その重みを採用する")
     }
 
     let trainElapsed = CFAbsoluteTimeGetCurrent() - trainStartTime

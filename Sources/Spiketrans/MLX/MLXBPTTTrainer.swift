@@ -51,6 +51,16 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         self.optimizer.learningRate = MLXArray(lr)
     }
 
+    /// 重みを保存済みの状態へ巻き戻す。Adam のモーメントも捨て、
+    /// 古い重みを参照している compile 済みステップも作り直す
+    public func rollback(to weights: SpikingNetworkWeights) {
+        network.importWeights(from: weights)
+        optimizer.resetState()
+        compiledCTCSteps.removeAll()
+        compiledLogitsSteps.removeAll()
+        eval(network, optimizer)
+    }
+
     /// バッチ（複数発話）に対するフォワードとロジット系列 [B, T, outputDim] の計算
     public func logitsBatch(
         network: MLXSpikingNetwork,

@@ -88,24 +88,33 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     /// [出力, 入力] の行優先なので転置して持つ
     public func importWeights(from data: SpikingNetworkWeights) {
         let hSize = data.maxHiddenDim
-        self.wIn = MLXArray(data.wIn, [hSize, data.inputDim]).transposed()
-        self.wRec = MLXArray(data.wRec, [hSize, hSize]).transposed()
-        self.bH = MLXArray(data.bH, [hSize])
-        self.wOut = MLXArray(data.wOut, [data.outputDim, hSize]).transposed()
-        self.bOut = MLXArray(data.bOut, [data.outputDim])
+        // Module は Mirror で見つけたパラメータ配列をキャッシュする。プロパティに新しい MLXArray を
+        // 代入するとキャッシュ側の古い配列が optimizer.update の対象のまま残り、学習が止まる。
+        // update(parameters:) はキャッシュ済みの配列へ in-place に書き込むので、こちらを使う
+        var params = ModuleParameters()
+        params["wIn"] = .value(MLXArray(data.wIn, [hSize, data.inputDim]).transposed())
+        params["wRec"] = .value(MLXArray(data.wRec, [hSize, hSize]).transposed())
+        params["bH"] = .value(MLXArray(data.bH, [hSize]))
+        params["wOut"] = .value(MLXArray(data.wOut, [data.outputDim, hSize]).transposed())
+        params["bOut"] = .value(MLXArray(data.bOut, [data.outputDim]))
 
-        var arraysToEval: [MLXArray] = [self.wIn, self.wRec, self.bH, self.wOut, self.bOut]
+        var layerW: [NestedItem<String, MLXArray>] = []
+        var layerB: [NestedItem<String, MLXArray>] = []
+        var layerG: [NestedItem<String, MLXArray>] = []
         var l = 0
         while l < min(self.wLayers.count, data.wLayers.count) {
-            self.wLayers[l] = MLXArray(data.wLayers[l], [hSize, hSize]).transposed()
-            self.bHLayers[l] = MLXArray(data.bHLayers[l], [hSize])
-            self.gammaRMS[l] = MLXArray(data.gammaRMS[l], [hSize])
-            arraysToEval.append(self.wLayers[l])
-            arraysToEval.append(self.bHLayers[l])
-            arraysToEval.append(self.gammaRMS[l])
+            layerW.append(.value(MLXArray(data.wLayers[l], [hSize, hSize]).transposed()))
+            layerB.append(.value(MLXArray(data.bHLayers[l], [hSize])))
+            layerG.append(.value(MLXArray(data.gammaRMS[l], [hSize])))
             l += 1
         }
-        eval(arraysToEval)
+        if 0 < layerW.count {
+            params["wLayers"] = .array(layerW)
+            params["bHLayers"] = .array(layerB)
+            params["gammaRMS"] = .array(layerG)
+        }
+        self.update(parameters: params)
+        eval(self)
     }
 
     /// SpikingNetworkWeights へ重みをエクスポート

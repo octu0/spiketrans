@@ -36,6 +36,13 @@ public final class ArrayLRAdam: Optimizer {
         return stateStorage.flattenedValues().flatMap { $0.innerState() }
     }
 
+    /// モーメントを 0 に戻す (形は保つ)。重みを巻き戻したあと、壊れた勾配の履歴を引き継がないため
+    public func resetState() {
+        stateStorage = stateStorage.mapValues { state in
+            ArrayLRAdamState(m: MLXArray.zeros(like: state.m), v: MLXArray.zeros(like: state.v))
+        }
+    }
+
     public func update(model: Module, gradients: ModuleParameters) {
         let (b1, b2) = betas
         let lr = learningRate
