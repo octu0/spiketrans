@@ -254,7 +254,7 @@ final class TwoStageDecoderTests: XCTestCase {
             ("すたば", "スターバックス"),
             ("まくど", "マクドナルド"),
             ("めすか", "メルカリ"),
-            ("えあびー", "AirBnB"),
+            ("えあびー", "Airbnb"),
             ("ぐーぐる", "Google")
         ]
 
@@ -274,7 +274,7 @@ final class TwoStageDecoderTests: XCTestCase {
             ("めすか", "メルカリ"),
             ("あいふぉーん", "iPhone"),
             ("おーぷんえーあい", "OpenAI"),
-            ("えあびー", "AirBnB"),
+            ("えあびー", "Airbnb"),
             ("わいふぁい", "WiFi"),
             ("ぐーぐる", "Google"),
             ("あっぷる", "アップル")

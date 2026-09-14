@@ -166,7 +166,7 @@ final class KanjiConverterTests: XCTestCase {
         let openAiTokens = converter.tokenize("OpenAI")
         XCTAssertEqual(openAiTokens.first?.reading, "おーぷんえーあい")
 
-        let airbnbTokens = converter.tokenize("AirBnB")
+        let airbnbTokens = converter.tokenize("Airbnb")
         XCTAssertEqual(airbnbTokens.first?.reading, "えあびー")
 
         // 大文字頭字語 (Acronym) の単文字読み展開

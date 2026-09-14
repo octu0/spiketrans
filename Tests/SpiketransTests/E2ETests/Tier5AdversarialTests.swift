@@ -269,15 +269,17 @@ final class Tier5AdversarialTests: XCTestCase {
         var totalSpikes: Float = 0.0
         var totalPossibleSpikes: Float = 0.0
 
+        // 読み出し積算は閾値単位の膜電位 (アナログ) なので、疎性は発火状態 sPrev で数える
+        // (forward 後の sPrev は最後の内部ステップの発火)
         var step = 0
         while step < 100 {
             net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
             var i = 0
             while i < 256 {
-                totalSpikes += spikeSum[i]
+                totalSpikes += sPrev[i]
                 i += 1
             }
-            totalPossibleSpikes += Float(256 * 4)
+            totalPossibleSpikes += Float(256)
             step += 1
         }
 

@@ -20,7 +20,7 @@ final class KanaKanjiDecoderTests: XCTestCase {
         let mercariEntries = entries.filter { $0.reading == "めすか" && $0.surface == "メルカリ" }
         XCTAssertFalse(mercariEntries.isEmpty)
 
-        let airbnbEntries = entries.filter { $0.reading == "えあびー" && $0.surface == "AirBnB" }
+        let airbnbEntries = entries.filter { $0.reading == "えあびー" && $0.surface == "Airbnb" }
         XCTAssertFalse(airbnbEntries.isEmpty)
 
         // 和英併記エントリの存在確認
@@ -74,7 +74,7 @@ final class KanaKanjiDecoderTests: XCTestCase {
 
         let airbnbHits = dict.lookupExact(reading: "えあびー")
         XCTAssertFalse(airbnbHits.isEmpty)
-        XCTAssertEqual(airbnbHits.first?.surface, "AirBnB")
+        XCTAssertEqual(airbnbHits.first?.surface, "Airbnb")
 
         let openAiHits = dict.lookupExact(reading: "おーぷんえーあい")
         XCTAssertFalse(openAiHits.isEmpty)
@@ -101,8 +101,8 @@ final class KanaKanjiDecoderTests: XCTestCase {
         let resMercari = decoder.decode(kanaText: "めすか")
         XCTAssertEqual(resMercari, "メルカリ")
 
-        let resAirBnB = decoder.decode(kanaText: "えあびー")
-        XCTAssertEqual(resAirBnB, "AirBnB")
+        let resAirbnb = decoder.decode(kanaText: "えあびー")
+        XCTAssertEqual(resAirbnb, "Airbnb")
 
         // 英語テック固有名詞への変換
         let resIPhone = decoder.decode(kanaText: "あいふぉーん")
@@ -213,7 +213,7 @@ final class KanaKanjiDecoderTests: XCTestCase {
 
         // 固有名詞・和英混在ストリームのデコード
         let mixedStream = decoder.decode(kanaText: "えあびーでとまったあとめるかりでうった")
-        XCTAssertTrue(mixedStream.contains("AirBnB"))
+        XCTAssertTrue(mixedStream.contains("Airbnb"))
         XCTAssertTrue(mixedStream.contains("メルカリ"))
 
         // BtoB デコード
