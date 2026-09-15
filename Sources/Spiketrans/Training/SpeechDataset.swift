@@ -171,7 +171,8 @@ public final class SpeechDataset: @unchecked Sendable {
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         frameStack: Int = defaultFrameStack,
-        workers: Int = 8
+        workers: Int = 8,
+        english: EnglishPronunciations? = nil
     ) -> SpeechDataset {
         final class MetaBuffer: @unchecked Sendable {
             var items: [SampleMeta?]
@@ -183,7 +184,7 @@ public final class SpeechDataset: @unchecked Sendable {
         let workerCount = max(1, workers)
 
         DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
-            let converter = KanjiConverter(vocabulary: phonemeVocabulary)
+            let converter = KanjiConverter(vocabulary: phonemeVocabulary, english: english)
             var i = worker
             while i < pairs.count {
                 let pair = pairs[i]

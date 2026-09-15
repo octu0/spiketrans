@@ -9,6 +9,7 @@ setbuf(stdout, nil)
 // スコア設計を反復するあいだ数秒で結果が得られる。
 
 var datasetPath = ""
+var englishDictPath = ""
 var dictSamples = 0        // 辞書・語彙の構築に使う行数 (0 で全件)
 var showExamples = 3
 var nbest = 0              // 0 で N-best 評価なし
@@ -25,6 +26,11 @@ while argIdx < args.count {
     case "-d", "--dir", "--dataset":
         if (argIdx + 1) < args.count {
             datasetPath = args[argIdx + 1]
+            argIdx += 1
+        }
+    case "--english-dict":
+        if (argIdx + 1) < args.count {
+            englishDictPath = args[argIdx + 1]
             argIdx += 1
         }
     case "-s", "--samples":
@@ -80,9 +86,13 @@ while argIdx < args.count {
     argIdx += 1
 }
 
-if datasetPath.isEmpty {
-    print("エラー: データセットディレクトリを指定してください。")
-    print("  使い方: stage2 -d <データセットディレクトリ> [-s 辞書構築行数] [--examples 件数]")
+if datasetPath.isEmpty || englishDictPath.isEmpty {
+    print("エラー: データセットディレクトリと英語の発音辞書を指定してください。")
+    print("  使い方: stage2 -d <データセットディレクトリ> --english-dict <cmudict> [-s 辞書構築行数] [--examples 件数]")
+    exit(1)
+}
+guard let englishDict = try? EnglishPronunciations(contentsOfFile: englishDictPath) else {
+    print("エラー: 発音辞書 \(englishDictPath) が読み込めません。")
     exit(1)
 }
 
@@ -114,7 +124,7 @@ if dictSamples == 0 {
 }
 let dictTexts = Array(texts.prefix(dictLimit))
 
-let converter = KanjiConverter()
+let converter = KanjiConverter(english: englishDict)
 let dictionary = KanaKanjiDictionary()
 dictionary.buildFromCorpus(rawTexts: dictTexts, converter: converter)
 if extraCorpusPath.isEmpty != true {

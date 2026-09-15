@@ -93,6 +93,7 @@ var epochs = 20
 var maxTrainSamples: Int? = nil
 var batchSize = Defaults.batchSize
 var datasetPath = ""
+var englishDictPath = ""
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
@@ -148,6 +149,11 @@ while argIdx < args.count {
             datasetPath = args[argIdx + 1]
             argIdx += 1
         }
+    case "--english-dict":
+        if (argIdx + 1) < args.count {
+            englishDictPath = args[argIdx + 1]
+            argIdx += 1
+        }
     case "--device":
         if (argIdx + 1) < args.count {
             deviceArg = args[argIdx + 1].lowercased()
@@ -172,9 +178,19 @@ while argIdx < args.count {
 }
 
 // データセットのパスは必須。特定コーパスを既定値に埋め込まない
+if englishDictPath.isEmpty {
+    print("エラー: 英語の発音辞書 (CMU 形式) を --english-dict で指定してください。")
+    exit(1)
+}
+guard let englishDict = try? EnglishPronunciations(contentsOfFile: englishDictPath) else {
+    print("エラー: 発音辞書 \(englishDictPath) が読み込めません。")
+    exit(1)
+}
+print("英語の発音辞書: \(englishDictPath) (\(englishDict.count) 語)")
+
 if datasetPath.isEmpty {
     print("エラー: 学習マニフェスト (JSONL) を指定してください。")
-    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数] [-b バッチサイズ]")
+    print("  使い方: train -d <マニフェスト.jsonl> --english-dict <cmudict> [-s 件数] [-e エポック数] [-b バッチサイズ]")
     print("  詳細は train --help を参照してください。")
     print("  各行: {\"path\": \"/path/to/voice.wav\", \"text\": \"漢字かな混じりの発話テキスト\"}")
     print("  マニフェストは script/dataset/ の各コーパス用スクリプトで生成する")
@@ -263,7 +279,7 @@ for line in manifestContent.components(separatedBy: "\n") {
 let sampleLimit = maxTrainSamples ?? rawPairs.count
 let trainTextLines = Array(textLines.prefix(sampleLimit))
 
-let kanjiConverter = KanjiConverter()
+let kanjiConverter = KanjiConverter(english: englishDict)
 let trainHiraganaLines = trainTextLines.map { kanjiConverter.convertToHiragana($0) }
 
 // 重みを持ち込む場合は同梱の語彙を使う。学習時と別のマニフェストでも
@@ -306,7 +322,8 @@ let dataset = SpeechDataset.lazyFromManifest(
     pairs: manifestPairs,
     textVocabulary: textVocabulary,
     frameStack: Defaults.frameStack,
-    workers: numWorkers
+    workers: numWorkers,
+    english: englishDict
 )
 
 let loadElapsed = CFAbsoluteTimeGetCurrent() - startTime
@@ -1237,7 +1254,7 @@ let evalBuffer = BatchEvalBuffer(count: evalIndices.count, dummy: dummyEval)
 let evalLanguageBonus = Defaults.languageBonus
 let evalPairs = evalIndices.map { rawPairs[$0] }
 let evalIsTrain = evalIndices.map { $0 < sampleLimit }
-let evalKanjiConverter = KanjiConverter()
+let evalKanjiConverter = KanjiConverter(english: englishDict)
 let evalFrameStack = Defaults.frameStack
 
 let evalWorkers = max(1, numWorkers)

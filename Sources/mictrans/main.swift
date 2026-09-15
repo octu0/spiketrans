@@ -14,6 +14,7 @@ setbuf(stdout, nil)
 
 var weightsPath = ""
 var corpusPath = ""
+var englishDictPath = ""
 var silenceSeconds = 0.6      // この長さの無音で発話終了とみなす
 var minSpeechSeconds = 0.3    // これより短い有声区間は雑音として捨てる
 var maxSpeechSeconds = 15.0   // 話し続けた場合の強制区切り
@@ -36,6 +37,11 @@ while argIdx < args.count {
     case "-d", "--corpus":
         if (argIdx + 1) < args.count {
             corpusPath = args[argIdx + 1]
+            argIdx += 1
+        }
+    case "--english-dict":
+        if (argIdx + 1) < args.count {
+            englishDictPath = args[argIdx + 1]
             argIdx += 1
         }
     case "--silence":
@@ -235,8 +241,12 @@ if listMicrophones {
     exit(0)
 }
 
-if weightsPath.isEmpty {
-    print("使い方: mictrans -w <重み.json> [-d <辞書テキスト>] [--mic <番号>]  (詳細は --help)")
+if weightsPath.isEmpty || englishDictPath.isEmpty {
+    print("使い方: mictrans -w <重み.json> --english-dict <cmudict> [-d <辞書テキスト>] [--mic <番号>]  (詳細は --help)")
+    exit(1)
+}
+guard let englishDict = try? EnglishPronunciations(contentsOfFile: englishDictPath) else {
+    print("エラー: 発音辞書 \(englishDictPath) が読み込めません。")
     exit(1)
 }
 
@@ -327,7 +337,7 @@ case .none:
         print("  学習時と同じテキストを -d に指定するか、語彙を含む重みを使ってください。")
         exit(1)
     }
-    let converter = KanjiConverter()
+    let converter = KanjiConverter(english: englishDict)
     phoneticVocabulary = TextVocabulary(
         corpus: corpusLines.map { converter.convertToHiragana($0) })
 }

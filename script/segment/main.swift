@@ -13,7 +13,7 @@ setbuf(stdout, nil)
 //             動的計画法で文を区間へ配分する。音響モデルによる強制整列ではないので、
 //             文字/秒が外れた区間は「要確認」として出す
 //
-// 使い方: segment -i <音声.wav> -t <書き起こし.srt / .txt / 文字列> -o <出力ディレクトリ> [--max-seconds 15]
+// 使い方: segment -i <音声.wav> -t <書き起こし.srt / .txt / 文字列> -o <出力ディレクトリ> --english-dict <cmudict> [--max-seconds 15]
 //         標準出力に {"path","text"} の JSONL を書く
 
 /// 区間を結合する無音の上限 (秒)。これより短い間は同じ発話とみなす
@@ -29,6 +29,7 @@ let sampleRate: Float = 16000.0
 var wavPath = ""
 var textArg = ""
 var outDir = ""
+var englishDictPath = ""
 var argIdx = 1
 let args = CommandLine.arguments
 while argIdx < args.count {
@@ -48,6 +49,11 @@ while argIdx < args.count {
             outDir = args[argIdx + 1]
             argIdx += 1
         }
+    case "--english-dict":
+        if (argIdx + 1) < args.count {
+            englishDictPath = args[argIdx + 1]
+            argIdx += 1
+        }
     case "--max-seconds":
         if (argIdx + 1) < args.count {
             if let v = Float(args[argIdx + 1]) {
@@ -65,8 +71,12 @@ func warn(_ message: String) {
     FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
 }
 
-if wavPath.isEmpty || textArg.isEmpty || outDir.isEmpty {
-    warn("使い方: segment -i <音声.wav> -t <書き起こし> -o <出力ディレクトリ> [--max-seconds 15]")
+if wavPath.isEmpty || textArg.isEmpty || outDir.isEmpty || englishDictPath.isEmpty {
+    warn("使い方: segment -i <音声.wav> -t <書き起こし> -o <出力ディレクトリ> --english-dict <cmudict> [--max-seconds 15]")
+    exit(1)
+}
+guard let englishDict = try? EnglishPronunciations(contentsOfFile: englishDictPath) else {
+    warn("エラー: 発音辞書 \(englishDictPath) が読み込めません。")
     exit(1)
 }
 
@@ -86,7 +96,7 @@ guard let wav = SpeechDataset.loadWavFile(path: wavPath) else {
 }
 let pcm = SpeechDataset.resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
 let totalSeconds = Float(pcm.count) / sampleRate
-let converter = KanjiConverter()
+let converter = KanjiConverter(english: englishDict)
 let chunker = SpeechChunker(
     mergeGapSeconds: mergeGapSeconds,
     minSegmentSeconds: minSegmentSeconds,

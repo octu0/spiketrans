@@ -3,9 +3,12 @@ import Foundation
 /// 漢字かな混じり文を形態素解析し、ひらがな読みへ正規化する。
 public struct KanjiConverter: Sendable {
     public let vocabulary: PhonemeVocabulary
+    /// 英単語の読みに使う発音辞書。nil なら英字の未知語は空読み
+    public let english: EnglishPronunciations?
 
-    public init(vocabulary: PhonemeVocabulary = PhonemeVocabulary()) {
+    public init(vocabulary: PhonemeVocabulary = PhonemeVocabulary(), english: EnglishPronunciations? = nil) {
         self.vocabulary = vocabulary
+        self.english = english
     }
 
     /// 形態素単位の表層と読みの組
@@ -247,14 +250,19 @@ public struct KanjiConverter: Sendable {
     ///
     /// 組み込み辞書 (SeedVocabulary) を優先し、大文字頭字語は単文字読みに展開する。
     /// 未知の英単語はローマ字規則による異常変換 (「いぷほね」「あっぷれ」等) を防ぐため空文字で保護する。
-    static func alphabetReading(_ surface: String) -> String? {
+    func alphabetReading(_ surface: String) -> String? {
+        // 小文字 1 文字の a / i は英文中の冠詞・代名詞。字母の読み (えー) ではなく発音辞書で読む
+        if surface.count == 1, surface == surface.lowercased(), let dictionary = english,
+           let word = dictionary.reading(of: surface) {
+            return word
+        }
         // 1. シード語彙テーブルから既知語を検索
         if let reading = SeedVocabulary.readingForAlphabetSurface(surface) {
             return reading
         }
 
         // 2. 単語が純粋な英字・頭字語か検査
-        if isAlphabetToken(surface) {
+        if Self.isAlphabetToken(surface) {
             // 大文字のみの頭字語 (例: "GPU", "API", "SDK", "PC", "CPU", "USB") は各文字を展開
             var isAllUpper = true
             var letterCount = 0
@@ -289,17 +297,48 @@ public struct KanjiConverter: Sendable {
                 }
             }
 
-            // 未知の英単語はローマ字読みへの異常崩れを防ぐため空文字とする
-            return ""
+            // 未知の英単語は発音辞書で読み、辞書にも無ければ空読み (ローマ字読みの異常崩れを防ぐ)
+            return englishReading(surface)
         }
 
-        // 英字に句読点が付いた語 (dream.See、Baby,) も英単語。形態素解析器のローマ字読み
-        // (でれあむせー) に落とさず空にする
-        if containsLatinLetter(surface) {
-            return ""
+        // 英単語は発音辞書 (あれば) からカタカナ英語の読みを付ける。句読点付き (dream.See、Baby,) は
+        // 英字の連なりごとに引く。辞書に無い語は形態素解析器のローマ字読み (でれあむせー) に
+        // 落とさず空読みにする
+        if Self.containsLatinLetter(surface) {
+            return englishReading(surface)
         }
 
         return nil
+    }
+
+    /// 英字の連なりごとに発音辞書を引いて連結する。辞書が無い・語が無いぶんは空
+    func englishReading(_ surface: String) -> String {
+        guard let dictionary = english else {
+            return ""
+        }
+        var reading = ""
+        var word = ""
+        for scalar in surface.unicodeScalars {
+            switch scalar.value {
+            case 0x41...0x5A, 0x61...0x7A:
+                word.unicodeScalars.append(scalar)
+            case 0xFF21...0xFF3A, 0xFF41...0xFF5A:
+                if let half = UnicodeScalar(scalar.value - 0xFEE0) {
+                    word.unicodeScalars.append(half)
+                }
+            case 0x27:
+                word.unicodeScalars.append(scalar)
+            default:
+                if word.isEmpty != true {
+                    reading += dictionary.reading(of: word) ?? ""
+                    word = ""
+                }
+            }
+        }
+        if word.isEmpty != true {
+            reading += dictionary.reading(of: word) ?? ""
+        }
+        return reading
     }
 
     static func containsLatinLetter(_ text: String) -> Bool {
@@ -393,7 +432,7 @@ public struct KanjiConverter: Sendable {
             }
 
             // 英文・アルファベットトークン（Wi-Fi, iPhone等）の保護およびフォールバック処理
-            if let alphaReading = Self.alphabetReading(surface) {
+            if let alphaReading = alphabetReading(surface) {
                 tokens.append(Token(surface: surface, reading: kanaOnly(alphaReading)))
                 continue
             }

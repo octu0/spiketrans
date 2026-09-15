@@ -6,6 +6,7 @@ setbuf(stdout, nil)
 var wavPath = ""
 var weightsPath = ""
 var dictPath = ""          // 第2段辞書を構築するテキスト (1 行 1 文)
+var englishDictPath = ""   // 英語の発音辞書 (CMU 形式、必須)
 var chunkSeconds = 0.0     // 0 で分割なし
 var maxSeconds = 0.0       // 0 で全体
 var usePostProcess = true
@@ -30,6 +31,11 @@ while argIdx < args.count {
             dictPath = args[argIdx + 1]
             argIdx += 1
         }
+    case "--english-dict":
+        if (argIdx + 1) < args.count {
+            englishDictPath = args[argIdx + 1]
+            argIdx += 1
+        }
     case "--chunk-seconds":
         if (argIdx + 1) < args.count {
             if let v = Double(args[argIdx + 1]) {
@@ -52,8 +58,8 @@ while argIdx < args.count {
     argIdx += 1
 }
 
-if wavPath.isEmpty || weightsPath.isEmpty {
-    print("使い方: transcribe -i <音声.wav> -w <重み.json> [-d <辞書テキスト>] [--chunk-seconds N] [--max-seconds N] [--raw]")
+if wavPath.isEmpty || weightsPath.isEmpty || englishDictPath.isEmpty {
+    print("使い方: transcribe -i <音声.wav> -w <重み.json> --english-dict <cmudict> [-d <辞書テキスト>] [--chunk-seconds N] [--max-seconds N] [--raw]")
     exit(1)
 }
 
@@ -121,7 +127,11 @@ if dictPath.isEmpty != true {
     }
 }
 
-let kanjiConverter = KanjiConverter()
+guard let englishDict = try? EnglishPronunciations(contentsOfFile: englishDictPath) else {
+    print("エラー: 発音辞書 \(englishDictPath) が読み込めません。")
+    exit(1)
+}
+let kanjiConverter = KanjiConverter(english: englishDict)
 let phoneticVocabulary: TextVocabulary
 switch weights.vocabulary {
 case .some(let embedded):
