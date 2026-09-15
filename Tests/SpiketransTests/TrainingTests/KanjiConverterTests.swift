@@ -333,4 +333,17 @@ final class KanjiConverterTests: XCTestCase {
         XCTAssertEqual(converter.convertToHiragana("それなw"), "それなだぶりゅー")
         XCTAssertEqual(converter.convertToHiragana("Wi-Fiとweb"), "わいふぁいとうぇぶ")
     }
+
+    func testEnglishWordsAndKimi() {
+        let converter = KanjiConverter()
+        // 未知の英単語は空読み。句読点付きでもローマ字読みに落ちない。5 文字以上の大文字語は綴り読みにしない
+        XCTAssertEqual(converter.convertToHiragana("Have a sweet dream.See you"), "えー")
+        XCTAssertEqual(converter.convertToHiragana("Thank you.今日がね"), "きょーがね")
+        XCTAssertEqual(converter.convertToHiragana("ZENSHOグループ"), "ぐるーぷ")
+        XCTAssertEqual(converter.convertToHiragana("GPU"), "じーぴーゆー")
+        // 君: 文頭・助詞の後は きみ、名前の後は くん
+        XCTAssertEqual(converter.convertToHiragana("君を思い出すよ"), "きみおおもいだすよ")
+        XCTAssertEqual(converter.convertToHiragana("でも君は"), "でもきみわ")
+        XCTAssertEqual(converter.convertToHiragana("たかし君が来た"), "たかしくんがきた")
+    }
 }

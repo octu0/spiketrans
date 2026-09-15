@@ -274,7 +274,9 @@ public struct KanjiConverter: Sendable {
                 }
             }
 
-            if isAllUpper && 0 < letterCount {
+            // 大文字だけの語でも 5 文字以上は頭字語ではなく単語として発音される (ZENSHO)。
+            // 読みが分からないので綴り読みにはせず空にする
+            if isAllUpper && 0 < letterCount && letterCount <= 4 {
                 var spelled = ""
                 for scalar in surface.unicodeScalars {
                     let letter = String(scalar)
@@ -291,7 +293,25 @@ public struct KanjiConverter: Sendable {
             return ""
         }
 
+        // 英字に句読点が付いた語 (dream.See、Baby,) も英単語。形態素解析器のローマ字読み
+        // (でれあむせー) に落とさず空にする
+        if containsLatinLetter(surface) {
+            return ""
+        }
+
         return nil
+    }
+
+    static func containsLatinLetter(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x41...0x5A, 0x61...0x7A, 0xFF21...0xFF3A, 0xFF41...0xFF5A:
+                return true
+            default:
+                continue
+            }
+        }
+        return false
     }
 
     /// テキストを形態素に分割し、表層と読みを同時に取得する。
@@ -472,6 +492,12 @@ public struct KanjiConverter: Sendable {
     ]
 
     static let maxPhraseTokens = 3
+
+    /// この語の直後の「君」は名前の敬称ではなく代名詞 (きみ)
+    static let kimiPredecessors: Set<String> = [
+        "は", "が", "を", "に", "の", "と", "も", "で", "へ", "や", "から", "まで", "でも", "だから", "そして",
+        "また", "まだ", "もう", "ずっと", "ねえ", "ねぇ", "ああ", "いつも", "だけ", "きっと", "ただ", "なぜ", "もし",
+    ]
 
     /// 直前の数によらず同じ読みが返る助数詞の基本読み (「本/ぽん」等を揃える)
     static let counterBaseReadings: [String: String] = [
@@ -702,6 +728,16 @@ public struct KanjiConverter: Sendable {
             }
             if let reading = rendakuSuffixes[token.surface], let prev = result.last, endsWithKanjiOrKatakana(prev.surface) {
                 token = Token(surface: token.surface, reading: pronunciation(surface: token.surface, reading: reading))
+            }
+            // 君: 名前に続く「たかし君」は くん、文頭や助詞・接続詞の後の「君」は代名詞 きみ
+            if token.surface == "君" && token.reading == "くん" {
+                var isPronoun = true
+                if let prev = result.last, prev.reading.isEmpty != true, kimiPredecessors.contains(prev.surface) != true {
+                    isPronoun = false
+                }
+                if isPronoun {
+                    token = Token(surface: token.surface, reading: "きみ")
+                }
             }
             // 3. 曜日: 「木曜/もくよう」+「日/ひ」→ もくようび
             if i + 1 < tokens.count && token.surface.hasSuffix("曜") && tokens[i + 1].surface == "日" {
