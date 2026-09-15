@@ -60,30 +60,22 @@ public final class SpeechDataset: @unchecked Sendable {
     public let samples: [AudioTextSample]
     public let metaSamples: [SampleMeta]
     public let lazyFrameStack: Int
-    public let cache: FeatureDiskCache?
-    public let maxCacheGigabytes: Double
     private let isLazy: Bool
 
     public init(samples: [AudioTextSample]) {
         self.samples = samples
         self.metaSamples = []
         self.lazyFrameStack = 1
-        self.cache = nil
-        self.maxCacheGigabytes = 0.0
         self.isLazy = false
     }
 
     public init(
         metaSamples: [SampleMeta],
-        frameStack: Int,
-        cache: FeatureDiskCache? = nil,
-        maxCacheGigabytes: Double = 0.0
+        frameStack: Int
     ) {
         self.samples = []
         self.metaSamples = metaSamples
         self.lazyFrameStack = frameStack
-        self.cache = cache
-        self.maxCacheGigabytes = maxCacheGigabytes
         self.isLazy = true
     }
 
@@ -136,7 +128,6 @@ public final class SpeechDataset: @unchecked Sendable {
         let (pcm16k, features) = Self.loadFeatures(
             path: meta.path,
             frameStack: lazyFrameStack,
-            cache: cache,
             loadPCM: loadPCM
         )
         return AudioTextSample(
@@ -160,105 +151,27 @@ public final class SpeechDataset: @unchecked Sendable {
         }
     }
 
-    /// WAV ファイルまたはディスクキャッシュから音響特徴量をロードする
+    /// WAV ファイルから音響特徴量をロードする
     public static func loadFeatures(
         path: String,
         frameStack: Int,
-        cache: FeatureDiskCache? = nil,
         loadPCM: Bool = false
     ) -> (pcm: [Float], features: [[Float]]) {
-        if let c = cache, let cached = c.load(path: path, frameStack: frameStack) {
-            var pcm16k: [Float] = []
-            if loadPCM {
-                if let wav = loadWavFile(path: path) {
-                    pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
-                }
-            }
-            return (pcm16k, cached)
-        }
-
         guard let wav = loadWavFile(path: path) else {
             return ([], [])
         }
         let pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
         let features = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack)
-        if let c = cache {
-            if 0 < features.count {
-                c.save(path: path, frameStack: frameStack, features: features)
-            }
-        }
         return (pcm16k, features)
     }
 
-    /// サンプル一覧からフレーム数の降順（長い順）に、指定容量（GB）に収まる長尺音声をキャッシュ対象として選別する
-    public static func selectQuotaPaths(
-        metas: [SampleMeta],
-        frameStack: Int,
-        maxGigabytes: Double
-    ) -> Set<String> {
-        if maxGigabytes <= 0.0 {
-            var allPaths = Set<String>()
-            allPaths.reserveCapacity(metas.count)
-            for m in metas {
-                allPaths.insert(m.path)
-            }
-            return allPaths
-        }
-
-        let maxBytesDouble = maxGigabytes * 1024.0 * 1024.0 * 1024.0
-        let maxBytes: Int64
-        if Double(Int64.max) < maxBytesDouble {
-            maxBytes = Int64.max
-        } else {
-            maxBytes = Int64(maxBytesDouble)
-        }
-
-        // 長尺（frameCount が大きい）順にソート (比較演算子は < のみ使用)
-        let sorted = metas.sorted { a, b in
-            if a.frameCount < b.frameCount {
-                return false
-            }
-            if b.frameCount < a.frameCount {
-                return true
-            }
-            return a.path < b.path
-        }
-
-        var seenPaths = Set<String>()
-        seenPaths.reserveCapacity(sorted.count)
-        var accumulatedBytes: Int64 = 0
-        var selected = Set<String>()
-
-        for item in sorted {
-            if seenPaths.insert(item.path).inserted != true {
-                continue
-            }
-            let itemBytes = FeatureDiskCache.estimateFileBytes(frameCount: item.frameCount, frameStack: frameStack)
-            if itemBytes <= 0 {
-                continue
-            }
-            let (nextTotal, overflow) = accumulatedBytes.addingReportingOverflow(itemBytes)
-            if overflow != true {
-                if nextTotal <= maxBytes {
-                    accumulatedBytes = nextTotal
-                    selected.insert(item.path)
-                }
-            }
-        }
-
-        return selected
-    }
-
-    /// マニフェストのペアから遅延データセットを構築する。
-    /// キャッシュが存在する場合は 32 バイトヘッダーのみを読みフレーム数を瞬時に確定する
+    /// マニフェストのペアから遅延データセットを構築する
     public static func lazyFromManifest(
         pairs: [(path: String, text: String)],
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         frameStack: Int = defaultFrameStack,
-        workers: Int = 8,
-        cache: FeatureDiskCache? = nil,
-        maxCacheGigabytes: Double = 0.0
+        workers: Int = 8
     ) -> SpeechDataset {
         final class MetaBuffer: @unchecked Sendable {
             var items: [SampleMeta?]
@@ -269,34 +182,17 @@ public final class SpeechDataset: @unchecked Sendable {
         let buffer = MetaBuffer(count: pairs.count)
         let workerCount = max(1, workers)
 
-        // 容量制限（クォータ）が有効な場合、初期メタデータ走査時はキャッシュ保存を行わない
-        // （全サンプルのフレーム数が確定した後に、長尺上位のみを選別してキャッシュするため）
-        // また、過去のホワイトリストによってヘッダー読み込みが拒絶されないよう allowedPaths をリセットする
-        let initialCache: FeatureDiskCache?
-        if 0.0 < maxCacheGigabytes {
-            cache?.allowedPaths = nil
-            initialCache = nil
-        } else {
-            initialCache = cache
-        }
-
         DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
             let converter = KanjiConverter(vocabulary: phonemeVocabulary)
             var i = worker
             while i < pairs.count {
                 let pair = pairs[i]
-                var frameCount = 0
-                if let c = cache, let cachedFrames = c.getFrameCount(path: pair.path, frameStack: frameStack) {
-                    frameCount = cachedFrames
-                } else {
-                    let (_, features) = loadFeatures(
-                        path: pair.path,
-                        frameStack: frameStack,
-                        cache: initialCache,
-                        loadPCM: false
-                    )
-                    frameCount = features.count
-                }
+                let (_, features) = loadFeatures(
+                    path: pair.path,
+                    frameStack: frameStack,
+                    loadPCM: false
+                )
+                let frameCount = features.count
 
                 if 0 < frameCount {
                     buffer.items[i] = SampleMeta(
@@ -319,36 +215,9 @@ public final class SpeechDataset: @unchecked Sendable {
             }
         }
 
-        if let c = cache {
-            if 0.0 < maxCacheGigabytes {
-                let allowed = selectQuotaPaths(
-                    metas: metas,
-                    frameStack: frameStack,
-                    maxGigabytes: maxCacheGigabytes
-                )
-                c.allowedPaths = allowed
-
-                // クォータ対象外となったサンプルの旧キャッシュが存在する場合はディスクから削除し、
-                // 指定された最大容量制約を確実に遵守する (同一パスの重複削除を防止)
-                var checkedPaths = Set<String>()
-                checkedPaths.reserveCapacity(metas.count)
-                for meta in metas {
-                    if checkedPaths.insert(meta.path).inserted {
-                        if allowed.contains(meta.path) != true {
-                            c.remove(path: meta.path, frameStack: frameStack)
-                        }
-                    }
-                }
-            } else {
-                c.allowedPaths = nil
-            }
-        }
-
         return SpeechDataset(
             metaSamples: metas,
-            frameStack: frameStack,
-            cache: cache,
-            maxCacheGigabytes: maxCacheGigabytes
+            frameStack: frameStack
         )
     }
 

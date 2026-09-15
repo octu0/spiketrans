@@ -92,9 +92,6 @@ var numWorkers = performanceCoreCount()
 var epochs = 20
 var maxTrainSamples: Int? = nil
 var batchSize = Defaults.batchSize
-var useFeatureCache = false
-var cacheMaxGB: Double = 0.0
-var featureCacheDir: String? = nil
 var datasetPath = ""
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
@@ -111,10 +108,6 @@ while argIdx < args.count {
         print("オプション:")
         print("  -d, --dir, --dataset <パス>        学習マニフェスト (JSONL) のパス [必須]")
         print("  -b, --batch-size <Int>             ミニバッチサイズ (既定: 64)")
-        print("  --cache-features                   特徴量ディスクキャッシュを有効化 (推奨)")
-        print("  --no-cache-features                特徴量ディスクキャッシュを無効化 (オンデマンド抽出)")
-        print("  --cache-max-gb <Double>            特徴量ディスクキャッシュの最大容量 (GB, 既定: 0.0 で無制限)")
-        print("  --feature-cache-dir <ディレクトリ> 特徴量ディスクキャッシュの保存先ディレクトリ")
         print("  -e, --epochs <Int>                 エポック数 (既定: 20)")
         print("  -s, --samples <Int>                最大学習サンプル数 (制限なし)")
         print("  -p, --parallel <Int>               並列ワーカー数 (既定: P コア数)")
@@ -150,28 +143,6 @@ while argIdx < args.count {
             }
             argIdx += 1
         }
-    case "--cache-features":
-        useFeatureCache = true
-    case "--no-cache-features":
-        useFeatureCache = false
-    case "--cache-max-gb":
-        if (argIdx + 1) < args.count {
-            if let val = Double(args[argIdx + 1]) {
-                if 0.0 < val {
-                    cacheMaxGB = val
-                } else {
-                    cacheMaxGB = 0.0
-                }
-                useFeatureCache = true
-            }
-            argIdx += 1
-        }
-    case "--feature-cache-dir", "--cache-dir":
-        if (argIdx + 1) < args.count {
-            featureCacheDir = args[argIdx + 1]
-            useFeatureCache = true
-            argIdx += 1
-        }
     case "-d", "--dir", "--dataset":
         if (argIdx + 1) < args.count {
             datasetPath = args[argIdx + 1]
@@ -203,7 +174,7 @@ while argIdx < args.count {
 // データセットのパスは必須。特定コーパスを既定値に埋め込まない
 if datasetPath.isEmpty {
     print("エラー: 学習マニフェスト (JSONL) を指定してください。")
-    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数] [-b バッチサイズ] [--cache-features]")
+    print("  使い方: train -d <マニフェスト.jsonl> [-s 件数] [-e エポック数] [-b バッチサイズ]")
     print("  詳細は train --help を参照してください。")
     print("  各行: {\"path\": \"/path/to/voice.wav\", \"text\": \"漢字かな混じりの発話テキスト\"}")
     print("  マニフェストは script/dataset/ の各コーパス用スクリプトで生成する")
@@ -262,30 +233,6 @@ guard let manifestContent = try? String(contentsOfFile: datasetPath, encoding: .
 }
 
 let manifestDir = (datasetPath as NSString).deletingLastPathComponent
-let resolvedCacheDir: String
-if let customDir = featureCacheDir {
-    resolvedCacheDir = (customDir as NSString).standardizingPath
-} else {
-    let baseDir: String
-    if manifestDir.isEmpty {
-        baseDir = FileManager.default.currentDirectoryPath
-    } else {
-        baseDir = manifestDir
-    }
-    resolvedCacheDir = ((baseDir as NSString).appendingPathComponent(".spiketrans_feature_cache") as NSString).standardizingPath
-}
-var featureCache: FeatureDiskCache? = nil
-if useFeatureCache {
-    featureCache = FeatureDiskCache(baseDirectory: resolvedCacheDir)
-    if 0.0 < cacheMaxGB {
-        print("特徴量キャッシュ (--cache-features): 有効 (\(resolvedCacheDir), 最大容量: \(String(format: "%.1f", cacheMaxGB)) GB 長尺優先クォータ)")
-    } else {
-        print("特徴量キャッシュ (--cache-features): 有効 (\(resolvedCacheDir), 容量制限なし)")
-    }
-} else {
-    print("特徴量キャッシュ (--cache-features): 無効 (オンデマンド抽出)")
-}
-
 let jsonDecoder = JSONDecoder()
 var textLines: [String] = []
 var rawPairs: [(path: String, fileId: String, text: String)] = []
@@ -359,30 +306,11 @@ let dataset = SpeechDataset.lazyFromManifest(
     pairs: manifestPairs,
     textVocabulary: textVocabulary,
     frameStack: Defaults.frameStack,
-    workers: numWorkers,
-    cache: featureCache,
-    maxCacheGigabytes: cacheMaxGB
+    workers: numWorkers
 )
 
 let loadElapsed = CFAbsoluteTimeGetCurrent() - startTime
 print("データセット構築完了: \(dataset.count) サンプル (所要時間: \(String(format: "%.3f", loadElapsed)) 秒)")
-if let c = featureCache {
-    if let allowed = c.allowedPaths {
-        let totalSamples = dataset.count
-        let cachedCount = allowed.count
-        let ratio: Double
-        if 0 < totalSamples {
-            ratio = Double(cachedCount) / Double(totalSamples) * 100.0
-        } else {
-            ratio = 0.0
-        }
-        print("  [キャッシュクォータ] 長尺上位 \(cachedCount)/\(totalSamples) 件 (\(String(format: "%.1f", ratio))%) をディスクキャッシュ対象に選別 (上限: \(String(format: "%.1f", cacheMaxGB)) GB)")
-        if 0 < totalSamples && cachedCount <= 0 {
-            print("  [警告] 指定されたキャッシュ上限 (\(String(format: "%.4f", cacheMaxGB)) GB) が小さすぎるため、全サンプルがキャッシュ対象外となりました。すべてオンデマンドで処理されます。")
-        }
-    }
-}
-
 for i in 0..<min(3, dataset.count) {
     let sample = dataset.sample(at: i, loadPCM: true)
     let featDim = sample.acousticFeatures.first?.count ?? 128
@@ -543,7 +471,9 @@ if epochs == 0 {
     }
     print("  長さ順バッチング: 逐次フレーム総数 \(unsortedFrameTotal) → \(paddedFrameTotal)")
 
-    // バッチの構成 (どのサンプルをどのバッチに入れるか) は全エポック共通
+    // バッチの構成 (どのサンプルをどのバッチに入れるか) は全エポック共通。
+    // 長い系列の件数を減らして総フレーム数を揃える案は、eager の所要時間が件数ではなく
+    // フレーム数 (演算ノード数) で決まるため逆に遅くなった (15k × 2 epoch で 303 → 449 秒)
     var batchGroups: [[Int]] = []
     var gStart = 0
     while gStart < lengthSortedIndices.count {
@@ -570,7 +500,6 @@ if epochs == 0 {
                 buffer.items[i] = SpeechDataset.loadFeatures(
                     path: meta.path,
                     frameStack: Defaults.frameStack,
-                    cache: dataset.cache,
                     loadPCM: false
                 ).features
                 i += workerCount
@@ -622,6 +551,13 @@ if epochs == 0 {
 
         var epLossSum: Float = 0.0
         var batchCount = 0
+        // 時間の内訳: GPU の学習ステップ、先読み待ち (特徴量の読み込みが GPU より遅いとき)、
+        // compile 済み / eager (系列長が compiledMaxFrames 超) の別、系列長バケットごとの時間
+        var gpuSeconds = 0.0
+        var waitSeconds = 0.0
+        var eagerBatches = 0
+        var eagerSeconds = 0.0
+        var bucketSeconds: [Int: (count: Int, seconds: Double)] = [:]
 
         var currentFeatures: [[[Float]]] = []
         if 0 < batchGroups.count {
@@ -650,11 +586,27 @@ if epochs == 0 {
                 step: globalStep, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
             mlxTrainer.updateLearningRate(curLR)
 
+            var maxFrames = 0
+            for seq in currentFeatures {
+                if maxFrames < seq.count {
+                    maxFrames = seq.count
+                }
+            }
+            let paddedFrames = ((maxFrames + 31) / 32) * 32
+            let gpuStart = CFAbsoluteTimeGetCurrent()
             let res = mlxTrainer.trainBatchCTC(
                 featuresBatch: currentFeatures,
                 targetsBatch: tBatch,
                 blankId: TextVocabulary.padId
             )
+            let gpuElapsed = CFAbsoluteTimeGetCurrent() - gpuStart
+            gpuSeconds += gpuElapsed
+            if compiledMaxFrames < paddedFrames {
+                eagerBatches += 1
+                eagerSeconds += gpuElapsed
+            }
+            let prev = bucketSeconds[paddedFrames] ?? (count: 0, seconds: 0.0)
+            bucketSeconds[paddedFrames] = (count: prev.count + 1, seconds: prev.seconds + gpuElapsed)
             epLossSum += res
             batchCount += 1
 
@@ -664,7 +616,9 @@ if epochs == 0 {
                 MLX.Memory.clearCache()
             }
 
+            let waitStart = CFAbsoluteTimeGetCurrent()
             prefetchGroup.wait()
+            waitSeconds += CFAbsoluteTimeGetCurrent() - waitStart
             currentFeatures = prefetchBox.value
             bIdx += 1
         }
@@ -672,6 +626,13 @@ if epochs == 0 {
         let avgLoss = epLossSum / Float(max(1, batchCount))
         let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
         print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
+        print("    内訳: GPU \(String(format: "%.0f", gpuSeconds)) 秒 (うち eager \(eagerBatches) バッチ \(String(format: "%.0f", eagerSeconds)) 秒) / 先読み待ち \(String(format: "%.0f", waitSeconds)) 秒 / \(batchCount) バッチ")
+        let topBuckets = bucketSeconds.sorted { a, b in b.value.seconds < a.value.seconds }.prefix(6)
+        var bucketLine = "    系列長バケット (フレーム: バッチ数 / 秒):"
+        for (frames, stat) in topBuckets {
+            bucketLine += " \(frames): \(stat.count) / \(String(format: "%.0f", stat.seconds))"
+        }
+        print(bucketLine)
 
         if avgLoss < bestLoss {
             bestLoss = avgLoss

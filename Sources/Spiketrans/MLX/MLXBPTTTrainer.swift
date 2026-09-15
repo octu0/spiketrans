@@ -9,7 +9,7 @@ internal let rmsNormEpsilon: Float = 1e-5
 /// compile() する系列長の上限 (32 の倍数に切り上げた後のフレーム数)。
 /// compile は時間ループを静的に展開するため、実測で T=256 が 13 GB、T=500 が 46〜72 GB、
 /// T=1000 で OOM。これを超える長い系列は eager で流す
-internal let compiledMaxFrames = 256
+public let compiledMaxFrames = 256
 
 /// MLX 上の切り詰め BPTT。系列が `compiledMaxFrames` を超えると eager。
 public final class MLXBPTTTrainer: @unchecked Sendable {
@@ -28,6 +28,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
     /// 系列長 (T) をキーとするコンパイル済み logitsBatch のキャッシュ
     private var compiledLogitsSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// compiledMaxFrames を超える系列をチャンク分割で学習するときの 1 チャンクのフレーム数
+    public let longSequenceChunkFrames = compiledMaxFrames / 2
+    /// false にすると長い系列も一括で微分する (比較用)
+    public var chunkLongSequences = true
 
     /// CTC 学習ステップのコンパイル（キャッシュミス）回数
     public private(set) var ctcCompileCount: Int = 0
@@ -61,6 +66,67 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         eval(network, optimizer)
     }
 
+    /// 1 サブステップ分の全層 LIF 更新。
+    /// 入力 [層 0 の入力電流, v_0...v_L-1, s_0...s_L-1, a_0...a_L-1]、出力 [v..., s..., a..., 最終層の読み出し]。
+    /// 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差。
+    /// 最終層だけハードリセットせず、閾値単位の膜電位を読んでから余りを残す
+    func substep(network: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] {
+        let numLayers = network.numLayers
+        let beta = network.lifConfig.beta
+        let vTh = network.lifConfig.vTh
+        let alpha = network.lifConfig.alpha
+        let rho = network.lifConfig.rho
+        let gamma = network.lifConfig.gamma
+        let vMin = LIFNeuronEngine.vClampMin
+        let vMax = LIFNeuronEngine.vClampMax
+        let readoutK = LIFNeuronEngine.readoutClipInThresholdUnits
+
+        let current0 = arrays[0]
+        var v = Array(arrays[1..<(1 + numLayers)])
+        var s = Array(arrays[(1 + numLayers)..<(1 + 2 * numLayers)])
+        var a = Array(arrays[(1 + 2 * numLayers)..<(1 + 3 * numLayers)])
+        var readout = MLXArray.zeros(like: v[0])
+
+        var current = current0 + matmul(s[0], network.wRec)
+        var l = 0
+        while l < numLayers {
+            if 0 < l {
+                let upperIdx = l - 1
+                let denseCur = matmul(s[l - 1], network.wLayers[upperIdx]) + network.bHLayers[upperIdx]
+                // MLXFast.rmsNorm は valueAndGrad + compile で Metal 生存バッファ上限を超える
+                let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
+                let rms = sqrt(meanSq + rmsNormEpsilon)
+                current = (denseCur / rms) * network.gammaRMS[upperIdx] + current
+            }
+
+            let isLast = (l + 1) == numLayers
+            if isLast {
+                v[l] = clip(v[l] * beta + current, min: vMin, max: vMax)
+            } else {
+                v[l] = clip((v[l] * beta) * (1.0 - s[l]) + current, min: vMin, max: vMax)
+            }
+
+            a[l] = (a[l] * rho) + (s[l] * gamma)
+            let dynVTh = vTh + a[l]
+            let vRel = (v[l] - dynVTh) * alpha
+            let sSurrogate = 0.5 * (vRel / (1.0 + abs(vRel)) + 1.0)
+            let sHard = (dynVTh .<= v[l]).asType(.float32)
+            s[l] = stopGradient(sHard - sSurrogate) + sSurrogate
+
+            if isLast {
+                // 読み出しは閾値単位でクリップするが、勾配はクリップ前の値を通す (straight-through)。
+                // clip の勾配は |v| >= vTh で 0 になり、発火しているニューロンから勾配が流れず
+                // 学習が 4 倍以上遅くなった (JSUT 20ep 未学習 16.7% → 43.4%)
+                let scaled = v[l] / vTh
+                let clipped = clip(scaled, min: -readoutK, max: readoutK)
+                readout = stopGradient(clipped - scaled) + scaled
+                v[l] = clip(v[l] - sHard * vTh, min: vMin, max: vMax)
+            }
+            l += 1
+        }
+        return v + s + a + [readout]
+    }
+
     /// バッチ（複数発話）に対するフォワードとロジット系列 [B, T, outputDim] の計算
     public func logitsBatch(
         network: MLXSpikingNetwork,
@@ -81,33 +147,38 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
-        let tSteps = network.timeSteps
         let numLayers = network.numLayers
-        let beta = network.lifConfig.beta
-        let vTh = network.lifConfig.vTh
-        let alpha = network.lifConfig.alpha
-        let rho = network.lifConfig.rho
-        let gamma = network.lifConfig.gamma
-        let vMin = LIFNeuronEngine.vClampMin
-        let vMax = LIFNeuronEngine.vClampMax
-        let readoutK = LIFNeuronEngine.readoutClipInThresholdUnits
 
         // 層 0 の入力電流系列: [B, T, hMax] = [B, T, inputDim] @ [inputDim, hMax] + bH
         let currentSeq0 = matmul(features, network.wIn) + network.bH
-
         var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
         var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
         var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        let readoutList = forwardFrames(network: network, currentSeq0: currentSeq0, from: 0, to: seqLen, v: &v, s: &s, a: &a)
+        return matmul(stacked(readoutList, axis: 1), network.wOut) + network.bOut
+    }
 
+    /// フレーム [t0, t1) を前向きに進め、各フレームの読み出し (サブステップ平均、[B, hMax]) を返す。
+    /// 状態 v, s, a は更新して返す。bpttWindow フレームごとに状態の勾配を切り離す (切り詰め BPTT)
+    func forwardFrames(
+        network: MLXSpikingNetwork,
+        currentSeq0: MLXArray,
+        from t0: Int,
+        to t1: Int,
+        v: inout [MLXArray],
+        s: inout [MLXArray],
+        a: inout [MLXArray]
+    ) -> [MLXArray] {
+        let tSteps = network.timeSteps
+        let numLayers = network.numLayers
         var readoutList: [MLXArray] = []
-        readoutList.reserveCapacity(seqLen)
+        readoutList.reserveCapacity(t1 - t0)
 
-        var t = 0
-        while t < seqLen {
+        var t = t0
+        while t < t1 {
             let current0_t = currentSeq0[0..., t, 0...]
-            var readoutSum = MLXArray.zeros([batchSize, hMax])
+            var readoutSum = MLXArray.zeros(like: v[0])
 
-            // 切り詰め BPTT: bpttWindow フレームごとに勾配を切り離す。
             if (t % bpttWindow) == 0 {
                 var l = 0
                 while l < numLayers {
@@ -120,53 +191,104 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
             var step = 0
             while step < tSteps {
-                // 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差。
-                // 最終層だけハードリセットせず、閾値単位の膜電位を読んでから余りを残す。
-                var current = current0_t + matmul(s[0], network.wRec)
-                var l = 0
-                while l < numLayers {
-                    if 0 < l {
-                        let upperIdx = l - 1
-                        let denseCur = matmul(s[l - 1], network.wLayers[upperIdx]) + network.bHLayers[upperIdx]
-                        // MLXFast.rmsNorm は valueAndGrad + compile で Metal 生存バッファ上限を超える
-                        let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
-                        let rms = sqrt(meanSq + rmsNormEpsilon)
-                        current = (denseCur / rms) * network.gammaRMS[upperIdx] + current
-                    }
-
-                    let isLast = (l + 1) == numLayers
-                    if isLast {
-                        v[l] = clip(v[l] * beta + current, min: vMin, max: vMax)
-                    } else {
-                        v[l] = clip((v[l] * beta) * (1.0 - s[l]) + current, min: vMin, max: vMax)
-                    }
-
-                    a[l] = (a[l] * rho) + (s[l] * gamma)
-                    let dynVTh = vTh + a[l]
-                    let vRel = (v[l] - dynVTh) * alpha
-                    let sSurrogate = 0.5 * (vRel / (1.0 + abs(vRel)) + 1.0)
-                    let sHard = (dynVTh .<= v[l]).asType(.float32)
-                    s[l] = stopGradient(sHard - sSurrogate) + sSurrogate
-
-                    if isLast {
-                        // 読み出しは閾値単位でクリップするが、勾配はクリップ前の値を通す (straight-through)。
-                        // clip の勾配は |v| >= vTh で 0 になり、発火しているニューロンから勾配が流れず
-                        // 学習が 4 倍以上遅くなった (JSUT 20ep 未学習 16.7% → 43.4%)
-                        let scaled = v[l] / vTh
-                        let clipped = clip(scaled, min: -readoutK, max: readoutK)
-                        readoutSum = readoutSum + stopGradient(clipped - scaled) + scaled
-                        v[l] = clip(v[l] - sHard * vTh, min: vMin, max: vMax)
-                    }
-                    l += 1
-                }
+                var inputs: [MLXArray] = [current0_t]
+                inputs.append(contentsOf: v)
+                inputs.append(contentsOf: s)
+                inputs.append(contentsOf: a)
+                let out = substep(network: network, arrays: inputs)
+                v = Array(out[0..<numLayers])
+                s = Array(out[numLayers..<(2 * numLayers)])
+                a = Array(out[(2 * numLayers)..<(3 * numLayers)])
+                readoutSum = readoutSum + out[3 * numLayers]
                 step += 1
             }
 
             readoutList.append(readoutSum / Float(tSteps))
             t += 1
         }
+        return readoutList
+    }
 
-        return matmul(stacked(readoutList, axis: 1), network.wOut) + network.bOut
+    /// 長い系列の損失とパラメータ勾配をチャンク分割で求める。
+    ///
+    /// 全系列を一度に微分すると逆伝播用の中間値が系列長に比例して残り (64 件 × 256 フレームで
+    /// 15 GB、768 フレームで 110 GB)、実メモリを超えると 1 バッチ 30 秒かかる。切り詰め BPTT は
+    /// 窓の外へ勾配を流さないので、次の 3 段で同じ勾配を小さなメモリで得られる。
+    ///   1. 勾配なしの前向きで、チャンク先頭の状態と全フレームのロジットを取る
+    ///   2. CTC 損失のロジットについての勾配を vjp で求める
+    ///   3. チャンクごとに前向きをやり直し、ロジットとその勾配の内積を逆伝播してパラメータ勾配を足す
+    /// チャンク境界は窓境界に揃えるので、一括で微分した結果と一致する
+    func chunkedLossAndGradients(
+        features: MLXArray,
+        extTargets: MLXCTCLoss.ExtendedTargets
+    ) -> (loss: MLXArray, gradients: ModuleParameters) {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        let hMax = network.maxHiddenDim
+        let numLayers = network.numLayers
+        let chunkFrames = max(bpttWindow, (longSequenceChunkFrames / bpttWindow) * bpttWindow)
+
+        // 1. 勾配なしの前向き
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        let currentSeq0 = stopGradient(matmul(features, network.wIn) + network.bH)
+        var chunkStarts: [[MLXArray]] = []
+        var logitsChunks: [MLXArray] = []
+        var t0 = 0
+        while t0 < seqLen {
+            let t1 = min(seqLen, t0 + chunkFrames)
+            chunkStarts.append(v + s + a)
+            let readouts = forwardFrames(network: network, currentSeq0: currentSeq0, from: t0, to: t1, v: &v, s: &s, a: &a)
+            let chunkLogits = matmul(stacked(readouts, axis: 1), network.wOut) + network.bOut
+            eval(v + s + a + [chunkLogits])
+            logitsChunks.append(chunkLogits)
+            t0 = t1
+        }
+        let logits = concatenated(logitsChunks, axis: 1)
+
+        // 2. CTC 損失のロジット勾配
+        let (lossOut, cotangents) = vjp(
+            { (arrays: [MLXArray]) -> [MLXArray] in
+                return [MLXCTCLoss.loss(logits: arrays[0], targets: extTargets)]
+            },
+            primals: [logits],
+            cotangents: [MLXArray(Float(1.0))]
+        )
+        let gradLogits = cotangents[0]
+        eval(lossOut[0], gradLogits)
+
+        // 3. チャンクごとの逆伝播
+        var total: ModuleParameters? = nil
+        var c = 0
+        t0 = 0
+        while t0 < seqLen {
+            let t1 = min(seqLen, t0 + chunkFrames)
+            let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+                let cur = matmul(arrays[0], model.wIn) + model.bH
+                var cv = Array(arrays[2..<(2 + numLayers)])
+                var cs = Array(arrays[(2 + numLayers)..<(2 + 2 * numLayers)])
+                var ca = Array(arrays[(2 + 2 * numLayers)..<(2 + 3 * numLayers)])
+                let readouts = self.forwardFrames(network: model, currentSeq0: cur, from: 0, to: t1 - t0, v: &cv, s: &cs, a: &ca)
+                let chunkLogits = matmul(stacked(readouts, axis: 1), model.wOut) + model.bOut
+                return [sum(chunkLogits * arrays[1])]
+            }
+            var inputs: [MLXArray] = [features[0..., t0..<t1, 0...], gradLogits[0..., t0..<t1, 0...]]
+            inputs.append(contentsOf: chunkStarts[c])
+            let (_, grads) = lg(network, inputs)
+            switch total {
+            case .some(let acc):
+                total = acc.mapValues(grads) { (x: MLXArray, y: MLXArray?) -> MLXArray in
+                    return x + (y ?? MLXArray.zeros(like: x))
+                }
+            case .none:
+                total = grads
+            }
+            eval(total!.flattenedValues())
+            c += 1
+            t0 = t1
+        }
+        return (lossOut[0], total!)
     }
 
     /// バッチ（複数発話）に対するフレーム整列教師の交差エントロピー損失
@@ -324,6 +446,14 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             frameCounts: frameCounts,
             blankId: blankId
         )
+
+        if compiledMaxFrames < maxT && chunkLongSequences {
+            let (loss, grads) = chunkedLossAndGradients(features: featArray, extTargets: extTargets)
+            let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+            optimizer.update(model: network, gradients: clippedGrads)
+            eval(network, optimizer, loss)
+            return loss.item(Float.self)
+        }
 
         if compiled != true || compiledMaxFrames < maxT {
             let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in

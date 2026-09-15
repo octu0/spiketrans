@@ -113,4 +113,25 @@ final class MLXCompiledLearningRateTests: XCTestCase {
         trainer.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: false)
         XCTAssertLessThan(0.0, maxAbsDiff(snapshot.wIn, net.exportWeights().wIn), "importWeights 後に重みが動かない")
     }
+
+    /// 長い系列のチャンク分割の勾配は、一括で微分した勾配と一致する
+    func testChunkedLongSequenceMatchesOneShot() {
+        let inputDim = 16
+        let frames = compiledMaxFrames + 64
+        let (feats, targets) = makeBatch(inputDim: inputDim, frames: frames)
+        let netA = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8)
+        let netB = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8)
+        netB.importWeights(from: netA.exportWeights())
+        let trainerA = MLXBPTTTrainer(network: netA, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        let trainerB = MLXBPTTTrainer(network: netB, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        trainerA.chunkLongSequences = false
+        let lossA = trainerA.trainBatchCTC(featuresBatch: feats, targetsBatch: targets)
+        let lossB = trainerB.trainBatchCTC(featuresBatch: feats, targetsBatch: targets)
+        XCTAssertEqual(lossA, lossB, accuracy: 1e-3 * max(1.0, abs(lossA)), "チャンク分割の損失が一括と違う")
+        let wA = netA.exportWeights()
+        let wB = netB.exportWeights()
+        XCTAssertLessThan(maxAbsDiff(wA.wIn, wB.wIn), 1e-4, "wIn の更新がチャンク分割と一括で違う")
+        XCTAssertLessThan(maxAbsDiff(wA.wOut, wB.wOut), 1e-4, "wOut の更新がチャンク分割と一括で違う")
+        XCTAssertLessThan(maxAbsDiff(wA.wRec, wB.wRec), 1e-4, "wRec の更新がチャンク分割と一括で違う")
+    }
 }
