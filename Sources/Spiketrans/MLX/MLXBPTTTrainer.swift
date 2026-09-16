@@ -40,6 +40,12 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// CTC 学習ステップのキャッシュヒット回数
     public private(set) var ctcCacheHitCount: Int = 0
 
+    /// MLX が使い回しのために抱えるバッファキャッシュの上限。
+    /// 系列長バケットごとに別サイズのバッファが要るため、無制限だと約 50 GB まで膨らんで実メモリ 64 GB を使い切る。
+    /// 逆に 1 ステップの作業領域 (B=64・T=256 で 15〜27 GB) より小さいと、同じ形が続いても毎ステップ確保し直して
+    /// 2 倍遅くなる (256 フレーム: 0.8 → 1.6 秒)。その間に置く
+    public static let cacheLimitBytes = 24 << 30
+
     public init(
         network: MLXSpikingNetwork,
         config: TrainingConfig = TrainingConfig(learningRate: 0.015),
@@ -49,6 +55,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         self.config = config
         self.optimizer = ArrayLRAdam(learningRate: config.learningRate)
         self.bpttWindow = max(1, bpttWindow)
+        MLX.GPU.set(cacheLimit: Self.cacheLimitBytes)
     }
 
     /// 学習率を更新。配列で持つので compile 済みステップにも入力として渡る

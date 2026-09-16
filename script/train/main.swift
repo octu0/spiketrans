@@ -57,8 +57,11 @@ enum Defaults {
     /// 暖機ステップ数の下限
     static let minWarmupSteps = 100
 
-    /// MLX のバッファキャッシュを捨てる間隔 (バッチ数)
-    static let clearCacheEveryBatches = 200
+    /// 系列長バケットをまとめる窓 (バッチ数)。
+    /// compile 済みステップは形が変わるたびに GPU バッファを確保し直すため、バケットが毎バッチ入れ替わると
+    /// 同じ形が続く場合の約 2 倍かかる (256 フレーム: 0.8 → 1.6 秒)。並びは混ぜたまま、この窓の中だけ
+    /// 同じバケットが連続するように並べ替える。窓が 1 epoch の 1% 程度なら学習の順序はほぼ無作為のまま
+    static let bucketRunWindow = 64
 
     /// 学習セットから評価する最大件数。
     /// 学習データが数十万件になると全件評価だけで何時間もかかるため、
@@ -499,6 +502,25 @@ if epochs == 0 {
         gStart = gEnd
     }
 
+    // 系列長バケット (32 フレーム単位に切り上げた最長フレーム数) を、window バッチの窓の中で昇順にまとめる
+    func paddedFrameCount(of group: [Int]) -> Int {
+        var maxFrames = 0
+        for idx in group {
+            maxFrames = max(maxFrames, dataset.frameCount(at: idx))
+        }
+        return ((maxFrames + 31) / 32) * 32
+    }
+    func groupBucketsWithinWindows(_ groups: inout [[Int]], window: Int) {
+        var start = 0
+        while start < groups.count {
+            let end = min(start + window, groups.count)
+            let keyed = groups[start..<end].map { group in (key: paddedFrameCount(of: group), group: group) }
+            let sortedWindow = keyed.sorted { a, b in a.key < b.key }.map { $0.group }
+            groups.replaceSubrange(start..<end, with: sortedWindow)
+            start = end
+        }
+    }
+
     // バッチの特徴量を WAV から並列生成する (遅延読み込みの実体)
     final class FeatureBatchBuffer: @unchecked Sendable {
         var items: [[[Float]]]
@@ -563,6 +585,7 @@ if epochs == 0 {
         // 短い断片ばかり、後半は長い発話ばかりになり、100 万件規模では最初の
         // 数千ステップが 1 秒未満の断片だけで埋まって blank 一色に崩れる
         batchGroups.shuffle()
+        groupBucketsWithinWindows(&batchGroups, window: Defaults.bucketRunWindow)
         var curLR = scheduler.learningRate(
             step: globalStep + 1, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
 
@@ -575,6 +598,8 @@ if epochs == 0 {
         var eagerBatches = 0
         var eagerSeconds = 0.0
         var bucketSeconds: [Int: (count: Int, seconds: Double)] = [:]
+        var bucketSwitches = 0
+        var previousPaddedFrames = 0
 
         var currentFeatures: [[[Float]]] = []
         if 0 < batchGroups.count {
@@ -624,14 +649,12 @@ if epochs == 0 {
             }
             let prev = bucketSeconds[paddedFrames] ?? (count: 0, seconds: 0.0)
             bucketSeconds[paddedFrames] = (count: prev.count + 1, seconds: prev.seconds + gpuElapsed)
+            if paddedFrames != previousPaddedFrames {
+                bucketSwitches += 1
+                previousPaddedFrames = paddedFrames
+            }
             epLossSum += res
             batchCount += 1
-
-            // MLX は解放したバッファを形ごとに使い回すため、系列長が毎バッチ違うと
-            // キャッシュが際限なく増えて Metal のリソース上限に達する。定期的に捨てる
-            if (batchCount % Defaults.clearCacheEveryBatches) == 0 {
-                MLX.Memory.clearCache()
-            }
 
             let waitStart = CFAbsoluteTimeGetCurrent()
             prefetchGroup.wait()
@@ -643,7 +666,8 @@ if epochs == 0 {
         let avgLoss = epLossSum / Float(max(1, batchCount))
         let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
         print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
-        print("    内訳: GPU \(String(format: "%.0f", gpuSeconds)) 秒 (うち eager \(eagerBatches) バッチ \(String(format: "%.0f", eagerSeconds)) 秒) / 先読み待ち \(String(format: "%.0f", waitSeconds)) 秒 / \(batchCount) バッチ")
+        print("    内訳: GPU \(String(format: "%.0f", gpuSeconds)) 秒 (うち eager \(eagerBatches) バッチ \(String(format: "%.0f", eagerSeconds)) 秒) / 先読み待ち \(String(format: "%.0f", waitSeconds)) 秒 / \(batchCount) バッチ / バケット切替 \(bucketSwitches) 回")
+        print("    MLX メモリ: 使用中 \(MLX.Memory.activeMemory >> 20) MB / キャッシュ \(MLX.Memory.cacheMemory >> 20) MB / ピーク \(MLX.GPU.peakMemory >> 20) MB")
         let topBuckets = bucketSeconds.sorted { a, b in b.value.seconds < a.value.seconds }.prefix(6)
         var bucketLine = "    系列長バケット (フレーム: バッチ数 / 秒):"
         for (frames, stat) in topBuckets {
