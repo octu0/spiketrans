@@ -188,22 +188,25 @@ public final class SpeechDataset: @unchecked Sendable {
             var i = worker
             while i < pairs.count {
                 let pair = pairs[i]
-                let (_, features) = loadFeatures(
-                    path: pair.path,
-                    frameStack: frameStack,
-                    loadPCM: false
-                )
-                let frameCount = features.count
-
-                if 0 < frameCount {
-                    buffer.items[i] = SampleMeta(
+                // Foundation 経由の一時オブジェクトを 1 件ごとに捌く (ワーカーのブロックは数万件回る)
+                autoreleasepool {
+                    let (_, features) = loadFeatures(
                         path: pair.path,
-                        rawText: pair.text,
-                        hiraganaText: converter.convertToHiragana(pair.text),
-                        textIds: textVocabulary.textToIds(pair.text),
-                        phonemeIds: converter.toPhonemeTokenIds(pair.text),
-                        frameCount: frameCount
+                        frameStack: frameStack,
+                        loadPCM: false
                     )
+                    let frameCount = features.count
+
+                    if 0 < frameCount {
+                        buffer.items[i] = SampleMeta(
+                            path: pair.path,
+                            rawText: pair.text,
+                            hiraganaText: converter.convertToHiragana(pair.text),
+                            textIds: textVocabulary.textToIds(pair.text),
+                            phonemeIds: converter.toPhonemeTokenIds(pair.text),
+                            frameCount: frameCount
+                        )
+                    }
                 }
                 i += workerCount
             }

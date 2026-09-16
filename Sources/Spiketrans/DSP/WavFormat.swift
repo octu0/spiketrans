@@ -387,7 +387,9 @@ func readBytes(from handle: FileHandle, count: Int, allowShort: Bool) throws -> 
     var out = Data()
     out.reserveCapacity(count)
     while out.count < count {
-        let chunk = try handle.read(upToCount: count - out.count)
+        // FileHandle の読み出しは autorelease される NSData を返す。並列ワーカーの長いループの中では
+        // プールが捌けず、ファイルぶんのメモリが数十万件分たまるので、読んだ場で捌く
+        let chunk = try autoreleasepool { try handle.read(upToCount: count - out.count) }
         switch chunk {
         case .some(let data) where 0 < data.count:
             out.append(data)

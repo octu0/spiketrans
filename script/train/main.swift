@@ -24,10 +24,9 @@ enum Defaults {
     /// 隠れ層の次元
     static let maxHiddenDim = 1024
     /// 音響 SNN の層数。層 0 が再帰層、層 1 以降は電流残差付きフィードフォワード層。
-    /// JSUT 2000 × 20 epoch: 2 層 22.6% → 3 層 19.9% → 4 層 19.7% (未学習かな CER)。
-    /// 混合 1.5 万件 × 3 epoch: 2 層 49.6% → 3 層 40.0%。幅 1536 も同程度の改善だが推論コストは
-    /// 3 層 +13% に対し +44%。4 層・3 層+1536 は伸びず学習時間だけ増える
-    static let numLayers = 3
+    /// 幅を広げるより層を足す方が同じ計算量で表現力を稼げる (再帰は層 0 だけなので 1 層 +1.05M、RTF +0.001 程度。
+    /// 幅 1.5 倍は計算 2.25 倍)。3 層は 39 万件 × 9 epoch で held-out が 4 epoch と横ばい (容量律速) だったため 4 層
+    static let numLayers = 4
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
@@ -536,11 +535,13 @@ if epochs == 0 {
             var i = worker
             while i < indices.count {
                 let meta = dataset.metaSamples[indices[i]]
-                buffer.items[i] = SpeechDataset.loadFeatures(
-                    path: meta.path,
-                    frameStack: Defaults.frameStack,
-                    loadPCM: false
-                ).features
+                buffer.items[i] = autoreleasepool {
+                    SpeechDataset.loadFeatures(
+                        path: meta.path,
+                        frameStack: Defaults.frameStack,
+                        loadPCM: false
+                    ).features
+                }
                 i += workerCount
             }
         }

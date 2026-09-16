@@ -15,8 +15,10 @@ public final class WavStreamReader: @unchecked Sendable {
 
     public init(filePath: String) throws {
         let url = URL(fileURLWithPath: filePath)
-        let attrs = try FileManager.default.attributesOfItem(atPath: filePath)
-        let fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        let fileSize = try autoreleasepool {
+            let attrs = try FileManager.default.attributesOfItem(atPath: filePath)
+            return (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        }
         let handle = try FileHandle(forReadingFrom: url)
         self.handle = handle
         let format = try WavFormat.read(from: handle, fileSize: fileSize)
