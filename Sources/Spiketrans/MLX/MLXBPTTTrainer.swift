@@ -7,9 +7,11 @@ import MLXOptimizers
 internal let rmsNormEpsilon: Float = 1e-5
 
 /// compile() する系列長の上限 (32 の倍数に切り上げた後のフレーム数)。
-/// compile は時間ループを静的に展開するため、実測で T=256 が 13 GB、T=500 が 46〜72 GB、
-/// T=1000 で OOM。これを超える長い系列は eager で流す
-public let compiledMaxFrames = 256
+/// compile は時間ループを静的に展開するため、1 ステップのピークメモリは系列長と層数に比例する
+/// (B=64・T=256 で 4 層 26 GB、5 層 37 GB。8 層なら実メモリ 64 GB を超える)。
+/// これを超える系列はチャンク分割の逆伝播で流す。学習中の compile 済み 256 バケットは 7.3 ms/フレームで
+/// チャンク分割 (7 ms/フレーム) と同等なので、128 に下げても速度はほぼ変わらずピークだけ下がる
+public let compiledMaxFrames = 128
 
 /// MLX 上の切り詰め BPTT。系列が `compiledMaxFrames` を超えると eager。
 public final class MLXBPTTTrainer: @unchecked Sendable {
@@ -30,7 +32,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     private var compiledLogitsSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
     /// compiledMaxFrames を超える系列をチャンク分割で学習するときの 1 チャンクのフレーム数
-    public let longSequenceChunkFrames = compiledMaxFrames / 2
+    public let longSequenceChunkFrames = compiledMaxFrames
     /// false にすると長い系列も一括で微分する (比較用)
     public var chunkLongSequences = true
 
