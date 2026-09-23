@@ -276,7 +276,12 @@ func parseSRTTime(_ s: String) -> Float? {
 }
 
 /// SRT を読む。連番行は無視し、時刻行の次から空行までを本文とする (複数行は連結)
-func parseSRT(_ text: String) -> [TimedLine] {
+func parseSRT(_ rawText: String) -> [TimedLine] {
+    // CRLF (Windows 改行) と BOM は SRT の判定と時刻の解析を壊すので先に揃える
+    let text = rawText
+        .replacingOccurrences(of: "\u{FEFF}", with: "")
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
     var cues: [TimedLine] = []
     var pendingStart: Float = 0.0
     var pendingEnd: Float = 0.0
