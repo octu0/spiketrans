@@ -37,6 +37,21 @@ final class WavStreamReaderTests: XCTestCase {
         XCTAssertEqual(streamed.pcmData[1], parsed.pcmData[1], accuracy: 1e-6)
     }
 
+    func testFollowsSymbolicLink() throws {
+        var samples = [Int16](repeating: 0, count: 160)
+        var i = 0
+        while i < samples.count {
+            samples[i] = Int16(i * 50)
+            i += 1
+        }
+        let path = try writeFile(classicMono16(samples: samples), name: "target.wav")
+        let link = (tempDir as NSString).appendingPathComponent("link.wav")
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: path)
+        let streamed = try WavStreamReader(filePath: link).readToEnd()
+        XCTAssertEqual(streamed.pcmData.count, samples.count)
+        XCTAssertEqual(streamed.pcmData[3], Float(samples[3]) / 32768.0, accuracy: 1e-6)
+    }
+
     func testJunkChunkBeforeFmtMatchesParser() throws {
         let bytes = junkThenPcm16()
         let path = try writeFile(bytes, name: "junk.wav")

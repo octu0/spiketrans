@@ -14,9 +14,10 @@ public final class WavStreamReader: @unchecked Sendable {
     private var isClosed = false
 
     public init(filePath: String) throws {
-        let url = URL(fileURLWithPath: filePath)
+        // シンボリックリンクはリンク先を見る (attributesOfItem はリンク自体のサイズを返す)
+        let url = URL(fileURLWithPath: filePath).resolvingSymlinksInPath()
         let fileSize = try autoreleasepool {
-            let attrs = try FileManager.default.attributesOfItem(atPath: filePath)
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
             return (attrs[.size] as? NSNumber)?.uint64Value ?? 0
         }
         let handle = try FileHandle(forReadingFrom: url)

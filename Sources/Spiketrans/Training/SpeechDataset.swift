@@ -151,16 +151,21 @@ public final class SpeechDataset: @unchecked Sendable {
         }
     }
 
-    /// WAV ファイルから音響特徴量をロードする
+    /// WAV ファイルから音響特徴量をロードする。
+    /// `pcmTransform` は 16 kHz の PCM に特徴量抽出の前で掛ける (学習時の雑音付加など)
     public static func loadFeatures(
         path: String,
         frameStack: Int,
-        loadPCM: Bool = false
+        loadPCM: Bool = false,
+        pcmTransform: (([Float]) -> [Float])? = nil
     ) -> (pcm: [Float], features: [[Float]]) {
         guard let wav = loadWavFile(path: path) else {
             return ([], [])
         }
-        let pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
+        var pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
+        if let transform = pcmTransform {
+            pcm16k = transform(pcm16k)
+        }
         let features = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack)
         return (pcm16k, features)
     }

@@ -100,6 +100,7 @@ var maxTrainSamples: Int? = nil
 var batchSize = Defaults.batchSize
 var datasetPath = ""
 var englishDictPath = ""
+var noiseBankPath = ""
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
@@ -121,6 +122,8 @@ while argIdx < args.count {
         print("  --device <auto|gpu|cpu>            実行デバイス (既定: auto)")
         print("  --export-weights <パス>            学習済み重みの出力先 JSON パス")
         print("  --import-weights <パス>            初期重みのインポート元 JSON パス")
+        print("  --english-dict <パス>              英語の発音辞書 (CMU 形式) [必須]")
+        print("  --noise-bank <jsonl>               学習時に発話へ重ねる雑音バンクのマニフェスト (省略時は付加しない)")
         exit(0)
     case "-p", "--parallel":
         if (argIdx + 1) < args.count {
@@ -160,6 +163,11 @@ while argIdx < args.count {
             englishDictPath = args[argIdx + 1]
             argIdx += 1
         }
+    case "--noise-bank":
+        if (argIdx + 1) < args.count {
+            noiseBankPath = args[argIdx + 1]
+            argIdx += 1
+        }
     case "--device":
         if (argIdx + 1) < args.count {
             deviceArg = args[argIdx + 1].lowercased()
@@ -193,6 +201,15 @@ guard let englishDict = try? EnglishPronunciations(contentsOfFile: englishDictPa
     exit(1)
 }
 print("英語の発音辞書: \(englishDictPath) (\(englishDict.count) 語)")
+var noiseBank: NoiseBank? = nil
+if noiseBankPath.isEmpty != true {
+    guard let bank = try? NoiseBank(manifestPath: noiseBankPath), 0 < bank.count else {
+        print("エラー: 雑音バンク \(noiseBankPath) が読み込めません。")
+        exit(1)
+    }
+    noiseBank = bank
+    print("雑音バンク: \(noiseBankPath) (\(bank.count) クリップ、\(String(format: "%.1f", bank.totalSeconds / 60.0)) 分。確率 \(NoiseBank.probability)、SNR \(NoiseBank.snrRange.lowerBound)〜\(NoiseBank.snrRange.upperBound) dB)")
+}
 
 if datasetPath.isEmpty {
     print("エラー: 学習マニフェスト (JSONL) を指定してください。")
@@ -543,7 +560,8 @@ if epochs == 0 {
                     SpeechDataset.loadFeatures(
                         path: meta.path,
                         frameStack: Defaults.frameStack,
-                        loadPCM: false
+                        loadPCM: false,
+                        pcmTransform: noiseBank?.mix
                     ).features
                 }
                 i += workerCount
