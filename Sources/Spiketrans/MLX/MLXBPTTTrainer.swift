@@ -31,6 +31,13 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// 系列長 (T) をキーとするコンパイル済み logitsBatch のキャッシュ
     private var compiledLogitsSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
+    /// (バッチ件数 << 16 | チャンクのフレーム数) をキーとする、チャンク分割の前向き (勾配なし) と逆伝播の
+    /// コンパイル済み関数。チャンクの形は 32 単位の 4 種類なので、件数ごとに数回のトレースで済む
+    private var compiledChunkForward: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledChunkBackward: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    /// `chunkBackward` が返す勾配配列の並び (ModuleParameters の flattened キー)
+    private var chunkGradKeys: [String] = []
+
     /// compiledMaxFrames を超える系列をチャンク分割で学習するときの 1 チャンクのフレーム数
     public let longSequenceChunkFrames = compiledMaxFrames
     /// false にすると長い系列も一括で微分する (比較用)
@@ -72,6 +79,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         optimizer.resetState()
         compiledCTCSteps.removeAll()
         compiledLogitsSteps.removeAll()
+        compiledChunkForward.removeAll()
+        compiledChunkBackward.removeAll()
         eval(network, optimizer)
     }
 
@@ -229,7 +238,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// チャンク境界は窓境界に揃えるので、一括で微分した結果と一致する
     func chunkedLossAndGradients(
         features: MLXArray,
-        extTargets: MLXCTCLoss.ExtendedTargets
+        extTargets: MLXCTCLoss.ExtendedTargets,
+        compiled: Bool = true
     ) -> (loss: MLXArray, gradients: ModuleParameters) {
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
@@ -237,21 +247,56 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let numLayers = network.numLayers
         let chunkFrames = max(bpttWindow, (longSequenceChunkFrames / bpttWindow) * bpttWindow)
 
+        // チャンクの形 [B, フレーム数] ごとに compile して、以後はトレース済みの関数を使う。
+        // 端のチャンクは 32 フレーム単位に切り上げて 0 で埋める (因果系なので前のフレームの結果は変わらない)。
+        // 形の種類は 32・64・96・128 の 4 つで済み、160 フレームの系列を 256 まで埋める無駄を避ける
+        func paddedFrames(_ frames: Int) -> Int {
+            return min(chunkFrames, ((frames + 31) / 32) * 32)
+        }
+        func padded(_ x: MLXArray, to frames: Int) -> MLXArray {
+            if x.shape[1] == frames {
+                return x
+            }
+            return concatenated([x, MLXArray.zeros([x.shape[0], frames - x.shape[1], x.shape[2]])], axis: 1)
+        }
+        func forwardFn(_ frames: Int) -> ([MLXArray]) -> [MLXArray] {
+            if compiled != true {
+                return { arrays in self.chunkForward(arrays, chunkFrames: frames) }
+            }
+            let key = batchSize << 16 | frames
+            if let cached = compiledChunkForward[key] {
+                return cached
+            }
+            let fn = compile(inputs: [network]) { arrays in self.chunkForward(arrays, chunkFrames: frames) }
+            compiledChunkForward[key] = fn
+            return fn
+        }
+        func backwardFn(_ frames: Int) -> ([MLXArray]) -> [MLXArray] {
+            if compiled != true {
+                return { arrays in self.chunkBackward(arrays, chunkFrames: frames) }
+            }
+            let key = batchSize << 16 | frames
+            if let cached = compiledChunkBackward[key] {
+                return cached
+            }
+            let fn = compile(inputs: [network]) { arrays in self.chunkBackward(arrays, chunkFrames: frames) }
+            compiledChunkBackward[key] = fn
+            return fn
+        }
+
         // 1. 勾配なしの前向き
-        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
-        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
-        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
-        let currentSeq0 = stopGradient(matmul(features, network.wIn) + network.bH)
+        var states = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: 3 * numLayers)
         var chunkStarts: [[MLXArray]] = []
         var logitsChunks: [MLXArray] = []
         var t0 = 0
         while t0 < seqLen {
             let t1 = min(seqLen, t0 + chunkFrames)
-            chunkStarts.append(v + s + a)
-            let readouts = forwardFrames(network: network, currentSeq0: currentSeq0, from: t0, to: t1, v: &v, s: &s, a: &a)
-            let chunkLogits = matmul(stacked(readouts, axis: 1), network.wOut) + network.bOut
-            eval(v + s + a + [chunkLogits])
-            logitsChunks.append(chunkLogits)
+            let frames = paddedFrames(t1 - t0)
+            chunkStarts.append(states)
+            let out = forwardFn(frames)([padded(features[0..., t0..<t1, 0...], to: frames)] + states)
+            eval(out)
+            logitsChunks.append(out[0][0..., 0..<(t1 - t0), 0...])
+            states = Array(out[1...])
             t0 = t1
         }
         let logits = concatenated(logitsChunks, axis: 1)
@@ -267,24 +312,16 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let gradLogits = cotangents[0]
         eval(lossOut[0], gradLogits)
 
-        // 3. チャンクごとの逆伝播
+        // 3. チャンクごとの逆伝播 (パラメータ勾配を足し込む)
         var total: ModuleParameters? = nil
         var c = 0
         t0 = 0
         while t0 < seqLen {
             let t1 = min(seqLen, t0 + chunkFrames)
-            let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
-                let cur = matmul(arrays[0], model.wIn) + model.bH
-                var cv = Array(arrays[2..<(2 + numLayers)])
-                var cs = Array(arrays[(2 + numLayers)..<(2 + 2 * numLayers)])
-                var ca = Array(arrays[(2 + 2 * numLayers)..<(2 + 3 * numLayers)])
-                let readouts = self.forwardFrames(network: model, currentSeq0: cur, from: 0, to: t1 - t0, v: &cv, s: &cs, a: &ca)
-                let chunkLogits = matmul(stacked(readouts, axis: 1), model.wOut) + model.bOut
-                return [sum(chunkLogits * arrays[1])]
-            }
-            var inputs: [MLXArray] = [features[0..., t0..<t1, 0...], gradLogits[0..., t0..<t1, 0...]]
-            inputs.append(contentsOf: chunkStarts[c])
-            let (_, grads) = lg(network, inputs)
+            let frames = paddedFrames(t1 - t0)
+            let inputs = [padded(features[0..., t0..<t1, 0...], to: frames), padded(gradLogits[0..., t0..<t1, 0...], to: frames)] + chunkStarts[c]
+            let gradValues = backwardFn(frames)(inputs)
+            let grads = ModuleParameters.unflattened(Array(zip(chunkGradKeys, gradValues)))
             switch total {
             case .some(let acc):
                 total = acc.mapValues(grads) { (x: MLXArray, y: MLXArray?) -> MLXArray in
@@ -298,6 +335,38 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             t0 = t1
         }
         return (lossOut[0], total!)
+    }
+
+    /// チャンク 1 つの勾配なし前向き。入力は [特徴量 [B, C, inDim]] + 状態 (v, s, a を層ごとに)、
+    /// 出力は [ロジット [B, C, V]] + チャンク末尾の状態
+    private func chunkForward(_ arrays: [MLXArray], chunkFrames: Int) -> [MLXArray] {
+        let numLayers = network.numLayers
+        let cur = matmul(arrays[0], network.wIn) + network.bH
+        var v = Array(arrays[1..<(1 + numLayers)])
+        var s = Array(arrays[(1 + numLayers)..<(1 + 2 * numLayers)])
+        var a = Array(arrays[(1 + 2 * numLayers)..<(1 + 3 * numLayers)])
+        let readouts = forwardFrames(network: network, currentSeq0: cur, from: 0, to: chunkFrames, v: &v, s: &s, a: &a)
+        let logits = matmul(stacked(readouts, axis: 1), network.wOut) + network.bOut
+        return [logits] + v + s + a
+    }
+
+    /// チャンク 1 つの逆伝播。入力は [特徴量, ロジット勾配] + チャンク先頭の状態、
+    /// 出力はパラメータ勾配を `chunkGradKeys` の順に並べたもの
+    private func chunkBackward(_ arrays: [MLXArray], chunkFrames: Int) -> [MLXArray] {
+        let numLayers = network.numLayers
+        let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+            let cur = matmul(arrays[0], model.wIn) + model.bH
+            var cv = Array(arrays[2..<(2 + numLayers)])
+            var cs = Array(arrays[(2 + numLayers)..<(2 + 2 * numLayers)])
+            var ca = Array(arrays[(2 + 2 * numLayers)..<(2 + 3 * numLayers)])
+            let readouts = self.forwardFrames(network: model, currentSeq0: cur, from: 0, to: chunkFrames, v: &cv, s: &cs, a: &ca)
+            let chunkLogits = matmul(stacked(readouts, axis: 1), model.wOut) + model.bOut
+            return [sum(chunkLogits * arrays[1])]
+        }
+        let (_, grads) = lg(network, arrays)
+        let flat = grads.flattened()
+        chunkGradKeys = flat.map { $0.0 }
+        return flat.map { $0.1 }
     }
 
     /// バッチ（複数発話）に対するフレーム整列教師の交差エントロピー損失
@@ -457,7 +526,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         )
 
         if compiledMaxFrames < maxT && chunkLongSequences {
-            let (loss, grads) = chunkedLossAndGradients(features: featArray, extTargets: extTargets)
+            let (loss, grads) = chunkedLossAndGradients(features: featArray, extTargets: extTargets, compiled: compiled)
             let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
             optimizer.update(model: network, gradients: clippedGrads)
             eval(network, optimizer, loss)

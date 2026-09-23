@@ -134,4 +134,29 @@ final class MLXCompiledLearningRateTests: XCTestCase {
         XCTAssertLessThan(maxAbsDiff(wA.wOut, wB.wOut), 1e-4, "wOut の更新がチャンク分割と一括で違う")
         XCTAssertLessThan(maxAbsDiff(wA.wRec, wB.wRec), 1e-4, "wRec の更新がチャンク分割と一括で違う")
     }
+
+    /// compile したチャンク分割 (端の短いチャンクは 0 埋め) が、compile なしのチャンク分割と同じ更新をする。
+    /// 2 ステップ回して 2 回目がキャッシュ済みの compile 関数を使う経路も通す
+    func testCompiledChunksMatchEagerChunks() {
+        let inputDim = 16
+        let frames = compiledMaxFrames + 40
+        let (feats, targets) = makeBatch(inputDim: inputDim, frames: frames)
+        let netA = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8)
+        let netB = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8)
+        netB.importWeights(from: netA.exportWeights())
+        let trainerA = MLXBPTTTrainer(network: netA, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        let trainerB = MLXBPTTTrainer(network: netB, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        var step = 0
+        while step < 2 {
+            let lossA = trainerA.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: false)
+            let lossB = trainerB.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: true)
+            XCTAssertEqual(lossA, lossB, accuracy: 1e-3 * max(1.0, abs(lossA)), "compile 済みチャンクの損失が違う (step \(step))")
+            step += 1
+        }
+        let wA = netA.exportWeights()
+        let wB = netB.exportWeights()
+        XCTAssertLessThan(maxAbsDiff(wA.wIn, wB.wIn), 1e-4, "wIn の更新が compile 済みチャンクで違う")
+        XCTAssertLessThan(maxAbsDiff(wA.wOut, wB.wOut), 1e-4, "wOut の更新が compile 済みチャンクで違う")
+        XCTAssertLessThan(maxAbsDiff(wA.wRec, wB.wRec), 1e-4, "wRec の更新が compile 済みチャンクで違う")
+    }
 }
