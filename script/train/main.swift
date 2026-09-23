@@ -601,6 +601,12 @@ if epochs == 0 {
     var rollbacks = 0
 
     var globalStep = 0
+    // 学習済みの重みから続けるときは暖機と減衰をやり直さず、最初から lrMin 一定で進める。
+    // 収束した重みを lrMax でなぞると壊れる。減衰上限に達した長い学習の続きと同じ形になる
+    if importedWeights != nil {
+        globalStep = scheduleSteps
+        print("  学習済みの重みから再開: 学習率は最初から lrMin \(Defaults.lrMin) 一定")
+    }
     var ep = 1
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
