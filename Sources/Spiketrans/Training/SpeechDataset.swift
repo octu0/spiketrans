@@ -152,12 +152,14 @@ public final class SpeechDataset: @unchecked Sendable {
     }
 
     /// WAV ファイルから音響特徴量をロードする。
-    /// `pcmTransform` は 16 kHz の PCM に特徴量抽出の前で掛ける (学習時の雑音付加など)
+    /// `pcmTransform` は 16 kHz の PCM に特徴量抽出の前で掛け (話速摂動・雑音付加)、
+    /// `featureTransform` は抽出した特徴量に掛ける (SpecAugment)。どちらも学習時だけ
     public static func loadFeatures(
         path: String,
         frameStack: Int,
         loadPCM: Bool = false,
-        pcmTransform: (([Float]) -> [Float])? = nil
+        pcmTransform: (([Float]) -> [Float])? = nil,
+        featureTransform: (([[Float]]) -> [[Float]])? = nil
     ) -> (pcm: [Float], features: [[Float]]) {
         guard let wav = loadWavFile(path: path) else {
             return ([], [])
@@ -166,7 +168,10 @@ public final class SpeechDataset: @unchecked Sendable {
         if let transform = pcmTransform {
             pcm16k = transform(pcm16k)
         }
-        let features = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack)
+        var features = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack)
+        if let transform = featureTransform {
+            features = transform(features)
+        }
         return (pcm16k, features)
     }
 

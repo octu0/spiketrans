@@ -101,6 +101,9 @@ var batchSize = Defaults.batchSize
 var datasetPath = ""
 var englishDictPath = ""
 var noiseBankPath = ""
+var dictTextPaths: [String] = []
+var evalDumpPath = ""
+var augmentOptions: Set<String> = []
 var deviceArg = "auto"
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
@@ -124,6 +127,9 @@ while argIdx < args.count {
         print("  --import-weights <パス>            初期重みのインポート元 JSON パス")
         print("  --english-dict <パス>              英語の発音辞書 (CMU 形式) [必須]")
         print("  --noise-bank <jsonl>               学習時に発話へ重ねる雑音バンクのマニフェスト (省略時は付加しない)")
+        print("  --dict-text <パス>                 第2段のかな漢字辞書だけに足すテキスト (.txt/.srt かそのディレクトリ。複数可。未学習セットの本文は入れない)")
+        print("  --eval-dump <jsonl>                評価の項目別結果 (かな CER・正解と推論のかな・長さ) を書き出す")
+        print("  --augment <speed,spec>             学習時のデータ拡張 (speed: 話速 0.9〜1.1 倍、spec: SpecAugment)。省略時は無し")
         exit(0)
     case "-p", "--parallel":
         if (argIdx + 1) < args.count {
@@ -168,6 +174,29 @@ while argIdx < args.count {
             noiseBankPath = args[argIdx + 1]
             argIdx += 1
         }
+    case "--dict-text":
+        if (argIdx + 1) < args.count {
+            dictTextPaths.append(args[argIdx + 1])
+            argIdx += 1
+        }
+    case "--eval-dump":
+        if (argIdx + 1) < args.count {
+            evalDumpPath = args[argIdx + 1]
+            argIdx += 1
+        }
+    case "--augment":
+        if (argIdx + 1) < args.count {
+            for item in args[argIdx + 1].split(separator: ",") {
+                let name = item.trimmingCharacters(in: .whitespaces)
+                if name == "speed" || name == "spec" {
+                    augmentOptions.insert(name)
+                } else if name.isEmpty != true {
+                    print("エラー: --augment の値 \(name) は不明です (speed, spec)。")
+                    exit(1)
+                }
+            }
+            argIdx += 1
+        }
     case "--device":
         if (argIdx + 1) < args.count {
             deviceArg = args[argIdx + 1].lowercased()
@@ -209,6 +238,14 @@ if noiseBankPath.isEmpty != true {
     }
     noiseBank = bank
     print("雑音バンク: \(noiseBankPath) (\(bank.count) クリップ、\(String(format: "%.1f", bank.totalSeconds / 60.0)) 分。確率 \(NoiseBank.probability)、SNR \(NoiseBank.snrRange.lowerBound)〜\(NoiseBank.snrRange.upperBound) dB)")
+}
+let augmenter = FeatureAugmenter(
+    speed: augmentOptions.contains("speed"),
+    specAugment: augmentOptions.contains("spec"),
+    noiseBank: noiseBank
+)
+if augmentOptions.isEmpty != true {
+    print("データ拡張: \(augmentOptions.sorted().joined(separator: ", ")) (話速 \(FeatureAugmenter.speedRange.lowerBound)〜\(FeatureAugmenter.speedRange.upperBound) 倍 / 時間マスク \(FeatureAugmenter.timeMasks) 本 ≤ \(FeatureAugmenter.maxTimeMaskFrames) フレーム / 周波数マスク \(FeatureAugmenter.frequencyMasks) 本 ≤ \(FeatureAugmenter.maxFrequencyMaskBands) 帯)")
 }
 
 if datasetPath.isEmpty {
@@ -324,15 +361,36 @@ case .some(let embedded):
 case .none:
     phoneticVocabulary = TextVocabulary(corpus: trainHiraganaLines)
 }
-let textVocabulary = TextVocabulary(corpus: trainTextLines)
+// 辞書専用テキスト (音声なし)。第2段の辞書と漢字かな混じり語彙にだけ足す
+var dictTextLines: [String] = []
+for path in dictTextPaths {
+    let lines = DictionaryTextCorpus.load(path: path)
+    if lines.isEmpty {
+        print("エラー: 辞書専用テキスト \(path) からテキストが読めません。")
+        exit(1)
+    }
+    dictTextLines.append(contentsOf: lines)
+}
+let textVocabulary = TextVocabulary(corpus: trainTextLines + dictTextLines)
 
 let kanaKanjiDict = KanaKanjiDictionary()
-kanaKanjiDict.buildFromCorpus(rawTexts: trainTextLines)
+kanaKanjiDict.buildFromCorpus(rawTexts: trainTextLines, converter: kanjiConverter)
+let dictEntriesFromSpeech = kanaKanjiDict.count
+if dictTextLines.isEmpty != true {
+    kanaKanjiDict.buildFromCorpus(rawTexts: dictTextLines, converter: kanjiConverter)
+}
 
 print("コーパス総行数: \(textLines.count) 件 (うち学習セット: \(trainTextLines.count) 件)")
+if dictTextLines.isEmpty != true {
+    print("辞書専用テキスト: \(dictTextLines.count) 行 (\(dictTextPaths.count) パス) → 辞書エントリ \(dictEntriesFromSpeech) → \(kanaKanjiDict.count) 語")
+}
 print("第1段 音響 SNN (かな・音素) 語彙数: \(phoneticVocabulary.size) 文字 (学習セットのみ)")
 print("第2段 言語 SNN (漢字かな混じり) 語彙数: \(textVocabulary.size) 文字 (学習セットのみ)")
-print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語 (学習セットのみ)")
+if dictTextLines.isEmpty {
+    print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語 (学習セットのみ)")
+} else {
+    print("第2段 かな漢字変換辞書エントリ数: \(kanaKanjiDict.count) 語 (学習セット + 辞書専用テキスト)")
+}
 
 // 3. 遅延データセット構築 (メタデータのみ保持し、特徴量はバッチ生成時に WAV から作る)
 print("\n--- 1. かな・漢字データセット構築 (最大 \(sampleLimit) 件、遅延読み込み) ---")
@@ -561,7 +619,8 @@ if epochs == 0 {
                         path: meta.path,
                         frameStack: Defaults.frameStack,
                         loadPCM: false,
-                        pcmTransform: noiseBank?.mix
+                        pcmTransform: augmenter.pcmTransform,
+                        featureTransform: augmenter.featureTransform
                     ).features
                 }
                 i += workerCount
@@ -1684,6 +1743,36 @@ func printExamples(_ title: String, _ list: [EvalResult]) {
 printExamples("未学習セット 良い例 Top 5", top5Best)
 printExamples("未学習セット 悪い例 Top 5", top5Worst)
 
+// 項目別の結果を jsonl に書き出す (ラベルの欠落 = 推論が正解より長い区間の割合、などの切り分け用)
+if evalDumpPath.isEmpty != true {
+    var lines: [String] = []
+    for r in allEval {
+        let row: [String: Any] = [
+            "fileId": r.fileId,
+            "corpus": r.corpus,
+            "isTrain": r.isTrain,
+            "cer": r.cer,
+            "kanaCer": r.kanaCer,
+            "targetKana": r.targetKana,
+            "predKana": r.predKana,
+            "targetKanaLength": r.targetKana.count,
+            "predKanaLength": r.predKana.count,
+            "targetText": r.targetText,
+            "predText": r.predText,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: row, options: [.withoutEscapingSlashes]),
+           let line = String(data: data, encoding: .utf8) {
+            lines.append(line)
+        }
+    }
+    do {
+        try (lines.joined(separator: "\n") + "\n").write(toFile: evalDumpPath, atomically: true, encoding: .utf8)
+        print("\n項目別の評価結果を書き出しました: \(evalDumpPath) (\(lines.count) 件)")
+    } catch {
+        print("\n✕ 項目別の評価結果を書き出せません: \(evalDumpPath)")
+    }
+}
+
 // 未学習セットが小さいときは全件を出す。配信の評価セットで、区間ごとの音の条件と CER を突き合わせるため
 if unseenResults.count <= 200 {
     print("\n--- [未学習セット 全件] fileId かなCER 漢字CER ---")
@@ -1704,7 +1793,7 @@ var reportContent = """
 - **第1段 LIF**: beta = \(Defaults.lifConfig.beta), rho = \(Defaults.lifConfig.rho), gamma = \(Defaults.lifConfig.gamma)
 - **特徴量**: \(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね = \(Defaults.acousticInputDim) 次元
 - **学習**: CTC 損失, 切り詰め BPTT 窓 \(Defaults.bpttWindow), 学習率 \(Defaults.lrMax) → \(Defaults.lrMin)
-- **語彙・かな漢字辞書**: 学習セット \(trainTextLines.count) 件のみから構築 (未学習セットの正解テキストは不使用)
+- **語彙・かな漢字辞書**: 学習セット \(trainTextLines.count) 件 + 辞書専用テキスト \(dictTextLines.count) 行から構築 (未学習セットの正解テキストは不使用)
 - **サンプリング**: 48kHz $\to$ 16kHz リサンプリング (アンチエイリアス 3:1 間引き)
 - **デコーダ**: CTC Prefix Beam Search, 第2段 言語 SNN 加点 = \(Defaults.languageBonus)
 - **評価指標**:

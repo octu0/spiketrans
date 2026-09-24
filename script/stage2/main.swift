@@ -128,16 +128,10 @@ let converter = KanjiConverter(english: englishDict)
 let dictionary = KanaKanjiDictionary()
 dictionary.buildFromCorpus(rawTexts: dictTexts, converter: converter)
 if extraCorpusPath.isEmpty != true {
-    guard let extraContent = try? String(contentsOfFile: extraCorpusPath, encoding: .utf8) else {
+    let extraLines = DictionaryTextCorpus.load(path: extraCorpusPath)
+    if extraLines.isEmpty {
         print("追加コーパスの読み込みに失敗: \(extraCorpusPath)")
         exit(1)
-    }
-    var extraLines: [String] = []
-    for line in extraContent.components(separatedBy: .newlines) {
-        let tr = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if tr.isEmpty != true {
-            extraLines.append(tr)
-        }
     }
     dictionary.buildFromCorpus(rawTexts: extraLines, converter: converter)
     print("追加コーパス統合: \(extraCorpusPath) (\(extraLines.count) 行)")
