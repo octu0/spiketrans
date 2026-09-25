@@ -114,4 +114,38 @@ final class MLXCTCLossTests: XCTestCase {
         }
         XCTAssertEqual(batchLoss, sum / Float(samples.count), accuracy: 1e-3)
     }
+
+    /// 整列できない発話 (フレーム数より必要ラベル長が長い) が混ざっても、損失は残りの発話の平均になる
+    func testInfeasibleUtteranceIsExcludedFromMean() {
+        let vocab = 6
+        let frames = 8
+        var logitsRows: [[[Float]]] = []
+        var b = 0
+        while b < 2 {
+            var seq: [[Float]] = []
+            var t = 0
+            while t < frames {
+                var row = [Float](repeating: 0.0, count: vocab)
+                var v = 0
+                while v < vocab {
+                    row[v] = Float((t * 3 + v * 5 + b) % 7) * 0.2
+                    v += 1
+                }
+                seq.append(row)
+                t += 1
+            }
+            logitsRows.append(seq)
+            b += 1
+        }
+        let logits = MLXArray(logitsRows.flatMap { $0.flatMap { $0 } }, [2, frames, vocab])
+        let feasibleTargets = [1, 2, 3]
+        // 8 フレームに 7 ラベルの重複 (2 * 7 + 1 = 15 > 8) は整列できない
+        let infeasibleTargets = [1, 1, 1, 1, 1, 1, 1]
+        let mixed = MLXCTCLoss.ExtendedTargets(targetsBatch: [feasibleTargets, infeasibleTargets], frameCounts: [frames, frames], blankId: 0)
+        let mixedLoss = MLXCTCLoss.loss(logits: logits, targets: mixed).item(Float.self)
+        let single = MLXCTCLoss.ExtendedTargets(targetsBatch: [feasibleTargets], frameCounts: [frames], blankId: 0)
+        let singleLoss = MLXCTCLoss.loss(logits: logits[0..<1], targets: single).item(Float.self)
+        XCTAssertEqual(mixedLoss, singleLoss, accuracy: 1e-3, "整列できない発話が損失の平均に混ざっている")
+        XCTAssertLessThan(mixedLoss, 1e6)
+    }
 }

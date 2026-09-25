@@ -197,6 +197,11 @@ public enum MLXCTCLoss {
         let last2 = which(MLXArray(0.0) .< targets.hasSecondFinal, last2Raw, MLXArray(negativeInfinity))
 
         let logLikelihood = logAddExp(last1, last2)
-        return -mean(logLikelihood)
+        // 整列できない発話 (フレーム数 < 必要ラベル長など) は対数尤度が番兵 -1e30 のまま残る。
+        // そのまま平均すると損失が 1e25 規模に化け、勾配も壊れるので、平均から外す
+        let feasible = logLikelihood .> MLXArray(negativeInfinity * 0.5)
+        let safe = which(feasible, logLikelihood, MLXArray(Float(0.0)))
+        let count = maximum(sum(feasible.asType(.float32)), MLXArray(Float(1.0)))
+        return -sum(safe) / count
     }
 }
