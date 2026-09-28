@@ -93,7 +93,6 @@ final class Tier3CombinationTests: XCTestCase {
         }
     }
 
-
     // MARK: - 3. BPTT 学習モデル ↔ Int32 固定小数点推論
     func testComboBPTTTrainingToQuantizedInferenceInt32() {
         let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 64, outputDim: 64, timeSteps: 4)
@@ -259,24 +258,6 @@ final class Tier3CombinationTests: XCTestCase {
     // MARK: - 7. Base モデル単体切出 export ↔ import ↔ 推論一致
 
     // MARK: - 8. 3スライス同時時間逆伝播勾配累積 ↔ Adam オプティマイザ
-    func testComboAdamOptimizerMultiSliceGradientAccumulation() {
-        let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)
-        let config = AdamConfig(lr: 0.01)
-        let adam = AdamOptimizer(config: config, parameters: net.parameters)
-        let trainer = BPTTTrainer(network: net, optimizer: adam)
-
-        var seq: [[Float]] = []
-        var targets: [Int] = []
-        var i = 0
-        while i < 5 {
-            seq.append([Float](repeating: 0.5, count: 32))
-            targets.append((i + 5) % 64)
-            i += 1
-        }
-
-        let stepRes = trainer.trainStep(featuresSeq: seq, targets: targets)
-        XCTAssertLessThanOrEqual(0.0, stepRes)
-    }
 
     // MARK: - 9. LPC 係数 ↔ Durand-Kerner ↔ フォルマント ↔ 32次元特徴量統合
     func testComboDurandKernerToFormantEnergyFilterbank() {

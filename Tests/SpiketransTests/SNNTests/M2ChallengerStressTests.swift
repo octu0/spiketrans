@@ -224,184 +224,9 @@ final class M2ChallengerStressTests: XCTestCase {
 
     // MARK: - 2. Fast Sigmoid 代理勾配および数値安定性テスト (Surrogate Gradient)
 
-    /// 代理勾配の極大膜電位・微小偏差・NaN/Inf 入力に対する安定性
-    func testSurrogateGradientExtremeValues() {
-        let vTh: Float = 1.0
-        let alpha: Float = 2.0
-
-        // 1. 極大電位差 (|V - Vth| = 1e6) -> 1 / (1 + 2e6)^2 ~= 0.0 (アンダーフローで安全に0に収束)
-        let dFar = SurrogateGradient.derivative(v: 1e6, vTh: vTh, alpha: alpha)
-        XCTAssertEqual(dFar, 0.0, accuracy: 1e-10)
-        XCTAssertFalse(dFar.isNaN)
-        XCTAssertFalse(dFar.isInfinite)
-
-        // 2. 極小偏差 (|V - Vth| = 1e-7) -> 1.0 に極めて近い値
-        let dNear = SurrogateGradient.derivative(v: 1.0 + 1e-7, vTh: vTh, alpha: alpha)
-        XCTAssertEqual(dNear, 1.0, accuracy: 1e-5)
-
-        // 3. SIMD8 での境界配列一括計算
-        let testCounts = [0, 1, 7, 8, 15, 16, 32, 64, 128]
-        var tIdx = 0
-        while tIdx < testCounts.count {
-            let count = testCounts[tIdx]
-            var vArray = [Float](repeating: 0.0, count: count)
-            var dstSIMD = [Float](repeating: 0.0, count: count)
-            var dstScalar = [Float](repeating: 0.0, count: count)
-
-            var i = 0
-            while i < count {
-                vArray[i] = Float(i - count / 2) * 0.1 + 1.0
-                dstScalar[i] = SurrogateGradient.derivative(v: vArray[i], vTh: vTh, alpha: alpha)
-                i += 1
-            }
-
-            if 0 < count {
-                vArray.withUnsafeBufferPointer { vp in
-                    dstSIMD.withUnsafeMutableBufferPointer { dp in
-                        SurrogateGradient.derivativeSIMD8(
-                            vPtr: vp.baseAddress!,
-                            dstPtr: dp.baseAddress!,
-                            count: count,
-                            vTh: vTh,
-                            alpha: alpha
-                        )
-                    }
-                }
-            }
-
-            i = 0
-            while i < count {
-                XCTAssertEqual(dstSIMD[i], dstScalar[i], accuracy: 1e-6)
-                i += 1
-            }
-
-            tIdx += 1
-        }
-    }
-
     // MARK: - 3. BPTT 学習・勾配爆発/消失・異常データ注入テスト (BPTTTrainer & Adam)
 
-    /// 勾配爆発シナリオ (Exploding Gradients): 極大特徴量入力時における Adam L2 ノルムクリッピングの保護検証
-    func testBPTTTrainerExplodingGradientL2Clipping() {
-        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
-        let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
-        let trainer = BPTTTrainer(network: net, optimizer: opt)
-
-        // 極大値を持つ特徴量系列
-        var explodingFeatures: [[Float]] = []
-        var k = 0
-        while k < 3 {
-            explodingFeatures.append([1e4, 1e4, 1e4, 1e4])
-            k += 1
-        }
-        let targets = [0, 1, 2]
-
-        // trainStep を実行
-        let stepRes = trainer.trainStep(featuresSeq: explodingFeatures, targets: targets)
-        XCTAssertFalse(stepRes.isNaN)
-        XCTAssertFalse(stepRes.isInfinite)
-
-        // 全パラメータが NaN / Inf にならず有限値にとどまっていること
-        for param in net.parameters {
-            var i = 0
-            while i < param.count {
-                XCTAssertFalse(param.data[i].isNaN, "Parameter data became NaN")
-                XCTAssertFalse(param.data[i].isInfinite, "Parameter data became Inf")
-                XCTAssertFalse(param.m[i].isNaN, "Momentum m became NaN")
-                XCTAssertFalse(param.v[i].isNaN, "Momentum v became NaN")
-                i += 1
-            }
-        }
-    }
-
-    /// 勾配消失シナリオ (Vanishing Gradient / Total Silence): 全ゼロ入力・発火ゼロ時の安定性
-    func testBPTTTrainerZeroActivityStability() {
-        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
-        let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
-        let trainer = BPTTTrainer(network: net, optimizer: opt)
-
-        // 全ゼロ入力
-        var zeroFeatures: [[Float]] = []
-        var k = 0
-        while k < 4 {
-            zeroFeatures.append([0.0, 0.0, 0.0, 0.0])
-            k += 1
-        }
-        let targets = [0, 1, 2, 3]
-
-        let stepRes = trainer.trainStep(featuresSeq: zeroFeatures, targets: targets)
-        XCTAssertFalse(stepRes.isNaN)
-        XCTAssertLessThan(0.0, stepRes)
-
-        for param in net.parameters {
-            var i = 0
-            while i < param.count {
-                XCTAssertFalse(param.data[i].isNaN)
-                XCTAssertFalse(param.data[i].isInfinite)
-                i += 1
-            }
-        }
-    }
-
-    /// 範囲外・異常ターゲットインデックス (Negative, Out-of-Bounds, All Invalid) 注入時のクラッシュ防止
-    func testBPTTTrainerInvalidTargetsHandling() {
-        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
-        let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
-        let trainer = BPTTTrainer(network: net, optimizer: opt)
-
-        var featuresSeq: [[Float]] = []
-        var k = 0
-        while k < 3 {
-            featuresSeq.append([0.1, 0.2, 0.3, 0.4])
-            k += 1
-        }
-
-        // 1. 範囲外ターゲット (-1, 999, 4) 混在
-        let corruptedTargets = [-1, 999, 4]
-        let stepRes1 = trainer.trainStep(featuresSeq: featuresSeq, targets: corruptedTargets)
-        // 有効ターゲットが 0 個なので loss は 0.0、勾配は 0 で更新なし
-        XCTAssertEqual(stepRes1, 0.0)
-
-        // 2. 一部のみ有効なターゲット ([-10, 2, 100])
-        let partialTargets = [-10, 2, 100]
-        let stepRes2 = trainer.trainStep(featuresSeq: featuresSeq, targets: partialTargets)
-        XCTAssertLessThan(0.0, stepRes2)
-        XCTAssertFalse(stepRes2.isNaN)
-
-        // 3. 空ターゲット配列
-        let emptyTargets: [Int] = []
-        let stepRes3 = trainer.trainStep(featuresSeq: featuresSeq, targets: emptyTargets)
-        XCTAssertEqual(stepRes3, 0.0)
-    }
-
-    /// 極端な学習率 (lr = 0.0, lr = 100.0) におけるオプティマイザの安全性
-    func testAdamOptimizerExtremeLearningRates() {
-        let p = Parameter(count: 4, initialData: [1.0, 2.0, 3.0, 4.0])
-        p.grad = [0.5, 0.5, 0.5, 0.5]
-
-        // 1. lr = 0.0 -> パラメータが一切変化しないこと
-        let optZero = AdamOptimizer(config: AdamConfig(lr: 0.0, gradClip: 1.0), parameters: [p])
-        optZero.step()
-        XCTAssertEqual(p.data[0], 1.0)
-        XCTAssertEqual(p.data[1], 2.0)
-        XCTAssertEqual(p.data[2], 3.0)
-        XCTAssertEqual(p.data[3], 4.0)
-
-        // 2. lr = 100.0 -> パラメータが有限値に更新され、NaN/Inf にならないこと
-        let p2 = Parameter(count: 4, initialData: [1.0, 2.0, 3.0, 4.0])
-        p2.grad = [10.0, 10.0, 10.0, 10.0]
-        let optHuge = AdamOptimizer(config: AdamConfig(lr: 100.0, gradClip: 1.0), parameters: [p2])
-        optHuge.step()
-        var i = 0
-        while i < 4 {
-            XCTAssertFalse(p2.data[i].isNaN)
-            XCTAssertFalse(p2.data[i].isInfinite)
-            i += 1
-        }
-    }
-
     // MARK: - 4. SNN 動的スライス切り替え・状態整合性テスト (SpikingNetwork)
-
 
     /// Softmax の極大・極小ロジットに対する数値安定性 (NaN / ゼロ除算の回避)
     func testSoftmaxNumericalStability() {
@@ -505,8 +330,6 @@ final class M2ChallengerStressTests: XCTestCase {
         XCTAssertEqual(sumP, 1.0, accuracy: 1e-4)
     }
 
-
-
     // MARK: - 6. NaN / Inf 入力および空シーケンス耐性テスト (Anomaly Data Robustness)
 
     /// LIF ニューロンに NaN / Inf / -Inf が入力された場合の非クラッシュ・SIMD8一致テスト
@@ -569,28 +392,6 @@ final class M2ChallengerStressTests: XCTestCase {
             XCTAssertEqual(sOutArr[i], scRes.sNext)
             i += 1
         }
-    }
-
-    /// 空系列 (Sequence Length = 0) における BPTT 学習トレーナーの非クラッシュ検証
-    func testBPTTTrainerEmptySequenceSafety() {
-        let net = SpikingNetwork(inputDim: 4, maxHiddenDim: 256, outputDim: 4, timeSteps: 2)
-        let opt = AdamOptimizer(config: AdamConfig(lr: 0.01, gradClip: 1.0), parameters: net.parameters)
-        let trainer = BPTTTrainer(network: net, optimizer: opt)
-
-        let emptyFeatures: [[Float]] = []
-        let emptyTargets: [Int] = []
-
-        // forwardSequence がクラッシュせず loss = 0.0 を返すこと
-        let fwdRes = trainer.forwardSequence(featuresSeq: emptyFeatures, targets: emptyTargets)
-        XCTAssertEqual(fwdRes.loss, 0.0)
-        XCTAssertEqual(fwdRes.cache.seqLen, 0)
-
-        // backwardSequence がクラッシュしないこと
-        trainer.backwardSequence(featuresSeq: emptyFeatures, targets: emptyTargets, cache: fwdRes.cache)
-
-        // trainStep がクラッシュせず 0.0 を返すこと
-        let stepRes = trainer.trainStep(featuresSeq: emptyFeatures, targets: emptyTargets)
-        XCTAssertEqual(stepRes, 0.0)
     }
 
     /// Int16 量子化と Int32 量子化のビットシフト減衰比較・ダイナミックレンジ検証

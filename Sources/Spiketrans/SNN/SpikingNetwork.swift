@@ -1,6 +1,7 @@
 import Foundation
 
-/// Float32 の SNN。層 0 は再帰 LIF、層 1 以降は FF LIF。上位層は結合電流を RMSNorm してから前層電流を足す。
+/// Float32 の SNN。層 0 は再帰 LIF、層 1 以降は FF LIF (`upperRecurrent` なら層 1 以降も再帰)。
+/// 上位層は結合電流を RMSNorm してから前層電流を足す。
 public final class SpikingNetwork: @unchecked Sendable {
     public let numLayers: Int
     public let inputDim: Int
@@ -15,6 +16,8 @@ public final class SpikingNetwork: @unchecked Sendable {
     public private(set) var wRecT: [Float] = []
     /// 層 1 以降の結合重みの転置コピー (wRecT と同じ並び)
     public private(set) var wLayersT: [[Float]] = []
+    /// 層 1 以降の再帰結合の転置コピー (wRecT と同じ並び)。再帰なしの構成では空
+    public private(set) var wRecLayersT: [[Float]] = []
     /// 推論用の転置コピー。wOutT[k * outputDim + c] = wOut[c][k]
     public private(set) var wOutT: [Float] = []
 
@@ -27,6 +30,8 @@ public final class SpikingNetwork: @unchecked Sendable {
     public let pWLayers: [Parameter]
     public let pBHLayers: [Parameter]
     public let pGammaRMS: [Parameter]
+    /// 層 1 以降の再帰結合 (同じ層の直前サブステップのスパイクから)。再帰なしの構成では空
+    public let pWRecLayers: [Parameter]
 
     // リードアウト
     public let pWOut: Parameter        // [outputDim, maxHiddenDim]
@@ -39,7 +44,8 @@ public final class SpikingNetwork: @unchecked Sendable {
         maxHiddenDim: Int = 4096,
         outputDim: Int = 64,
         timeSteps: Int = 4,
-        lifConfig: LIFConfig = LIFConfig()
+        lifConfig: LIFConfig = LIFConfig(),
+        upperRecurrent: Bool = false
     ) {
         self.numLayers = max(1, numLayers)
         self.inputDim = inputDim
@@ -71,6 +77,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         var wLayersList: [Parameter] = []
         var bhLayersList: [Parameter] = []
         var gammaRMSList: [Parameter] = []
+        var wRecLayersList: [Parameter] = []
         let scaleLayer = sqrt(2.0 / Float(maxHiddenDim))
 
         var l = 1
@@ -87,6 +94,15 @@ public final class SpikingNetwork: @unchecked Sendable {
             wLayersList.append(Parameter(count: maxHiddenDim * maxHiddenDim, initialData: initWLayer))
             bhLayersList.append(Parameter(count: maxHiddenDim, initialData: initBHL))
             gammaRMSList.append(Parameter(count: maxHiddenDim, initialData: initGamma))
+            if upperRecurrent {
+                var initWRecLayer = [Float](repeating: 0.0, count: maxHiddenDim * maxHiddenDim)
+                idx = 0
+                while idx < maxHiddenDim * maxHiddenDim {
+                    initWRecLayer[idx] = Float.random(in: -scaleRec...scaleRec)
+                    idx += 1
+                }
+                wRecLayersList.append(Parameter(count: maxHiddenDim * maxHiddenDim, initialData: initWRecLayer))
+            }
             l += 1
         }
 
@@ -106,6 +122,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         self.pWLayers = wLayersList
         self.pBHLayers = bhLayersList
         self.pGammaRMS = gammaRMSList
+        self.pWRecLayers = wRecLayersList
         self.pWOut = Parameter(count: outputDim * maxHiddenDim, initialData: initWOut)
         self.pBOut = Parameter(count: outputDim, initialData: initBOut)
 
@@ -120,7 +137,8 @@ public final class SpikingNetwork: @unchecked Sendable {
             maxHiddenDim: weights.maxHiddenDim,
             outputDim: weights.outputDim,
             timeSteps: weights.timeSteps,
-            lifConfig: weights.lifConfig
+            lifConfig: weights.lifConfig,
+            upperRecurrent: weights.hasUpperRecurrence
         )
         self.importWeights(from: weights)
     }
@@ -134,6 +152,7 @@ public final class SpikingNetwork: @unchecked Sendable {
             params.append(pGammaRMS[l])
             l += 1
         }
+        params.append(contentsOf: pWRecLayers)
         params.append(pWOut)
         params.append(pBOut)
         return params
@@ -153,10 +172,18 @@ public final class SpikingNetwork: @unchecked Sendable {
             wLayers: pWLayers.map { $0.data },
             bHLayers: pBHLayers.map { $0.data },
             gammaRMS: pGammaRMS.map { $0.data },
+            wRecLayers: exportedRecLayers(),
             wOut: pWOut.data,
             bOut: pBOut.data,
             vocabularyCharacters: vocabulary?.serializedCharacters
         )
+    }
+
+    private func exportedRecLayers() -> [[Float]]? {
+        if pWRecLayers.isEmpty {
+            return nil
+        }
+        return pWRecLayers.map { $0.data }
     }
 
     /// 全体重みのインポート (学習時の LIF / ALIF パラメータも同時に復元)
@@ -183,6 +210,15 @@ public final class SpikingNetwork: @unchecked Sendable {
                 pGammaRMS[l].data = weightsData.gammaRMS[l]
             }
             l += 1
+        }
+        if let rec = weightsData.wRecLayers {
+            var r = 0
+            while r < min(pWRecLayers.count, rec.count) {
+                if rec[r].count == pWRecLayers[r].data.count {
+                    pWRecLayers[r].data = rec[r]
+                }
+                r += 1
+            }
         }
         if weightsData.wOut.count == pWOut.data.count {
             pWOut.data = weightsData.wOut
@@ -237,6 +273,31 @@ public final class SpikingNetwork: @unchecked Sendable {
                 }
             }
             l += 1
+        }
+        var r = 0
+        while r < pWRecLayers.count {
+            if wRecLayersT.count <= r {
+                wRecLayersT.append([Float](repeating: 0.0, count: hSize * hSize))
+            }
+            if wRecLayersT[r].count != hSize * hSize {
+                wRecLayersT[r] = [Float](repeating: 0.0, count: hSize * hSize)
+            }
+            let srcRec = pWRecLayers[r].data
+            srcRec.withUnsafeBufferPointer { src in
+                wRecLayersT[r].withUnsafeMutableBufferPointer { dst in
+                    var n = 0
+                    while n < hSize {
+                        let rowOffset = n * hSize
+                        var j = 0
+                        while j < hSize {
+                            dst[j * hSize + n] = src[rowOffset + j]
+                            j += 1
+                        }
+                        n += 1
+                    }
+                }
+            }
+            r += 1
         }
         if wOutT.count != hSize * outputDim {
             wOutT = [Float](repeating: 0.0, count: hSize * outputDim)
@@ -563,6 +624,37 @@ public final class SpikingNetwork: @unchecked Sendable {
                     }
                 }
 
+                // 再帰構成: 同じ層の直前サブステップのスパイクによる再帰電流を足す。
+                // 次の上位層へ渡す残差 (stepCurrentsPrev) にも同じ電流を含める (学習側と同じ式)
+                if upperIdx < wRecLayersT.count {
+                    var activeRecCount = 0
+                    var rj = 0
+                    while rj < hSize {
+                        if sPrev[thisLayerOffset + rj] != 0.0 {
+                            scratch.activeLayerSpikes[activeRecCount] = rj
+                            activeRecCount += 1
+                        }
+                        rj += 1
+                    }
+                    let hasNext = (layerIdx + 1) < numLayers
+                    wRecLayersT[upperIdx].withUnsafeBufferPointer { wBuf in
+                        scratch.stepCurrents.withUnsafeMutableBufferPointer { stepBuf in
+                            scratch.stepCurrentsPrev.withUnsafeMutableBufferPointer { prevBuf in
+                                let wT = wBuf.baseAddress!
+                                var a = 0
+                                while a < activeRecCount {
+                                    let row = wT.advanced(by: scratch.activeLayerSpikes[a] * hSize)
+                                    Self.addRow(row, to: stepBuf.baseAddress!, count: hSize)
+                                    if hasNext {
+                                        Self.addRow(row, to: prevBuf.baseAddress!, count: hSize)
+                                    }
+                                    a += 1
+                                }
+                            }
+                        }
+                    }
+                }
+
                 vPrev.withUnsafeMutableBufferPointer { vBuf in
                     sPrev.withUnsafeMutableBufferPointer { sBuf in
                         aPrev.withUnsafeMutableBufferPointer { aBuf in
@@ -705,6 +797,23 @@ public final class SpikingNetwork: @unchecked Sendable {
             probabilities: &probabilities,
             scratch: scratch
         )
+    }
+
+    /// dst[0..<count] に row を足す
+    @inline(__always)
+    private static func addRow(_ row: UnsafePointer<Float>, to dst: UnsafeMutablePointer<Float>, count: Int) {
+        let limit = count - (count % 8)
+        var n = 0
+        while n < limit {
+            let acc = UnsafeRawPointer(dst.advanced(by: n)).loadUnaligned(as: SIMD8<Float>.self)
+            let w = UnsafeRawPointer(row.advanced(by: n)).loadUnaligned(as: SIMD8<Float>.self)
+            UnsafeMutableRawPointer(dst.advanced(by: n)).storeBytes(of: acc + w, as: SIMD8<Float>.self)
+            n += 8
+        }
+        while n < count {
+            dst[n] += row[n]
+            n += 1
+        }
     }
 
     /// 隠れ層はハードリセット、最終層は閾値単位の膜電位を読んで余りを残す。

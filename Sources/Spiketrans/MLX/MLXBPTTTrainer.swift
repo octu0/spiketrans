@@ -86,7 +86,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
     /// 1 サブステップ分の全層 LIF 更新。
     /// 入力 [層 0 の入力電流, v_0...v_L-1, s_0...s_L-1, a_0...a_L-1]、出力 [v..., s..., a..., 最終層の読み出し]。
-    /// 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差。
+    /// 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差 (+ 再帰構成なら同じ層の直前スパイクの再帰電流)。
     /// 最終層だけハードリセットせず、閾値単位の膜電位を読んでから余りを残す
     func substep(network: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] {
         let numLayers = network.numLayers
@@ -115,6 +115,9 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
                 let rms = sqrt(meanSq + rmsNormEpsilon)
                 current = (denseCur / rms) * network.gammaRMS[upperIdx] + current
+                if upperIdx < network.wRecLayers.count {
+                    current = current + matmul(s[l], network.wRecLayers[upperIdx])
+                }
             }
 
             let isLast = (l + 1) == numLayers

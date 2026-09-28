@@ -23,6 +23,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let wLayers: [[Float]]    // [numLayers - 1][maxHiddenDim * maxHiddenDim]
     public let bHLayers: [[Float]]   // [numLayers - 1][maxHiddenDim]
     public let gammaRMS: [[Float]]   // [numLayers - 1][maxHiddenDim]
+    /// 層 1 以降の再帰結合 (同じ層の直前サブステップのスパイクから)。上位層に再帰を持たない構成では nil
+    public let wRecLayers: [[Float]]?  // [numLayers - 1][maxHiddenDim * maxHiddenDim]
 
     public let wOut: [Float]   // [outputDim * maxHiddenDim]
     public let bOut: [Float]   // [outputDim]
@@ -43,6 +45,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         wLayers: [[Float]] = [],
         bHLayers: [[Float]] = [],
         gammaRMS: [[Float]] = [],
+        wRecLayers: [[Float]]? = nil,
         wOut: [Float],
         bOut: [Float],
         vocabularyCharacters: String? = nil
@@ -63,9 +66,18 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.wLayers = wLayers
         self.bHLayers = bHLayers
         self.gammaRMS = gammaRMS
+        self.wRecLayers = wRecLayers
         self.wOut = wOut
         self.bOut = bOut
         self.vocabularyCharacters = vocabularyCharacters
+    }
+
+    /// 上位層が再帰結合を持つか
+    public var hasUpperRecurrence: Bool {
+        guard let rec = wRecLayers else {
+            return false
+        }
+        return rec.isEmpty != true
     }
 
     /// 層数 (層 0 + 上位層)

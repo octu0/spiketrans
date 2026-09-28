@@ -1,28 +1,9 @@
 import Foundation
 
-public struct TrainingSummary: Sendable {
-    public let acousticEpochs: [EpochResult]
-    public let languageEpochs: [EpochResult]
-    public let finalAcousticLoss: Float
-    public let finalLanguageLoss: Float
-
-    public init(
-        acousticEpochs: [EpochResult],
-        languageEpochs: [EpochResult],
-        finalAcousticLoss: Float,
-        finalLanguageLoss: Float
-    ) {
-        self.acousticEpochs = acousticEpochs
-        self.languageEpochs = languageEpochs
-        self.finalAcousticLoss = finalAcousticLoss
-        self.finalLanguageLoss = finalLanguageLoss
-    }
-}
-
-/// 音響 SNN と言語 SNN の学習と、その推論入口。
+/// 音響 SNN と言語 SNN の推論入口。学習は MLXBPTTTrainer が行い、重みをここへ転送する。
 public final class Trainer: @unchecked Sendable {
-    public let acousticTrainer: AcousticTrainer
-    public let languageTrainer: LanguageTrainer
+    public let acousticNetwork: SpikingNetwork
+    public let languageNetwork: SpikingNetwork
     public let textVocabulary: TextVocabulary
     public let phonemeVocabulary: PhonemeVocabulary
 
@@ -30,24 +11,18 @@ public final class Trainer: @unchecked Sendable {
         acousticNetwork: SpikingNetwork,
         languageNetwork: SpikingNetwork,
         textVocabulary: TextVocabulary,
-        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        config: TrainingConfig = TrainingConfig()
+        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary()
     ) {
         self.textVocabulary = textVocabulary
         self.phonemeVocabulary = phonemeVocabulary
-        self.acousticTrainer = AcousticTrainer(network: acousticNetwork, config: config)
-        self.languageTrainer = LanguageTrainer(
-            network: languageNetwork,
-            textVocabulary: textVocabulary,
-            config: config
-        )
+        self.acousticNetwork = acousticNetwork
+        self.languageNetwork = languageNetwork
     }
 
     /// 音響入力は `SpeechDataset.acousticInputDim()`、言語入力は 128 次元のトークン埋め込み。
     public static func makeDefault(
         textVocabulary: TextVocabulary,
-        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
-        config: TrainingConfig = TrainingConfig()
+        phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary()
     ) -> Trainer {
         let acNet = SpikingNetwork(
             inputDim: SpeechDataset.acousticInputDim(),
@@ -65,34 +40,9 @@ public final class Trainer: @unchecked Sendable {
             acousticNetwork: acNet,
             languageNetwork: lmNet,
             textVocabulary: textVocabulary,
-            phonemeVocabulary: phonemeVocabulary,
-            config: config
+            phonemeVocabulary: phonemeVocabulary
         )
     }
-
-    /// 音響を先に、言語を後に学習する。`numWorkers` は各段の内部並列。
-    public func fit(dataset: SpeechDataset, numWorkers: Int = 1) -> TrainingSummary {
-        let acResults = acousticTrainer.train(dataset: dataset, numWorkers: numWorkers)
-        let lmResults = languageTrainer.train(dataset: dataset, numWorkers: numWorkers)
-
-        var finalAcLoss: Float = 0.0
-        if 0 < acResults.count {
-            finalAcLoss = acResults[acResults.count - 1].totalLoss
-        }
-
-        var finalLmLoss: Float = 0.0
-        if 0 < lmResults.count {
-            finalLmLoss = lmResults[lmResults.count - 1].totalLoss
-        }
-
-        return TrainingSummary(
-            acousticEpochs: acResults,
-            languageEpochs: lmResults,
-            finalAcousticLoss: finalAcLoss,
-            finalLanguageLoss: finalLmLoss
-        )
-    }
-
 }
 
 /// 推論実行精度モード
@@ -105,7 +55,7 @@ public enum ExecutionPrecision: String, Sendable, CaseIterable {
 
 extension Trainer {
     private func acousticFrameStack() -> Int {
-        var stack = acousticTrainer.network.inputDim / StreamingFeatureFrontEnd.tapDim
+        var stack = acousticNetwork.inputDim / StreamingFeatureFrontEnd.tapDim
         if stack < 1 {
             stack = 1
         }
@@ -131,37 +81,37 @@ extension Trainer {
             break
         case .float16:
             let qWeights = QuantizedEngine.quantize(
-                network: acousticTrainer.network,
+                network: acousticNetwork,
                 config: .float16Config()
             )
-            qEngine = QuantizedEngine(weights: qWeights, timeSteps: acousticTrainer.network.timeSteps)
+            qEngine = QuantizedEngine(weights: qWeights, timeSteps: acousticNetwork.timeSteps)
         case .int32:
             let qWeights = QuantizedEngine.quantize(
-                network: acousticTrainer.network,
+                network: acousticNetwork,
                 config: .int32Config()
             )
-            qEngine = QuantizedEngine(weights: qWeights, timeSteps: acousticTrainer.network.timeSteps)
+            qEngine = QuantizedEngine(weights: qWeights, timeSteps: acousticNetwork.timeSteps)
         case .int16:
             let qWeights = QuantizedEngine.quantize(
-                network: acousticTrainer.network,
+                network: acousticNetwork,
                 config: .int16Config()
             )
-            qEngine = QuantizedEngine(weights: qWeights, timeSteps: acousticTrainer.network.timeSteps)
+            qEngine = QuantizedEngine(weights: qWeights, timeSteps: acousticNetwork.timeSteps)
         }
 
         let acDecoder = AcousticDecoder(
-            network: acousticTrainer.network,
+            network: acousticNetwork,
             quantizedEngine: qEngine
         )
         let acWorkspace = AcousticWorkspace(
-            maxHiddenDim: acousticTrainer.network.maxHiddenDim,
-            outputDim: acousticTrainer.network.outputDim,
-            inputDim: acousticTrainer.network.inputDim,
-            numLayers: acousticTrainer.network.numLayers
+            maxHiddenDim: acousticNetwork.maxHiddenDim,
+            outputDim: acousticNetwork.outputDim,
+            inputDim: acousticNetwork.inputDim,
+            numLayers: acousticNetwork.numLayers
         )
 
         let lmDecoder = LanguageDecoder(
-            lmNetwork: languageTrainer.network,
+            lmNetwork: languageNetwork,
             vocabulary: textVocabulary
         )
 
@@ -215,13 +165,13 @@ extension Trainer {
         }
 
         let acDecoder = AcousticDecoder(
-            network: acousticTrainer.network
+            network: acousticNetwork
         )
         let acWorkspace = AcousticWorkspace(
-            maxHiddenDim: acousticTrainer.network.maxHiddenDim,
-            outputDim: acousticTrainer.network.outputDim,
-            inputDim: acousticTrainer.network.inputDim,
-            numLayers: acousticTrainer.network.numLayers
+            maxHiddenDim: acousticNetwork.maxHiddenDim,
+            outputDim: acousticNetwork.outputDim,
+            inputDim: acousticNetwork.inputDim,
+            numLayers: acousticNetwork.numLayers
         )
 
         let frameProbs = acDecoder.decodeSequence(
@@ -317,7 +267,7 @@ extension Trainer {
             return ""
         }
 
-        let network = acousticTrainer.network
+        let network = acousticNetwork
         let acDecoder = AcousticDecoder(
             network: network
         )
@@ -391,7 +341,7 @@ extension Trainer {
         case .some(let dict):
             // 辞書 Viterbi DP に、学習済み第2段 言語 SNN の予測も手掛かりとして与える
             let lmDecoder = LanguageDecoder(
-                lmNetwork: languageTrainer.network,
+                lmNetwork: languageNetwork,
                 vocabulary: kanjiVocabulary
             )
             let decoder = KanaKanjiDecoder(
@@ -403,7 +353,7 @@ extension Trainer {
             kanjiText = decoder.decode(kanaText: kanaText)
         case .none:
             let decoder = LanguageDecoder(
-                lmNetwork: languageTrainer.network,
+                lmNetwork: languageNetwork,
                 vocabulary: kanjiVocabulary
             )
             kanjiText = decoder.decodeKanaToKanji(

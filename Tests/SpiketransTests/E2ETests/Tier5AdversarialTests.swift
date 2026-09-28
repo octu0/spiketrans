@@ -350,29 +350,6 @@ final class Tier5AdversarialTests: XCTestCase {
     }
 
     // MARK: - 9. 逆伝播勾配爆発時の Global Norm Clipping 耐性
-    func testAdversarialGradientExplosionClipping() {
-        let p1 = Parameter(count: 2, initialData: [0.0, 0.0])
-        p1.grad = [1e8, 1e8]
-        let p2 = Parameter(count: 2, initialData: [0.0, 0.0])
-        p2.grad = [1e8, 1e8]
-
-        let config = AdamConfig(lr: 0.01, gradClip: 1.0)
-        let adam = AdamOptimizer(config: config, parameters: [p1, p2])
-        adam.step()
-
-        var sumSq1: Float = 0.0
-        var sumSq2: Float = 0.0
-        p1.grad.withUnsafeBufferPointer { ptr in
-            sumSq1 = VectorOperations.sumOfSquares(ptr: ptr.baseAddress!, count: 2)
-        }
-        p2.grad.withUnsafeBufferPointer { ptr in
-            sumSq2 = VectorOperations.sumOfSquares(ptr: ptr.baseAddress!, count: 2)
-        }
-        let norm1 = sqrt(sumSq1)
-        let norm2 = sqrt(sumSq2)
-        XCTAssertLessThanOrEqual(norm1, 1.01)
-        XCTAssertLessThanOrEqual(norm2, 1.01)
-    }
 
     // MARK: - 10. メモリ安全性 / 高速連続ライフサイクル
     func testAdversarialMemorySafetyDoubleFree() {

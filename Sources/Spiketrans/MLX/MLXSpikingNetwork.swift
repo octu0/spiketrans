@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import MLXNN
 
-/// MLX 上の SNN。層 0 は再帰 LIF、層 1 以降は FF LIF。
+/// MLX 上の SNN。層 0 は再帰 LIF、層 1 以降は FF LIF (`upperRecurrent` なら層 1 以降も再帰)。
 /// 上位層は結合電流を RMSNorm し、前層の入力電流を足す。疎スパイクをそのまま
 /// 重み付けすると上位層が沈黙するため。
 public final class MLXSpikingNetwork: Module, @unchecked Sendable {
@@ -22,6 +22,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     public var wLayers: [MLXArray]   // 各 [maxHiddenDim, maxHiddenDim]
     public var bHLayers: [MLXArray]  // 各 [maxHiddenDim]
     public var gammaRMS: [MLXArray]  // 各 [maxHiddenDim]
+    /// 層 1 以降の再帰結合 (同じ層の直前サブステップのスパイクから)。再帰なしの構成では空
+    public var wRecLayers: [MLXArray]  // 各 [maxHiddenDim, maxHiddenDim]
 
     // リードアウト
     public var wOut: MLXArray      // [maxHiddenDim, outputDim]
@@ -33,7 +35,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         maxHiddenDim: Int = 1024,
         outputDim: Int = 523,
         timeSteps: Int = 4,
-        lifConfig: LIFConfig = LIFConfig()
+        lifConfig: LIFConfig = LIFConfig(),
+        upperRecurrent: Bool = false
     ) {
         self.numLayers = max(1, numLayers)
         self.inputDim = inputDim
@@ -54,16 +57,21 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         var wl: [MLXArray] = []
         var bl: [MLXArray] = []
         var gl: [MLXArray] = []
+        var rl: [MLXArray] = []
         var l = 1
         while l < self.numLayers {
             wl.append(MLXRandom.uniform(low: -scaleLayer, high: scaleLayer, [maxHiddenDim, maxHiddenDim]))
             bl.append(MLXArray.zeros([maxHiddenDim]))
             gl.append(MLXArray.ones([maxHiddenDim]))
+            if upperRecurrent {
+                rl.append(MLXRandom.uniform(low: -scaleRec, high: scaleRec, [maxHiddenDim, maxHiddenDim]))
+            }
             l += 1
         }
         self.wLayers = wl
         self.bHLayers = bl
         self.gammaRMS = gl
+        self.wRecLayers = rl
 
         self.wOut = MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, outputDim])
         self.bOut = MLXArray.zeros([outputDim])
@@ -79,7 +87,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             maxHiddenDim: weights.maxHiddenDim,
             outputDim: weights.outputDim,
             timeSteps: weights.timeSteps,
-            lifConfig: weights.lifConfig
+            lifConfig: weights.lifConfig,
+            upperRecurrent: weights.hasUpperRecurrence
         )
         self.importWeights(from: weights)
     }
@@ -113,6 +122,17 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             params["bHLayers"] = .array(layerB)
             params["gammaRMS"] = .array(layerG)
         }
+        if let rec = data.wRecLayers {
+            var layerR: [NestedItem<String, MLXArray>] = []
+            var r = 0
+            while r < min(self.wRecLayers.count, rec.count) {
+                layerR.append(.value(MLXArray(rec[r], [hSize, hSize]).transposed()))
+                r += 1
+            }
+            if 0 < layerR.count {
+                params["wRecLayers"] = .array(layerR)
+            }
+        }
         self.update(parameters: params)
         eval(self)
     }
@@ -127,6 +147,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             arraysToEval.append(gammaRMS[l])
             l += 1
         }
+        arraysToEval.append(contentsOf: wRecLayers)
         eval(arraysToEval)
 
         var wl: [[Float]] = []
@@ -138,6 +159,10 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             bl.append(self.bHLayers[l].asArray(Float.self))
             gl.append(self.gammaRMS[l].asArray(Float.self))
             l += 1
+        }
+        var rl: [[Float]]? = nil
+        if wRecLayers.isEmpty != true {
+            rl = wRecLayers.map { $0.transposed().asArray(Float.self) }
         }
 
         return SpikingNetworkWeights(
@@ -152,6 +177,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             wLayers: wl,
             bHLayers: bl,
             gammaRMS: gl,
+            wRecLayers: rl,
             wOut: self.wOut.transposed().asArray(Float.self),
             bOut: self.bOut.asArray(Float.self),
             vocabularyCharacters: vocabulary?.serializedCharacters

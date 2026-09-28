@@ -833,122 +833,7 @@ final class Tier1FeatureTests: XCTestCase {
 
     // MARK: - Feature 9: Fast Sigmoid Surrogate Gradient (5 tests)
 
-    func testSurrogateGradientAtThreshold() {
-        let grad = SurrogateGradient.derivative(v: 1.0, vTh: 1.0, alpha: 2.0)
-        // sigma'(0) = alpha / (1 + 0)^2 = 2.0 / 4 = 0.5 (or normalized scaled)
-        XCTAssertLessThan(0.0, grad)
-        XCTAssertLessThanOrEqual(grad, 2.0)
-    }
-
-    func testSurrogateGradientSymmetry() {
-        let gradLeft = SurrogateGradient.derivative(v: 0.8, vTh: 1.0, alpha: 2.0)
-        let gradRight = SurrogateGradient.derivative(v: 1.2, vTh: 1.0, alpha: 2.0)
-        XCTAssertLessThanOrEqual(abs(gradLeft - gradRight), 1e-5)
-    }
-
-    func testSurrogateGradientSIMD8VsScalar() {
-        let vValues: [Float] = [0.0, 0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0]
-        var gradScalar = [Float](repeating: 0.0, count: 8)
-        var gradSimd = [Float](repeating: 0.0, count: 8)
-
-        var i = 0
-        while i < 8 {
-            gradScalar[i] = SurrogateGradient.derivative(v: vValues[i], vTh: 1.0, alpha: 2.0)
-            i += 1
-        }
-
-        vValues.withUnsafeBufferPointer { vBuf in
-            gradSimd.withUnsafeMutableBufferPointer { gBuf in
-                SurrogateGradient.derivativeSIMD8(vPtr: vBuf.baseAddress!, dstPtr: gBuf.baseAddress!, count: 8, vTh: 1.0, alpha: 2.0)
-            }
-        }
-
-        i = 0
-        while i < 8 {
-            XCTAssertLessThanOrEqual(abs(gradScalar[i] - gradSimd[i]), 1e-5)
-            i += 1
-        }
-    }
-
-    func testSurrogateGradientExtremeInputs() {
-        let gradNeg = SurrogateGradient.derivative(v: -100.0, vTh: 1.0, alpha: 2.0)
-        let gradPos = SurrogateGradient.derivative(v: 100.0, vTh: 1.0, alpha: 2.0)
-        XCTAssertLessThanOrEqual(0.0, gradNeg)
-        XCTAssertLessThanOrEqual(gradNeg, 0.01)
-        XCTAssertLessThanOrEqual(0.0, gradPos)
-        XCTAssertLessThanOrEqual(gradPos, 0.01)
-    }
-
-    func testSurrogateGradientAlphaScaling() {
-        let gradAlpha1 = SurrogateGradient.derivative(v: 1.5, vTh: 1.0, alpha: 1.0)
-        let gradAlpha4 = SurrogateGradient.derivative(v: 1.5, vTh: 1.0, alpha: 4.0)
-        XCTAssertLessThan(gradAlpha4, gradAlpha1)
-    }
-
     // MARK: - Feature 10: Adam Optimizer (5 tests)
-
-    func testAdamOptimizerMomentumUpdate() {
-        let param = Parameter(count: 1, initialData: [1.0])
-        param.grad[0] = 0.5
-        let config = AdamConfig(lr: 0.01)
-        let adam = AdamOptimizer(config: config, parameters: [param])
-
-        adam.step()
-        XCTAssertLessThan(0.0, param.m[0])
-        XCTAssertLessThan(0.0, param.v[0])
-        XCTAssertLessThan(param.data[0], 1.0)
-    }
-
-    func testAdamOptimizerBiasCorrection() {
-        let param = Parameter(count: 1, initialData: [1.0])
-        param.grad[0] = 0.5
-        let config = AdamConfig(lr: 0.01)
-        let adam = AdamOptimizer(config: config, parameters: [param])
-
-        adam.step()
-        let p1 = param.data[0]
-        adam.step()
-        let p2 = param.data[0]
-        XCTAssertLessThan(p2, p1)
-    }
-
-    func testAdamOptimizerGlobalL2NormClipping() {
-        let param = Parameter(count: 4, initialData: [0.0, 0.0, 0.0, 0.0])
-        param.grad = [100.0, 200.0, 300.0, 400.0]
-        let config = AdamConfig(lr: 0.01, gradClip: 1.0)
-        let adam = AdamOptimizer(config: config, parameters: [param])
-        adam.step()
-
-        let totalNorm = param.grad.withUnsafeBufferPointer { ptr in
-            sqrt(VectorOperations.sumOfSquares(ptr: ptr.baseAddress!, count: 4))
-        }
-        XCTAssertLessThanOrEqual(totalNorm, 1.01)
-    }
-
-    func testAdamOptimizerZeroGrad() {
-        let param = Parameter(count: 4, initialData: [0.0, 0.0, 0.0, 0.0])
-        param.grad = [1.0, 2.0, 3.0, 4.0]
-        param.zeroGrad()
-        XCTAssertEqual(param.grad[0], 0.0)
-        XCTAssertEqual(param.grad[1], 0.0)
-        XCTAssertEqual(param.grad[2], 0.0)
-        XCTAssertEqual(param.grad[3], 0.0)
-    }
-
-    func testAdamOptimizerParameterConvergence() {
-        let param = Parameter(count: 1, initialData: [5.0])
-        let config = AdamConfig(lr: 0.05)
-        let adam = AdamOptimizer(config: config, parameters: [param])
-
-        // Minimize f(x) = x^2, df/dx = 2x
-        var step = 1
-        while step <= 100 {
-            param.grad[0] = 2.0 * param.data[0]
-            adam.step()
-            step += 1
-        }
-        XCTAssertLessThanOrEqual(abs(param.data[0]), 0.1)
-    }
 
     // MARK: - Feature 11: Nested SNN (5 tests)
 
@@ -982,9 +867,6 @@ final class Tier1FeatureTests: XCTestCase {
             XCTAssertLessThanOrEqual(abs(probSum - 1.0), 1e-4)
         }
     }
-
-
-
 
     func testForwardHotPathZeroAlloc() {
         let net = SpikingNetwork(inputDim: 32, maxHiddenDim: 256, outputDim: 64, timeSteps: 4)

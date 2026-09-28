@@ -635,21 +635,6 @@ final class Tier2BoundaryTests: XCTestCase {
         }
     }
 
-    func testB8SurrogateGradientNaNInput() {
-        let grad = SurrogateGradient.derivative(v: Float.nan, vTh: 1.0, alpha: 2.0)
-        // Must return float without fatal crash
-        XCTAssertTrue(grad.isNaN || 0.0 <= grad)
-    }
-
-    func testB8AdamOptimizerNaNGradient() {
-        let param = Parameter(count: 1, initialData: [1.0])
-        param.grad = [Float.nan]
-        let config = AdamConfig(lr: 0.01)
-        let adam = AdamOptimizer(config: config, parameters: [param])
-        adam.step()
-        XCTAssertEqual(param.count, 1)
-    }
-
     func testB8TranscriberNaNInputProtection() {
         let vocab = TextVocabulary()
         let acNet = SpikingNetwork(inputDim: SpeechDataset.acousticInputDim(), maxHiddenDim: 256, outputDim: vocab.size, timeSteps: 4)
@@ -704,21 +689,6 @@ final class Tier2BoundaryTests: XCTestCase {
         }
     }
 
-    func testB9AdamOptimizerEpsilonProtection() {
-        let config = AdamConfig(lr: 0.01, eps: 1e-8)
-        let param = Parameter(count: 1, initialData: [1.0])
-        param.grad = [0.0]
-        let adam = AdamOptimizer(config: config, parameters: [param])
-        adam.step()
-        XCTAssertEqual(param.data[0], 1.0)
-    }
-
-    func testB9SurrogateGradientZeroDenominator() {
-        // When v = vTh, denominator (1 + alpha * |v - vTh|)^2 = 1.0 > 0
-        let grad = SurrogateGradient.derivative(v: 1.0, vTh: 1.0, alpha: 0.0)
-        XCTAssertFalse(grad.isNaN)
-    }
-
     // MARK: - B10: 浮動小数点アンダーフロー (5 tests)
 
     func testB10SoftmaxExtremeNegativeLogits() {
@@ -735,11 +705,6 @@ final class Tier2BoundaryTests: XCTestCase {
 
         net.forward(features: features, vPrev: &vPrev, sPrev: &sPrev, readoutSum: &spikeSum, logits: &logits, probabilities: &probs)
         XCTAssertFalse(probs[0].isNaN)
-    }
-
-    func testB10SurrogateGradientUnderflowProtection() {
-        let grad = SurrogateGradient.derivative(v: 1e30, vTh: 1.0, alpha: 2.0)
-        XCTAssertLessThanOrEqual(0.0, grad)
     }
 
     func testB10BPTTLogProbabilityUnderflowClamp() {

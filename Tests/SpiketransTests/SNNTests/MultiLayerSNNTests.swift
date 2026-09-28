@@ -109,6 +109,97 @@ final class MultiLayerSNNTests: XCTestCase {
         XCTAssertLessThan(0.0, upperLayerSpikes)
     }
 
+    func testUpperRecurrentWeightsRoundTripThroughJSON() throws {
+        let plain = MLXSpikingNetwork(numLayers: 3, inputDim: 16, maxHiddenDim: 32, outputDim: 10)
+        XCTAssertNil(plain.exportWeights().wRecLayers)
+        XCTAssertEqual(plain.exportWeights().hasUpperRecurrence, false)
+
+        let mlxNet = MLXSpikingNetwork(numLayers: 3, inputDim: 16, maxHiddenDim: 32, outputDim: 10, upperRecurrent: true)
+        let weights = mlxNet.exportWeights()
+        XCTAssertEqual(weights.hasUpperRecurrence, true)
+        XCTAssertEqual(weights.wRecLayers?.count, 2)
+        XCTAssertEqual(weights.wRecLayers?[1].count, 32 * 32)
+
+        let data = try JSONEncoder().encode(weights)
+        let decoded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
+        XCTAssertEqual(decoded, weights)
+        XCTAssertEqual(SpikingNetwork(weights: decoded).exportWeights(), weights)
+        XCTAssertEqual(MLXSpikingNetwork(weights: decoded).exportWeights(), weights)
+    }
+
+    /// 上位層の再帰電流は次の層への残差にも乗るので、3 層で残差経路まで含めて比べる
+    func testThreeLayerUpperRecurrentForwardMatchesBetweenMLXAndPureSwift() {
+        let inputDim = 16
+        let hidden = 64
+        let outputDim = 12
+        let frames = 8
+        let layers = 3
+        let mlxNet = MLXSpikingNetwork(
+            numLayers: layers, inputDim: inputDim, maxHiddenDim: hidden, outputDim: outputDim, timeSteps: 4,
+            upperRecurrent: true
+        )
+        mlxNet.wIn = mlxNet.wIn * 4.0
+        mlxNet.wLayers[0] = mlxNet.wLayers[0] * 8.0
+        mlxNet.wLayers[1] = mlxNet.wLayers[1] * 8.0
+        // 再帰電流が膜電位に効く大きさにする
+        mlxNet.wRecLayers[0] = mlxNet.wRecLayers[0] * 40.0
+        mlxNet.wRecLayers[1] = mlxNet.wRecLayers[1] * 40.0
+        let weights = mlxNet.exportWeights()
+        let cpuNet = SpikingNetwork(weights: weights)
+
+        let features = makeFeatures(frames: frames, dim: inputDim)
+        var flat: [Float] = []
+        for frame in features {
+            flat.append(contentsOf: frame)
+        }
+        let trainer = MLXBPTTTrainer(network: mlxNet, bpttWindow: 4)
+        let mlxLogits = trainer.logitsBatch(network: mlxNet, features: MLXArray(flat, [1, frames, inputDim]))
+        eval(mlxLogits)
+        let mlxFlat = mlxLogits.asArray(Float.self)
+
+        // 再帰を外した同じ重みとは出力が変わる (再帰が実際に効いている)
+        let plainWeights = SpikingNetworkWeights(
+            inputDim: weights.inputDim, maxHiddenDim: weights.maxHiddenDim, outputDim: weights.outputDim,
+            timeSteps: weights.timeSteps, lifConfig: weights.lifConfig,
+            wIn: weights.wIn, wRec: weights.wRec, bH: weights.bH,
+            wLayers: weights.wLayers, bHLayers: weights.bHLayers, gammaRMS: weights.gammaRMS,
+            wOut: weights.wOut, bOut: weights.bOut
+        )
+        let plainNet = MLXSpikingNetwork(weights: plainWeights)
+        let plainLogits = MLXBPTTTrainer(network: plainNet, bpttWindow: 4)
+            .logitsBatch(network: plainNet, features: MLXArray(flat, [1, frames, inputDim]))
+        eval(plainLogits)
+        let plainFlat = plainLogits.asArray(Float.self)
+        var maxDiff: Float = 0.0
+        var i = 0
+        while i < plainFlat.count {
+            maxDiff = max(maxDiff, abs(plainFlat[i] - mlxFlat[i]))
+            i += 1
+        }
+        XCTAssertLessThan(Float(1e-2), maxDiff)
+
+        var vPrev = [Float](repeating: 0.0, count: layers * hidden)
+        var sPrev = [Float](repeating: 0.0, count: layers * hidden)
+        var aPrev = [Float](repeating: 0.0, count: layers * hidden)
+        var readoutSum = [Float](repeating: 0.0, count: hidden)
+        var logits = [Float](repeating: 0.0, count: outputDim)
+        var probs = [Float](repeating: 0.0, count: outputDim)
+        let scratch = ForwardScratch(maxHiddenDim: hidden)
+        var t = 0
+        while t < frames {
+            cpuNet.forward(
+                features: features[t], vPrev: &vPrev, sPrev: &sPrev, aPrev: &aPrev,
+                readoutSum: &readoutSum, logits: &logits, probabilities: &probs, scratch: scratch
+            )
+            var c = 0
+            while c < outputDim {
+                XCTAssertEqual(logits[c], mlxFlat[t * outputDim + c], accuracy: 1e-3, "frame \(t) class \(c)")
+                c += 1
+            }
+            t += 1
+        }
+    }
+
     func testTwoLayerCTCTrainingReducesLoss() {
         let inputDim = 16
         let outputDim = 8

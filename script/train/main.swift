@@ -31,6 +31,8 @@ enum Defaults {
     /// 4 層は lrMin に入っても held-out が下がり続け、5 層は epoch 6 で 4 層の最終値に届いた (14.49 vs 14.11%)。
     /// 1 層ずつ足すと 1 回 1 日かかるので、容量曲線の上側を一度に見るために 8 層 (RTF は 1 層 +0.0033 で約 0.023 の見込み)
     static let numLayers = 8
+    /// 層 1 以降も同じ層の直前スパイクから再帰結合を持つか (false なら再帰は層 0 だけ)
+    static let upperRecurrent = false
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
@@ -104,7 +106,6 @@ var noiseBankPath = ""
 var dictTextPaths: [String] = []
 var evalDumpPath = ""
 var augmentOptions: Set<String> = []
-var deviceArg = "auto"
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
 let reportPath = "/dev/stdout"
@@ -122,7 +123,6 @@ while argIdx < args.count {
         print("  -e, --epochs <Int>                 エポック数 (既定: 20)")
         print("  -s, --samples <Int>                最大学習サンプル数 (制限なし)")
         print("  -p, --parallel <Int>               並列ワーカー数 (既定: P コア数)")
-        print("  --device <auto|gpu|cpu>            実行デバイス (既定: auto)")
         print("  --export-weights <パス>            学習済み重みの出力先 JSON パス")
         print("  --import-weights <パス>            初期重みのインポート元 JSON パス")
         print("  --english-dict <パス>              英語の発音辞書 (CMU 形式) [必須]")
@@ -197,11 +197,6 @@ while argIdx < args.count {
             }
             argIdx += 1
         }
-    case "--device":
-        if (argIdx + 1) < args.count {
-            deviceArg = args[argIdx + 1].lowercased()
-            argIdx += 1
-        }
     case "--export-weights":
         if (argIdx + 1) < args.count {
             exportWeightsPath = args[argIdx + 1]
@@ -257,29 +252,8 @@ if datasetPath.isEmpty {
     exit(1)
 }
 
-let useGPU: Bool
-switch deviceArg {
-case "gpu":
-    useGPU = true
-case "cpu":
-    useGPU = false
-default: // "auto"
-    #if arch(arm64) && canImport(Darwin)
-    useGPU = true
-    #else
-    useGPU = false
-    #endif
-}
-
-let deviceDescription: String
-if useGPU {
-    deviceDescription = "Apple Silicon GPU (MLX Swift)"
-} else {
-    deviceDescription = "CPU (Pure Swift)"
-}
-
 print("データセットパス: \(datasetPath)")
-print("実行デバイス   : \(deviceDescription)")
+print("実行デバイス   : Apple Silicon GPU (MLX Swift)")
 print("ミニバッチサイズ (-b): \(batchSize)")
 print("並列ワーカー数 (-p): \(numWorkers) スレッド")
 print("エポック数     (-e): \(epochs) エポック")
@@ -421,19 +395,10 @@ for i in 0..<min(3, dataset.count) {
 }
 
 // 4. 第1段 音響 SNN (かな・音素) の学習実行
-let trainDeviceLabel: String
-let trainLR: Float
-if useGPU {
-    trainDeviceLabel = "GPU"
-    trainLR = 0.003
-} else {
-    trainDeviceLabel = "CPU"
-    trainLR = 0.015
-}
-print("\n--- 2. 第1段 音響 SNN (かな・音素) の学習実行 (デバイス: \(trainDeviceLabel)) ---")
+print("\n--- 2. 第1段 音響 SNN (かな・音素) の学習実行 (デバイス: GPU) ---")
 let trainConfig = TrainingConfig(
     epochs: epochs,
-    learningRate: trainLR,
+    learningRate: 0.003,
     logInterval: 2,
     clipNorm: 5.0
 )
@@ -441,7 +406,7 @@ let trainConfig = TrainingConfig(
 let acousticInputDim = Defaults.acousticInputDim
 print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
 
-print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers)")
+print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers), 幅 = \(Defaults.maxHiddenDim), 上位層の再帰 = \(Defaults.upperRecurrent)")
 
 let trainer = Trainer(
     acousticNetwork: SpikingNetwork(
@@ -450,7 +415,8 @@ let trainer = Trainer(
         maxHiddenDim: Defaults.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
         timeSteps: 4,
-        lifConfig: Defaults.lifConfig
+        lifConfig: Defaults.lifConfig,
+        upperRecurrent: Defaults.upperRecurrent
     ),
     languageNetwork: SpikingNetwork(
         inputDim: 128,
@@ -459,19 +425,20 @@ let trainer = Trainer(
         timeSteps: 4
     ),
     textVocabulary: phoneticVocabulary,
-    phonemeVocabulary: PhonemeVocabulary(),
-    config: trainConfig
+    phonemeVocabulary: PhonemeVocabulary()
 )
 
 // 重みのインポート。-e 0 なら評価のみ、-e N なら読み込んだ重みから追加学習する
 if let wData = importedWeights {
     guard wData.outputDim == phoneticVocabulary.size,
           wData.inputDim == acousticInputDim,
-          wData.numLayers == Defaults.numLayers else {
-        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size), 層数 \(wData.numLayers)/\(Defaults.numLayers))。")
+          wData.numLayers == Defaults.numLayers,
+          wData.maxHiddenDim == Defaults.maxHiddenDim,
+          wData.hasUpperRecurrence == Defaults.upperRecurrent else {
+        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size), 層数 \(wData.numLayers)/\(Defaults.numLayers), 幅 \(wData.maxHiddenDim)/\(Defaults.maxHiddenDim), 上位層の再帰 \(wData.hasUpperRecurrence)/\(Defaults.upperRecurrent))。")
         exit(1)
     }
-    trainer.acousticTrainer.network.importWeights(from: wData)
+    trainer.acousticNetwork.importWeights(from: wData)
     if epochs == 0 {
         print("  ✓ 音響モデル重みのインポート完了。評価のみ実行します (-e 0)。")
     } else {
@@ -482,90 +449,90 @@ if let wData = importedWeights {
 if epochs == 0 {
     // 追加学習なし。インポート済み重みで評価へ進む
 } else {
-    if useGPU {
-        print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(batchSize))...")
+    print("  Apple Silicon GPU (MLX Swift Metal) による並列ミニバッチ学習を開始 (バッチサイズ: \(batchSize))...")
 
-        // 教師はフレームに整列していないかな ID 列。アライメントは CTC が周辺化する。
-        // 発話フレームを文字数で等分する近似アライメント + 交差エントロピーでは、
-        // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
-        print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
-        let allTargets: [[Int]] = (0..<dataset.count).map { idx in
-            return phoneticVocabulary.textToIds(dataset.hiraganaText(at: idx))
-        }
+    // 教師はフレームに整列していないかな ID 列。アライメントは CTC が周辺化する。
+    // 発話フレームを文字数で等分する近似アライメント + 交差エントロピーでは、
+    // 教師ラベル自体が誤っているため学習セットすら再現できなかった。
+    print("  [教師] CTC 損失: フレーム整列なしのかな ID 列")
+    let allTargets: [[Int]] = (0..<dataset.count).map { idx in
+        return phoneticVocabulary.textToIds(dataset.hiraganaText(at: idx))
+    }
 
-        let mlxNet = MLXSpikingNetwork(
-            numLayers: Defaults.numLayers,
-            inputDim: acousticInputDim,
-            maxHiddenDim: Defaults.maxHiddenDim,
-            outputDim: phoneticVocabulary.size,
-            timeSteps: 4,
-            lifConfig: trainer.acousticTrainer.network.lifConfig
-        )
-        if let wData = importedWeights {
-            mlxNet.importWeights(from: wData)
-            print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
-        }
-        let mlxTrainer = MLXBPTTTrainer(
-            network: mlxNet,
-            config: trainConfig,
-            bpttWindow: Defaults.bpttWindow
-        )
-        print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
-        let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
-        print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
-        let trainStartTime = CFAbsoluteTimeGetCurrent()
+    let mlxNet = MLXSpikingNetwork(
+        numLayers: Defaults.numLayers,
+        inputDim: acousticInputDim,
+        maxHiddenDim: Defaults.maxHiddenDim,
+        outputDim: phoneticVocabulary.size,
+        timeSteps: 4,
+        lifConfig: trainer.acousticNetwork.lifConfig,
+        upperRecurrent: Defaults.upperRecurrent
+    )
+    if let wData = importedWeights {
+        mlxNet.importWeights(from: wData)
+        print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
+    }
+    let mlxTrainer = MLXBPTTTrainer(
+        network: mlxNet,
+        config: trainConfig,
+        bpttWindow: Defaults.bpttWindow
+    )
+    print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
+    let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
+    print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
+    let trainStartTime = CFAbsoluteTimeGetCurrent()
 
     // CTC はフレーム数 T >= ラベル数 + 連続重複数 を要求する。
     // これを満たさないサンプル (早口・短尺音声に長い教師) は尤度が定義できず、
     // 番兵 -1e30 が損失に漏れて学習を汚染するため除外する。
     func ctcMinimumFrames(_ labels: [Int]) -> Int {
-        var required = labels.count
-        var i = 1
-        while i < labels.count {
-            if labels[i] == labels[i - 1] {
-                required += 1
-            }
-            i += 1
+    var required = labels.count
+    var i = 1
+    while i < labels.count {
+        if labels[i] == labels[i - 1] {
+            required += 1
         }
-        return required
+        i += 1
+    }
+    return required
     }
     var feasibleIndices: [Int] = []
     var infeasibleCount = 0
     var di = 0
     while di < dataset.count {
-        let frames = dataset.frameCount(at: di)
-        if ctcMinimumFrames(allTargets[di]) <= frames {
-            feasibleIndices.append(di)
-        } else {
-            infeasibleCount += 1
-        }
-        di += 1
+    let frames = dataset.frameCount(at: di)
+    if ctcMinimumFrames(allTargets[di]) <= frames {
+        feasibleIndices.append(di)
+    } else {
+        infeasibleCount += 1
+    }
+    di += 1
     }
     if 0 < infeasibleCount {
-        print("  CTC 整合不可のため学習から除外: \(infeasibleCount) 件 (フレーム数 < 必要ラベル長)")
+    print("  CTC 整合不可のため学習から除外: \(infeasibleCount) 件 (フレーム数 < 必要ラベル長)")
     }
 
     // 長さ順にバッチを組む。バッチ内の最長フレーム数までパディングされるため、
     // 長さの近いサンプルをまとめると無駄な逐次ステップが減る。
     let lengthSortedIndices = feasibleIndices.sorted { a, b in
-        return dataset.frameCount(at: a) < dataset.frameCount(at: b)
+    return dataset.frameCount(at: a) < dataset.frameCount(at: b)
     }
     var paddedFrameTotal = 0
     var unsortedFrameTotal = 0
     var probeStart = 0
     while probeStart < lengthSortedIndices.count {
-        let probeEnd = min(probeStart + batchSize, lengthSortedIndices.count)
-        var sortedMax = 0
-        var plainMax = 0
-        var pi = probeStart
-        while pi < probeEnd {
-            sortedMax = max(sortedMax, dataset.frameCount(at: lengthSortedIndices[pi]))
-            plainMax = max(plainMax, dataset.frameCount(at: feasibleIndices[pi]))
-            pi += 1
-        }
-        paddedFrameTotal += sortedMax
-        unsortedFrameTotal += plainMax
-        probeStart = probeEnd
+    let probeEnd = min(probeStart + batchSize, lengthSortedIndices.count)
+    var sortedMax = 0
+    var plainMax = 0
+    var pi = probeStart
+    while pi < probeEnd {
+        sortedMax = max(sortedMax, dataset.frameCount(at: lengthSortedIndices[pi]))
+        plainMax = max(plainMax, dataset.frameCount(at: feasibleIndices[pi]))
+        pi += 1
+    }
+    paddedFrameTotal += sortedMax
+    unsortedFrameTotal += plainMax
+    probeStart = probeEnd
     }
     print("  長さ順バッチング: 逐次フレーム総数 \(unsortedFrameTotal) → \(paddedFrameTotal)")
 
@@ -575,63 +542,63 @@ if epochs == 0 {
     var batchGroups: [[Int]] = []
     var gStart = 0
     while gStart < lengthSortedIndices.count {
-        let gEnd = min(gStart + batchSize, lengthSortedIndices.count)
-        batchGroups.append(Array(lengthSortedIndices[gStart..<gEnd]))
-        gStart = gEnd
+    let gEnd = min(gStart + batchSize, lengthSortedIndices.count)
+    batchGroups.append(Array(lengthSortedIndices[gStart..<gEnd]))
+    gStart = gEnd
     }
 
     // 系列長バケット (32 フレーム単位に切り上げた最長フレーム数) を、window バッチの窓の中で昇順にまとめる
     func paddedFrameCount(of group: [Int]) -> Int {
-        var maxFrames = 0
-        for idx in group {
-            maxFrames = max(maxFrames, dataset.frameCount(at: idx))
-        }
-        return ((maxFrames + 31) / 32) * 32
+    var maxFrames = 0
+    for idx in group {
+        maxFrames = max(maxFrames, dataset.frameCount(at: idx))
+    }
+    return ((maxFrames + 31) / 32) * 32
     }
     func groupBucketsWithinWindows(_ groups: inout [[Int]], window: Int) {
-        var start = 0
-        while start < groups.count {
-            let end = min(start + window, groups.count)
-            let keyed = groups[start..<end].map { group in (key: paddedFrameCount(of: group), group: group) }
-            let sortedWindow = keyed.sorted { a, b in a.key < b.key }.map { $0.group }
-            groups.replaceSubrange(start..<end, with: sortedWindow)
-            start = end
-        }
+    var start = 0
+    while start < groups.count {
+        let end = min(start + window, groups.count)
+        let keyed = groups[start..<end].map { group in (key: paddedFrameCount(of: group), group: group) }
+        let sortedWindow = keyed.sorted { a, b in a.key < b.key }.map { $0.group }
+        groups.replaceSubrange(start..<end, with: sortedWindow)
+        start = end
+    }
     }
 
     // バッチの特徴量を WAV から並列生成する (遅延読み込みの実体)
     final class FeatureBatchBuffer: @unchecked Sendable {
-        var items: [[[Float]]]
-        init(count: Int) {
-            self.items = [[[Float]]](repeating: [], count: count)
-        }
+    var items: [[[Float]]]
+    init(count: Int) {
+        self.items = [[[Float]]](repeating: [], count: count)
+    }
     }
     let activeWorkers = numWorkers
     @Sendable func buildBatchFeatures(_ indices: [Int]) -> [[[Float]]] {
-        let buffer = FeatureBatchBuffer(count: indices.count)
-        let workerCount = max(1, min(activeWorkers, indices.count))
-        DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
-            var i = worker
-            while i < indices.count {
-                let meta = dataset.metaSamples[indices[i]]
-                buffer.items[i] = autoreleasepool {
-                    SpeechDataset.loadFeatures(
-                        path: meta.path,
-                        frameStack: Defaults.frameStack,
-                        loadPCM: false,
-                        pcmTransform: augmenter.pcmTransform,
-                        featureTransform: augmenter.featureTransform
-                    ).features
-                }
-                i += workerCount
+    let buffer = FeatureBatchBuffer(count: indices.count)
+    let workerCount = max(1, min(activeWorkers, indices.count))
+    DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
+        var i = worker
+        while i < indices.count {
+            let meta = dataset.metaSamples[indices[i]]
+            buffer.items[i] = autoreleasepool {
+                SpeechDataset.loadFeatures(
+                    path: meta.path,
+                    frameStack: Defaults.frameStack,
+                    loadPCM: false,
+                    pcmTransform: augmenter.pcmTransform,
+                    featureTransform: augmenter.featureTransform
+                ).features
             }
+            i += workerCount
         }
-        return buffer.items
+    }
+    return buffer.items
     }
 
     // GPU がバッチを学習している間に、次バッチの特徴量を CPU で先読みする
     final class PrefetchBox: @unchecked Sendable {
-        var value: [[[Float]]] = []
+    var value: [[[Float]]] = []
     }
 
     // 学習率はバッチ単位で刻む。エポック単位だとデータが増えたときに
@@ -663,156 +630,156 @@ if epochs == 0 {
     // 学習済みの重みから続けるときは暖機と減衰をやり直さず、最初から lrMin 一定で進める。
     // 収束した重みを lrMax でなぞると壊れる。減衰上限に達した長い学習の続きと同じ形になる
     if importedWeights != nil {
-        globalStep = scheduleSteps
-        print("  学習済みの重みから再開: 学習率は最初から lrMin \(Defaults.lrMin) 一定")
+    globalStep = scheduleSteps
+    print("  学習済みの重みから再開: 学習率は最初から lrMin \(Defaults.lrMin) 一定")
     }
     var ep = 1
     while ep <= epochs {
-        let epStartTime = CFAbsoluteTimeGetCurrent()
-        // バッチの並びは毎エポック混ぜる。長さ順のまま流すと 1 エポックの前半は
-        // 短い断片ばかり、後半は長い発話ばかりになり、100 万件規模では最初の
-        // 数千ステップが 1 秒未満の断片だけで埋まって blank 一色に崩れる
-        batchGroups.shuffle()
-        groupBucketsWithinWindows(&batchGroups, window: Defaults.bucketRunWindow)
-        var curLR = scheduler.learningRate(
-            step: globalStep + 1, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
+    let epStartTime = CFAbsoluteTimeGetCurrent()
+    // バッチの並びは毎エポック混ぜる。長さ順のまま流すと 1 エポックの前半は
+    // 短い断片ばかり、後半は長い発話ばかりになり、100 万件規模では最初の
+    // 数千ステップが 1 秒未満の断片だけで埋まって blank 一色に崩れる
+    batchGroups.shuffle()
+    groupBucketsWithinWindows(&batchGroups, window: Defaults.bucketRunWindow)
+    var curLR = scheduler.learningRate(
+        step: globalStep + 1, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
 
-        var epLossSum: Float = 0.0
-        var batchCount = 0
-        // 時間の内訳: GPU の学習ステップ、先読み待ち (特徴量の読み込みが GPU より遅いとき)、
-        // compile 済み / eager (系列長が compiledMaxFrames 超) の別、系列長バケットごとの時間
-        var gpuSeconds = 0.0
-        var waitSeconds = 0.0
-        var eagerBatches = 0
-        var eagerSeconds = 0.0
-        var bucketSeconds: [Int: (count: Int, seconds: Double)] = [:]
-        var bucketSwitches = 0
-        var previousPaddedFrames = 0
+    var epLossSum: Float = 0.0
+    var batchCount = 0
+    // 時間の内訳: GPU の学習ステップ、先読み待ち (特徴量の読み込みが GPU より遅いとき)、
+    // compile 済み / eager (系列長が compiledMaxFrames 超) の別、系列長バケットごとの時間
+    var gpuSeconds = 0.0
+    var waitSeconds = 0.0
+    var eagerBatches = 0
+    var eagerSeconds = 0.0
+    var bucketSeconds: [Int: (count: Int, seconds: Double)] = [:]
+    var bucketSwitches = 0
+    var previousPaddedFrames = 0
 
-        var currentFeatures: [[[Float]]] = []
-        if 0 < batchGroups.count {
-            currentFeatures = buildBatchFeatures(batchGroups[0])
-        }
-        var bIdx = 0
-        while bIdx < batchGroups.count {
-            let prefetchBox = PrefetchBox()
-            let prefetchGroup = DispatchGroup()
-            if (bIdx + 1) < batchGroups.count {
-                let nextIndices = batchGroups[bIdx + 1]
-                prefetchGroup.enter()
-                DispatchQueue.global(qos: .userInitiated).async {
-                    prefetchBox.value = buildBatchFeatures(nextIndices)
-                    prefetchGroup.leave()
-                }
+    var currentFeatures: [[[Float]]] = []
+    if 0 < batchGroups.count {
+        currentFeatures = buildBatchFeatures(batchGroups[0])
+    }
+    var bIdx = 0
+    while bIdx < batchGroups.count {
+        let prefetchBox = PrefetchBox()
+        let prefetchGroup = DispatchGroup()
+        if (bIdx + 1) < batchGroups.count {
+            let nextIndices = batchGroups[bIdx + 1]
+            prefetchGroup.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                prefetchBox.value = buildBatchFeatures(nextIndices)
+                prefetchGroup.leave()
             }
-
-            var tBatch: [[Int]] = []
-            for sampleIdx in batchGroups[bIdx] {
-                tBatch.append(allTargets[sampleIdx])
-            }
-
-            globalStep += 1
-            curLR = scheduler.learningRate(
-                step: globalStep, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
-            mlxTrainer.updateLearningRate(curLR)
-
-            var maxFrames = 0
-            for seq in currentFeatures {
-                if maxFrames < seq.count {
-                    maxFrames = seq.count
-                }
-            }
-            let paddedFrames = ((maxFrames + 31) / 32) * 32
-            let gpuStart = CFAbsoluteTimeGetCurrent()
-            let res = mlxTrainer.trainBatchCTC(
-                featuresBatch: currentFeatures,
-                targetsBatch: tBatch,
-                blankId: TextVocabulary.padId
-            )
-            let gpuElapsed = CFAbsoluteTimeGetCurrent() - gpuStart
-            gpuSeconds += gpuElapsed
-            if compiledMaxFrames < paddedFrames {
-                eagerBatches += 1
-                eagerSeconds += gpuElapsed
-            }
-            let prev = bucketSeconds[paddedFrames] ?? (count: 0, seconds: 0.0)
-            bucketSeconds[paddedFrames] = (count: prev.count + 1, seconds: prev.seconds + gpuElapsed)
-            if paddedFrames != previousPaddedFrames {
-                bucketSwitches += 1
-                previousPaddedFrames = paddedFrames
-            }
-            epLossSum += res
-            batchCount += 1
-
-            let waitStart = CFAbsoluteTimeGetCurrent()
-            prefetchGroup.wait()
-            waitSeconds += CFAbsoluteTimeGetCurrent() - waitStart
-            currentFeatures = prefetchBox.value
-            bIdx += 1
         }
 
-        let avgLoss = epLossSum / Float(max(1, batchCount))
-        let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
-        print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
-        print("    内訳: GPU \(String(format: "%.0f", gpuSeconds)) 秒 (うち eager \(eagerBatches) バッチ \(String(format: "%.0f", eagerSeconds)) 秒) / 先読み待ち \(String(format: "%.0f", waitSeconds)) 秒 / \(batchCount) バッチ / バケット切替 \(bucketSwitches) 回")
-        print("    MLX メモリ: 使用中 \(MLX.Memory.activeMemory >> 20) MB / キャッシュ \(MLX.Memory.cacheMemory >> 20) MB / ピーク \(MLX.GPU.peakMemory >> 20) MB")
-        let topBuckets = bucketSeconds.sorted { a, b in b.value.seconds < a.value.seconds }.prefix(6)
-        var bucketLine = "    系列長バケット (フレーム: バッチ数 / 秒):"
-        for (frames, stat) in topBuckets {
-            bucketLine += " \(frames): \(stat.count) / \(String(format: "%.0f", stat.seconds))"
+        var tBatch: [[Int]] = []
+        for sampleIdx in batchGroups[bIdx] {
+            tBatch.append(allTargets[sampleIdx])
         }
-        print(bucketLine)
 
-        if avgLoss < bestLoss {
-            bestLoss = avgLoss
-            bestEpoch = ep
-            bestWeights = mlxNet.exportWeights(vocabulary: phoneticVocabulary)
+        globalStep += 1
+        curLR = scheduler.learningRate(
+            step: globalStep, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
+        mlxTrainer.updateLearningRate(curLR)
+
+        var maxFrames = 0
+        for seq in currentFeatures {
+            if maxFrames < seq.count {
+                maxFrames = seq.count
+            }
         }
-        if prevLoss < avgLoss {
-            riseStreak += 1
-        } else {
+        let paddedFrames = ((maxFrames + 31) / 32) * 32
+        let gpuStart = CFAbsoluteTimeGetCurrent()
+        let res = mlxTrainer.trainBatchCTC(
+            featuresBatch: currentFeatures,
+            targetsBatch: tBatch,
+            blankId: TextVocabulary.padId
+        )
+        let gpuElapsed = CFAbsoluteTimeGetCurrent() - gpuStart
+        gpuSeconds += gpuElapsed
+        if compiledMaxFrames < paddedFrames {
+            eagerBatches += 1
+            eagerSeconds += gpuElapsed
+        }
+        let prev = bucketSeconds[paddedFrames] ?? (count: 0, seconds: 0.0)
+        bucketSeconds[paddedFrames] = (count: prev.count + 1, seconds: prev.seconds + gpuElapsed)
+        if paddedFrames != previousPaddedFrames {
+            bucketSwitches += 1
+            previousPaddedFrames = paddedFrames
+        }
+        epLossSum += res
+        batchCount += 1
+
+        let waitStart = CFAbsoluteTimeGetCurrent()
+        prefetchGroup.wait()
+        waitSeconds += CFAbsoluteTimeGetCurrent() - waitStart
+        currentFeatures = prefetchBox.value
+        bIdx += 1
+    }
+
+    let avgLoss = epLossSum / Float(max(1, batchCount))
+    let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
+    print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
+    print("    内訳: GPU \(String(format: "%.0f", gpuSeconds)) 秒 (うち eager \(eagerBatches) バッチ \(String(format: "%.0f", eagerSeconds)) 秒) / 先読み待ち \(String(format: "%.0f", waitSeconds)) 秒 / \(batchCount) バッチ / バケット切替 \(bucketSwitches) 回")
+    print("    MLX メモリ: 使用中 \(MLX.Memory.activeMemory >> 20) MB / キャッシュ \(MLX.Memory.cacheMemory >> 20) MB / ピーク \(MLX.GPU.peakMemory >> 20) MB")
+    let topBuckets = bucketSeconds.sorted { a, b in b.value.seconds < a.value.seconds }.prefix(6)
+    var bucketLine = "    系列長バケット (フレーム: バッチ数 / 秒):"
+    for (frames, stat) in topBuckets {
+        bucketLine += " \(frames): \(stat.count) / \(String(format: "%.0f", stat.seconds))"
+    }
+    print(bucketLine)
+
+    if avgLoss < bestLoss {
+        bestLoss = avgLoss
+        bestEpoch = ep
+        bestWeights = mlxNet.exportWeights(vocabulary: phoneticVocabulary)
+    }
+    if prevLoss < avgLoss {
+        riseStreak += 1
+    } else {
+        riseStreak = 0
+    }
+    prevLoss = avgLoss
+
+    if Defaults.lossRiseEpochs <= riseStreak {
+        if let best = bestWeights, rollbacks < Defaults.maxLRRollbacks {
+            rollbacks += 1
+            lrScale *= Defaults.lrRollbackFactor
             riseStreak = 0
+            prevLoss = bestLoss
+            mlxTrainer.rollback(to: best)
+            print("    ↩ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇。epoch \(bestEpoch) の重み (損失 \(String(format: "%.4f", bestLoss))) へ巻き戻し、学習率を \(String(format: "%.2f", lrScale)) 倍にする (\(rollbacks)/\(Defaults.maxLRRollbacks) 回目)")
+        } else {
+            print("    ■ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇し、巻き戻しの回数も使い切ったので学習を打ち切る (最良は epoch \(bestEpoch))")
+            break
         }
-        prevLoss = avgLoss
+    }
 
-        if Defaults.lossRiseEpochs <= riseStreak {
-            if let best = bestWeights, rollbacks < Defaults.maxLRRollbacks {
-                rollbacks += 1
-                lrScale *= Defaults.lrRollbackFactor
-                riseStreak = 0
-                prevLoss = bestLoss
-                mlxTrainer.rollback(to: best)
-                print("    ↩ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇。epoch \(bestEpoch) の重み (損失 \(String(format: "%.4f", bestLoss))) へ巻き戻し、学習率を \(String(format: "%.2f", lrScale)) 倍にする (\(rollbacks)/\(Defaults.maxLRRollbacks) 回目)")
-            } else {
-                print("    ■ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇し、巻き戻しの回数も使い切ったので学習を打ち切る (最良は epoch \(bestEpoch))")
-                break
+    // 定期チェックポイント: 長時間実行が途中で止まっても成果を失わないようにする。
+    // エポック数が少ない大規模学習では 10 エポックごとだと 1 度も保存されないため、
+    // 全体の 1/6 を上限に間隔を詰める
+    if 0 < checkpointInterval && (ep % checkpointInterval) == 0 && ep < epochs {
+        switch exportWeightsPath {
+        case .some(let basePath):
+            let ckptPath = "\(basePath).ep\(ep).json"
+            do {
+                try mlxNet.exportWeights(vocabulary: phoneticVocabulary).save(to: URL(fileURLWithPath: ckptPath))
+                print("    ✓ チェックポイント保存: \(ckptPath)")
+            } catch {
+                print("    ✕ チェックポイント保存に失敗: \(error)")
             }
+        case .none:
+            break
         }
-
-        // 定期チェックポイント: 長時間実行が途中で止まっても成果を失わないようにする。
-        // エポック数が少ない大規模学習では 10 エポックごとだと 1 度も保存されないため、
-        // 全体の 1/6 を上限に間隔を詰める
-        if 0 < checkpointInterval && (ep % checkpointInterval) == 0 && ep < epochs {
-            switch exportWeightsPath {
-            case .some(let basePath):
-                let ckptPath = "\(basePath).ep\(ep).json"
-                do {
-                    try mlxNet.exportWeights(vocabulary: phoneticVocabulary).save(to: URL(fileURLWithPath: ckptPath))
-                    print("    ✓ チェックポイント保存: \(ckptPath)")
-                } catch {
-                    print("    ✕ チェックポイント保存に失敗: \(error)")
-                }
-            case .none:
-                break
-            }
-        }
-        ep += 1
+    }
+    ep += 1
     }
 
     // 最後の epoch が最良でなければ、最良の重みで終える
     if let best = bestWeights, bestLoss < prevLoss {
-        mlxNet.importWeights(from: best)
-        print("  最終 epoch より epoch \(bestEpoch) (損失 \(String(format: "%.4f", bestLoss))) の方が良いので、その重みを採用する")
+    mlxNet.importWeights(from: best)
+    print("  最終 epoch より epoch \(bestEpoch) (損失 \(String(format: "%.4f", bestLoss))) の方が良いので、その重みを採用する")
     }
 
     let trainElapsed = CFAbsoluteTimeGetCurrent() - trainStartTime
@@ -820,64 +787,20 @@ if epochs == 0 {
     
     // 学習した重みを Pure Swift 推論エンジンに転送
     let exported = mlxNet.exportWeights(vocabulary: phoneticVocabulary)
-    trainer.acousticTrainer.network.importWeights(from: exported)
+    trainer.acousticNetwork.importWeights(from: exported)
     print("  ✓ GPU 学習パラメータを Pure Swift 推論エンジンに転送完了")
 
     // MLX Metal GPU メモリ・キャッシュを解放
     #if canImport(MLX)
     MLX.Memory.clearCache()
     #endif
-    } else {
-        print("  CPU (Pure Swift \(numWorkers) スレッド) による SNN-CTC 損失並列学習を開始...")
-        let trainStartTime = CFAbsoluteTimeGetCurrent()
-        var acResults: [EpochResult] = []
-        var ep = 1
-        while ep <= epochs {
-            let epStartTime = CFAbsoluteTimeGetCurrent()
-            let acRes = trainer.acousticTrainer.trainCTCEpoch(
-                dataset: dataset,
-                kanaVocabulary: phoneticVocabulary,
-                epoch: ep,
-                numWorkers: numWorkers
-            )
-            acResults.append(acRes)
-            let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
-            print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", acRes.totalLoss)) (所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
-            ep += 1
-        }
-        let trainElapsed = CFAbsoluteTimeGetCurrent() - trainStartTime
-        print("\nCPU 学習完了 (総所要時間: \(String(format: "%.3f", trainElapsed)) 秒)")
-    }
 }
 
-// languageBonus == 0 のときは言語 SNN を第2段で使わないため学習を省略する
-if 0.0 < Defaults.languageBonus {
-    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習 (CPU マルチスレッド) ---")
-    let lmStartTime = CFAbsoluteTimeGetCurrent()
-    var lmEpoch = 1
-    let lmMaxEpochs = 40
-    while lmEpoch <= lmMaxEpochs {
-        let res = trainer.languageTrainer.trainKanaToKanjiEpoch(
-            dataset: dataset,
-            kanaVocabulary: phoneticVocabulary,
-            epoch: lmEpoch,
-            numWorkers: 8
-        )
-        if lmEpoch % 10 == 0 || lmEpoch == lmMaxEpochs {
-            print("  LM Epoch [\(lmEpoch)/\(lmMaxEpochs)] - 損失: \(String(format: "%.4f", res.totalLoss))")
-        }
-        lmEpoch += 1
-    }
-    let lmElapsed = CFAbsoluteTimeGetCurrent() - lmStartTime
-    print("  ✓ 言語 SNN 学習完了 (所要時間: \(String(format: "%.2f", lmElapsed)) 秒)")
-} else {
-    print("\n--- 2.5 第2段 漢字自己回帰言語 SNN の学習をスキップ (languageBonus = 0) ---")
-}
 
 if let expPath = exportWeightsPath {
     print("\n[重み保存] モデル重みをファイルにエクスポート中: \(expPath)")
     let expURL = URL(fileURLWithPath: expPath)
-    let wData = trainer.acousticTrainer.network.exportWeights(vocabulary: phoneticVocabulary)
+    let wData = trainer.acousticNetwork.exportWeights(vocabulary: phoneticVocabulary)
     do {
         try wData.save(to: expURL)
         print("  ✓ 重みパラメータのエクスポートが完了しました: \(expPath)")
@@ -902,21 +825,6 @@ if 0 < dataset.count {
     print("正解テキスト: \"\(s0.rawText)\"")
     print("正解かな発音: \"\(s0.hiraganaText)\" (\(hiraIds0.count) 文字), 音響フレーム数: \(totalF) フレーム")
 
-    // 1. alignTargets の集計 (Mel エネルギーによる発話フレーム配分)
-    let targets = trainer.acousticTrainer.alignTargets(textIds: hiraIds0, features: feat0)
-    var charFrameCounts = [Int](repeating: 0, count: hiraIds0.count)
-    var padCount = 0
-    var nonPadCount = 0
-    for t in targets {
-        if t == TextVocabulary.padId {
-            padCount += 1
-        } else {
-            nonPadCount += 1
-            if let ci = hiraIds0.firstIndex(of: t) {
-                charFrameCounts[ci] += 1
-            }
-        }
-    }
     // [0] フォルマント適応スペクトルイコライジング診断 (発話フレームでの帯域外減衰測定)
     let dspCfg = DSPConfig(melChannels: 64)
     let ws = DSPWorkspace(melChannels: 64)
@@ -1004,26 +912,16 @@ if 0 < dataset.count {
         print("  減衰比率: \(String(format: "%.2f", attenRatio * 100.0))% (減衰量: \(String(format: "%.1f", attenDb)) dB)")
     }
 
-    print("\n[1] alignTargets 分析:")
-    print("  総フレーム数: \(totalF)")
-    print("  pad (0) フレーム数: \(padCount) (\(String(format: "%.1f", Float(padCount)*100.0/Float(totalF)))%)")
-    print("  非 pad フレーム数: \(nonPadCount) (\(String(format: "%.1f", Float(nonPadCount)*100.0/Float(totalF)))%)")
-    print("  文字ごとの割り当てフレーム数:")
-    for (ci, ch) in s0.hiraganaText.enumerated() {
-        if ci < charFrameCounts.count {
-            print("    '\(ch)' (ID: \(hiraIds0[ci])): \(charFrameCounts[ci]) フレーム")
-        }
-    }
 
     // 2. 音響 SNN のフレーム別予測
     let acDec = AcousticDecoder(
-        network: trainer.acousticTrainer.network
+        network: trainer.acousticNetwork
     )
     let acWs = AcousticWorkspace(
-        maxHiddenDim: trainer.acousticTrainer.network.maxHiddenDim,
+        maxHiddenDim: trainer.acousticNetwork.maxHiddenDim,
         outputDim: phoneticVocabulary.size,
-        inputDim: trainer.acousticTrainer.network.inputDim,
-        numLayers: trainer.acousticTrainer.network.numLayers
+        inputDim: trainer.acousticNetwork.inputDim,
+        numLayers: trainer.acousticNetwork.numLayers
     )
     let frameProbs = acDec.decodeSequence(featuresSeq: feat0, workspace: acWs)
 
@@ -1052,20 +950,6 @@ if 0 < dataset.count {
     print("  推論 pad 率: \(String(format: "%.2f", padRatio))%")
     print("  ユニーク Top-1 トークン数: \(uniqueTopTokens.count)")
 
-    var correctFrameCount = 0
-    var fIdx = 0
-    while fIdx < totalF {
-        if fIdx < frameProbs.count {
-            let pred = frameProbs[fIdx].topTokenId
-            let tgt = targets[fIdx]
-            if pred == tgt {
-                correctFrameCount += 1
-            }
-        }
-        fIdx += 1
-    }
-    let frameAccuracy = Float(correctFrameCount) * 100.0 / Float(totalF)
-    print("  フレーム正解率 (alignTargets 対 argmax): \(String(format: "%.2f", frameAccuracy))% (\(correctFrameCount)/\(totalF))")
 
     print("\n[3] 代表フレームの Top-1 予測:")
     let printFrame: (Int) -> Void = { idx in
@@ -1666,7 +1550,7 @@ if 0 < rawPairs.count {
     print("=== [推論レイテンシ] 単一スレッド, \(benchFeatures.count) 発話 (音声 \(String(format: "%.1f", benchAudioSeconds)) 秒) ===")
     print("==================================================")
 
-    let benchNetwork = trainer.acousticTrainer.network
+    let benchNetwork = trainer.acousticNetwork
     do {
         let decoder = AcousticDecoder(
             network: benchNetwork
