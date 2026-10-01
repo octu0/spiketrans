@@ -161,7 +161,6 @@ if corpusLines.isEmpty != true {
 
 // 4. 分割単位の決定。VAD の無音で切り、--chunk-seconds を 1 区間の上限にする
 //    (固定長で切ると語の途中で分断される)。0 なら分割なし
-let frameStack = StreamingFeatureFrontEnd.defaultStack
 var segments: [(start: Int, count: Int)] = []
 if chunkSeconds <= 0.0 {
     segments.append((start: 0, count: pcm.count))
@@ -207,7 +206,11 @@ var segIdx = 0
 while segIdx < segments.count {
     let seg = segments[segIdx]
     let segPCM = Array(pcm[seg.start..<(seg.start + seg.count)])
-    let features = SpeechDataset.extractFeaturesFromPCM(pcmData: segPCM, frameStack: frameStack)
+    let features = SpeechDataset.extractFeaturesFromPCM(
+        pcmData: segPCM,
+        frameStack: StreamingFeatureFrontEnd.frameStack(forInputDim: network.inputDim),
+        longContext: StreamingFeatureFrontEnd.hasLongContext(inputDim: network.inputDim)
+    )
     totalFrames += features.count
 
     if 0 < features.count {

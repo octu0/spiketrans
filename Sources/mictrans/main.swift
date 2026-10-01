@@ -529,7 +529,10 @@ final class Transcriber: @unchecked Sendable {
         if stack < 1 {
             stack = 1
         }
-        self.frontEnd = StreamingFeatureFrontEnd(frameStack: stack)
+        self.frontEnd = StreamingFeatureFrontEnd(
+            frameStack: stack,
+            longContext: StreamingFeatureFrontEnd.hasLongContext(inputDim: network.inputDim)
+        )
         self.workspace = AcousticWorkspace(
             maxHiddenDim: network.maxHiddenDim,
             outputDim: network.outputDim,

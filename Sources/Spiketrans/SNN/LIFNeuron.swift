@@ -115,9 +115,14 @@ public enum LIFNeuronEngine {
         vPrev: Float,
         sPrev: Float,
         aPrev: Float,
-        inputCurrent: Float
+        inputCurrent: Float,
+        beta: Float? = nil
     ) -> (vNext: Float, sNext: Float, aNext: Float) {
-        let vDecayed = config.beta * vPrev * (1.0 - sPrev)
+        var b = config.beta
+        if let override = beta {
+            b = override
+        }
+        let vDecayed = b * vPrev * (1.0 - sPrev)
         let vNext = clampMembrane(vDecayed + inputCurrent)
         let aNext = (config.rho * aPrev) + (config.gamma * sPrev)
         let dynVTh = config.vTh + aNext
@@ -137,7 +142,8 @@ public enum LIFNeuronEngine {
         sPtr: UnsafeMutablePointer<Float>,
         aPtr: UnsafeMutablePointer<Float>,
         curPtr: UnsafePointer<Float>,
-        count: Int
+        count: Int,
+        betaPtr: UnsafePointer<Float>? = nil
     ) {
         let limit = count - (count % 8)
         let betaVec = SIMD8<Float>(repeating: config.beta)
@@ -168,7 +174,11 @@ public enum LIFNeuronEngine {
                 curPtr[i+4], curPtr[i+5], curPtr[i+6], curPtr[i+7]
             )
 
-            let vDecayed = betaVec * vPrev * (oneVec - sPrev)
+            var bVec = betaVec
+            if let bp = betaPtr {
+                bVec = UnsafeRawPointer(bp.advanced(by: i)).loadUnaligned(as: SIMD8<Float>.self)
+            }
+            let vDecayed = bVec * vPrev * (oneVec - sPrev)
             let vRaw = vDecayed + inCur
             var vNext = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
             vNext = vNext.replacing(with: highVec, where: highVec .< vNext)
@@ -186,12 +196,17 @@ public enum LIFNeuronEngine {
             i += 8
         }
         while i < count {
+            var beta: Float? = nil
+            if let bp = betaPtr {
+                beta = bp[i]
+            }
             let res = stepScalarAdaptive(
                 config: config,
                 vPrev: vPtr[i],
                 sPrev: sPtr[i],
                 aPrev: aPtr[i],
-                inputCurrent: curPtr[i]
+                inputCurrent: curPtr[i],
+                beta: beta
             )
             vPtr[i] = res.vNext
             sPtr[i] = res.sNext
@@ -208,9 +223,14 @@ public enum LIFNeuronEngine {
         vPrev: Float,
         sPrev: Float,
         aPrev: Float,
-        inputCurrent: Float
+        inputCurrent: Float,
+        beta: Float? = nil
     ) -> (vNext: Float, sNext: Float, aNext: Float, readout: Float) {
-        let vIntegrated = clampMembrane(config.beta * vPrev + inputCurrent)
+        var b = config.beta
+        if let override = beta {
+            b = override
+        }
+        let vIntegrated = clampMembrane(b * vPrev + inputCurrent)
         let aNext = (config.rho * aPrev) + (config.gamma * sPrev)
         let dynVTh = config.vTh + aNext
         var sNext: Float = 0.0
@@ -231,7 +251,8 @@ public enum LIFNeuronEngine {
         aPtr: UnsafeMutablePointer<Float>,
         curPtr: UnsafePointer<Float>,
         readoutSumPtr: UnsafeMutablePointer<Float>,
-        count: Int
+        count: Int,
+        betaPtr: UnsafePointer<Float>? = nil
     ) {
         let limit = count - (count % 8)
         let betaVec = SIMD8<Float>(repeating: config.beta)
@@ -269,7 +290,11 @@ public enum LIFNeuronEngine {
                 curPtr[i+4], curPtr[i+5], curPtr[i+6], curPtr[i+7]
             )
 
-            let vRaw = (betaVec * vPrev) + inCur
+            var bVec = betaVec
+            if let bp = betaPtr {
+                bVec = UnsafeRawPointer(bp.advanced(by: i)).loadUnaligned(as: SIMD8<Float>.self)
+            }
+            let vRaw = (bVec * vPrev) + inCur
             var vIntegrated = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
             vIntegrated = vIntegrated.replacing(with: highVec, where: highVec .< vIntegrated)
             let aNext = (rhoVec * aPrev) + (gammaVec * sPrev)
@@ -300,12 +325,17 @@ public enum LIFNeuronEngine {
             i += 8
         }
         while i < count {
+            var beta: Float? = nil
+            if let bp = betaPtr {
+                beta = bp[i]
+            }
             let res = stepReadoutScalarAdaptive(
                 config: config,
                 vPrev: vPtr[i],
                 sPrev: sPtr[i],
                 aPrev: aPtr[i],
-                inputCurrent: curPtr[i]
+                inputCurrent: curPtr[i],
+                beta: beta
             )
             vPtr[i] = res.vNext
             sPtr[i] = res.sNext

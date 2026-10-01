@@ -32,6 +32,10 @@ public final class SpikingNetwork: @unchecked Sendable {
     public let pGammaRMS: [Parameter]
     /// 層 1 以降の再帰結合 (同じ層の直前サブステップのスパイクから)。再帰なしの構成では空
     public let pWRecLayers: [Parameter]
+    /// ニューロンごとの膜電位減衰率 (層 0 から numLayers 本)。共通 beta の構成では空
+    public let pBetaLayers: [Parameter]
+    /// 各層の LIF に入る電流全体を RMSNorm するときのゲイン (層 0 から numLayers 本)。正規化しない構成では空
+    public let pInputNormGains: [Parameter]
 
     // リードアウト
     public let pWOut: Parameter        // [outputDim, maxHiddenDim]
@@ -45,7 +49,10 @@ public final class SpikingNetwork: @unchecked Sendable {
         outputDim: Int = 64,
         timeSteps: Int = 4,
         lifConfig: LIFConfig = LIFConfig(),
-        upperRecurrent: Bool = false
+        upperRecurrent: Bool = false,
+        learnedBeta: Bool = false,
+        inputNorm: Bool = false,
+        inputNormGainInit: Float = 1.0
     ) {
         self.numLayers = max(1, numLayers)
         self.inputDim = inputDim
@@ -123,6 +130,36 @@ public final class SpikingNetwork: @unchecked Sendable {
         self.pBHLayers = bhLayersList
         self.pGammaRMS = gammaRMSList
         self.pWRecLayers = wRecLayersList
+        var betaList: [Parameter] = []
+        if learnedBeta {
+            let lo = SpikingNetworkWeights.learnedBetaRange.lowerBound
+            let hi = SpikingNetworkWeights.learnedBetaRange.upperBound
+            var values = [Float](repeating: 0.0, count: maxHiddenDim)
+            var n = 0
+            while n < maxHiddenDim {
+                var frac: Float = 0.0
+                if 1 < maxHiddenDim {
+                    frac = Float(n) / Float(maxHiddenDim - 1)
+                }
+                values[n] = lo + (hi - lo) * frac
+                n += 1
+            }
+            var li = 0
+            while li < self.numLayers {
+                betaList.append(Parameter(count: maxHiddenDim, initialData: values))
+                li += 1
+            }
+        }
+        self.pBetaLayers = betaList
+        var normList: [Parameter] = []
+        if inputNorm {
+            var li = 0
+            while li < self.numLayers {
+                normList.append(Parameter(count: maxHiddenDim, initialData: [Float](repeating: inputNormGainInit, count: maxHiddenDim)))
+                li += 1
+            }
+        }
+        self.pInputNormGains = normList
         self.pWOut = Parameter(count: outputDim * maxHiddenDim, initialData: initWOut)
         self.pBOut = Parameter(count: outputDim, initialData: initBOut)
 
@@ -138,7 +175,9 @@ public final class SpikingNetwork: @unchecked Sendable {
             outputDim: weights.outputDim,
             timeSteps: weights.timeSteps,
             lifConfig: weights.lifConfig,
-            upperRecurrent: weights.hasUpperRecurrence
+            upperRecurrent: weights.hasUpperRecurrence,
+            learnedBeta: weights.hasLearnedBeta,
+            inputNorm: weights.hasInputNorm
         )
         self.importWeights(from: weights)
     }
@@ -153,6 +192,8 @@ public final class SpikingNetwork: @unchecked Sendable {
             l += 1
         }
         params.append(contentsOf: pWRecLayers)
+        params.append(contentsOf: pBetaLayers)
+        params.append(contentsOf: pInputNormGains)
         params.append(pWOut)
         params.append(pBOut)
         return params
@@ -173,10 +214,26 @@ public final class SpikingNetwork: @unchecked Sendable {
             bHLayers: pBHLayers.map { $0.data },
             gammaRMS: pGammaRMS.map { $0.data },
             wRecLayers: exportedRecLayers(),
+            betaLayers: exportedBetaLayers(),
+            inputNormGains: exportedNormGains(),
             wOut: pWOut.data,
             bOut: pBOut.data,
             vocabularyCharacters: vocabulary?.serializedCharacters
         )
+    }
+
+    private func exportedNormGains() -> [[Float]]? {
+        if pInputNormGains.isEmpty {
+            return nil
+        }
+        return pInputNormGains.map { $0.data }
+    }
+
+    private func exportedBetaLayers() -> [[Float]]? {
+        if pBetaLayers.isEmpty {
+            return nil
+        }
+        return pBetaLayers.map { $0.data }
     }
 
     private func exportedRecLayers() -> [[Float]]? {
@@ -218,6 +275,24 @@ public final class SpikingNetwork: @unchecked Sendable {
                     pWRecLayers[r].data = rec[r]
                 }
                 r += 1
+            }
+        }
+        if let betas = weightsData.betaLayers {
+            var bi = 0
+            while bi < min(pBetaLayers.count, betas.count) {
+                if betas[bi].count == pBetaLayers[bi].data.count {
+                    pBetaLayers[bi].data = betas[bi]
+                }
+                bi += 1
+            }
+        }
+        if let gains = weightsData.inputNormGains {
+            var gi = 0
+            while gi < min(pInputNormGains.count, gains.count) {
+                if gains[gi].count == pInputNormGains[gi].data.count {
+                    pInputNormGains[gi].data = gains[gi]
+                }
+                gi += 1
             }
         }
         if weightsData.wOut.count == pWOut.data.count {
@@ -477,12 +552,14 @@ public final class SpikingNetwork: @unchecked Sendable {
                             readoutSum.withUnsafeMutableBufferPointer { sumBuf in
                                 stepLayer(
                                     isLast: numLayers == 1,
+                                    layer: 0,
                                     vPtr: vBuf.baseAddress!,
                                     sPtr: sBuf.baseAddress!,
                                     aPtr: aBuf.baseAddress!,
                                     curPtr: curBuf.baseAddress!,
                                     readoutSumPtr: sumBuf.baseAddress!,
-                                    count: hSize
+                                    count: hSize,
+                                    scratch: scratch
                                 )
                             }
                         }
@@ -662,12 +739,14 @@ public final class SpikingNetwork: @unchecked Sendable {
                                 readoutSum.withUnsafeMutableBufferPointer { sumBuf in
                                     stepLayer(
                                         isLast: (layerIdx + 1) == numLayers,
+                                        layer: layerIdx,
                                         vPtr: vBuf.baseAddress!.advanced(by: thisLayerOffset),
                                         sPtr: sBuf.baseAddress!.advanced(by: thisLayerOffset),
                                         aPtr: aBuf.baseAddress!.advanced(by: thisLayerOffset),
                                         curPtr: curBuf.baseAddress!,
                                         readoutSumPtr: sumBuf.baseAddress!,
-                                        count: hSize
+                                        count: hSize,
+                                        scratch: scratch
                                     )
                                 }
                             }
@@ -817,15 +896,86 @@ public final class SpikingNetwork: @unchecked Sendable {
     }
 
     /// 隠れ層はハードリセット、最終層は閾値単位の膜電位を読んで余りを残す。
+    /// 入力正規化の構成では、残差電流 (curPtr) は変えずに RMSNorm·ゲインを scratch.normCurrents に作って LIF へ渡す
     @inline(__always)
     private func stepLayer(
         isLast: Bool,
+        layer: Int,
+        vPtr: UnsafeMutablePointer<Float>,
+        sPtr: UnsafeMutablePointer<Float>,
+        aPtr: UnsafeMutablePointer<Float>,
+        curPtr: UnsafePointer<Float>,
+        readoutSumPtr: UnsafeMutablePointer<Float>,
+        count: Int,
+        scratch: ForwardScratch
+    ) {
+        if layer < pInputNormGains.count {
+            var sumSq: Float = 0.0
+            var n = 0
+            while n < count {
+                sumSq += curPtr[n] * curPtr[n]
+                n += 1
+            }
+            let invRms = 1.0 / sqrt(sumSq / Float(max(1, count)) + inputNormEpsilon)
+            let gains = pInputNormGains[layer].data
+            scratch.normCurrents.withUnsafeMutableBufferPointer { normBuf in
+                let norm = normBuf.baseAddress!
+                var k = 0
+                while k < count {
+                    norm[k] = (curPtr[k] * invRms) * gains[k]
+                    k += 1
+                }
+            }
+            scratch.normCurrents.withUnsafeBufferPointer { normBuf in
+                stepLayerScaled(
+                    isLast: isLast, layer: layer, vPtr: vPtr, sPtr: sPtr, aPtr: aPtr,
+                    curPtr: normBuf.baseAddress!, readoutSumPtr: readoutSumPtr, count: count
+                )
+            }
+            return
+        }
+        stepLayerScaled(
+            isLast: isLast, layer: layer, vPtr: vPtr, sPtr: sPtr, aPtr: aPtr,
+            curPtr: curPtr, readoutSumPtr: readoutSumPtr, count: count
+        )
+    }
+
+    @inline(__always)
+    private func stepLayerScaled(
+        isLast: Bool,
+        layer: Int,
         vPtr: UnsafeMutablePointer<Float>,
         sPtr: UnsafeMutablePointer<Float>,
         aPtr: UnsafeMutablePointer<Float>,
         curPtr: UnsafePointer<Float>,
         readoutSumPtr: UnsafeMutablePointer<Float>,
         count: Int
+    ) {
+        if layer < pBetaLayers.count {
+            pBetaLayers[layer].data.withUnsafeBufferPointer { bBuf in
+                stepLayerWithBeta(
+                    isLast: isLast, vPtr: vPtr, sPtr: sPtr, aPtr: aPtr, curPtr: curPtr,
+                    readoutSumPtr: readoutSumPtr, count: count, betaPtr: bBuf.baseAddress
+                )
+            }
+            return
+        }
+        stepLayerWithBeta(
+            isLast: isLast, vPtr: vPtr, sPtr: sPtr, aPtr: aPtr, curPtr: curPtr,
+            readoutSumPtr: readoutSumPtr, count: count, betaPtr: nil
+        )
+    }
+
+    @inline(__always)
+    private func stepLayerWithBeta(
+        isLast: Bool,
+        vPtr: UnsafeMutablePointer<Float>,
+        sPtr: UnsafeMutablePointer<Float>,
+        aPtr: UnsafeMutablePointer<Float>,
+        curPtr: UnsafePointer<Float>,
+        readoutSumPtr: UnsafeMutablePointer<Float>,
+        count: Int,
+        betaPtr: UnsafePointer<Float>?
     ) {
         if isLast {
             LIFNeuronEngine.stepReadoutAdaptiveSIMD8(
@@ -835,7 +985,8 @@ public final class SpikingNetwork: @unchecked Sendable {
                 aPtr: aPtr,
                 curPtr: curPtr,
                 readoutSumPtr: readoutSumPtr,
-                count: count
+                count: count,
+                betaPtr: betaPtr
             )
         } else {
             LIFNeuronEngine.stepAdaptiveSIMD8(
@@ -844,7 +995,8 @@ public final class SpikingNetwork: @unchecked Sendable {
                 sPtr: sPtr,
                 aPtr: aPtr,
                 curPtr: curPtr,
-                count: count
+                count: count,
+                betaPtr: betaPtr
             )
         }
     }
@@ -855,6 +1007,8 @@ public final class ForwardScratch: @unchecked Sendable {
     public var inputCurrents: [Float]
     public var stepCurrents: [Float]
     public var stepCurrentsPrev: [Float]
+    /// 入力正規化の構成で LIF に渡す正規化済み電流
+    public var normCurrents: [Float]
     public var activeSpikes: [Int]
     public var activeLayerSpikes: [Int]
     public var activeReadoutIndices: [Int]
@@ -866,6 +1020,7 @@ public final class ForwardScratch: @unchecked Sendable {
         self.inputCurrents = [Float](repeating: 0.0, count: size)
         self.stepCurrents = [Float](repeating: 0.0, count: size)
         self.stepCurrentsPrev = [Float](repeating: 0.0, count: size)
+        self.normCurrents = [Float](repeating: 0.0, count: size)
         self.activeSpikes = [Int](repeating: 0, count: size)
         self.activeLayerSpikes = [Int](repeating: 0, count: size)
         self.activeReadoutIndices = [Int](repeating: 0, count: size)

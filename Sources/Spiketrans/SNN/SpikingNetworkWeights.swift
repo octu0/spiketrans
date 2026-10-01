@@ -25,6 +25,13 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let gammaRMS: [[Float]]   // [numLayers - 1][maxHiddenDim]
     /// 層 1 以降の再帰結合 (同じ層の直前サブステップのスパイクから)。上位層に再帰を持たない構成では nil
     public let wRecLayers: [[Float]]?  // [numLayers - 1][maxHiddenDim * maxHiddenDim]
+    /// ニューロンごとの膜電位減衰率 (学習する構成のみ。無ければ全ニューロン beta 共通)
+    public let betaLayers: [[Float]]?  // [numLayers][maxHiddenDim]
+    /// 各層の LIF に入る電流全体を RMSNorm するときのゲイン (無ければ残差をそのまま入れる)
+    public let inputNormGains: [[Float]]?  // [numLayers][maxHiddenDim]
+    /// 声の種類 (なし / 配信者 / bot / その他) を中間層の発火率から判定する補助ヘッド。学習時だけ使う
+    public let wVoice: [Float]?   // [voiceClasses * maxHiddenDim]
+    public let bVoice: [Float]?   // [voiceClasses]
 
     public let wOut: [Float]   // [outputDim * maxHiddenDim]
     public let bOut: [Float]   // [outputDim]
@@ -46,6 +53,10 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         bHLayers: [[Float]] = [],
         gammaRMS: [[Float]] = [],
         wRecLayers: [[Float]]? = nil,
+        betaLayers: [[Float]]? = nil,
+        inputNormGains: [[Float]]? = nil,
+        wVoice: [Float]? = nil,
+        bVoice: [Float]? = nil,
         wOut: [Float],
         bOut: [Float],
         vocabularyCharacters: String? = nil
@@ -67,6 +78,10 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.bHLayers = bHLayers
         self.gammaRMS = gammaRMS
         self.wRecLayers = wRecLayers
+        self.betaLayers = betaLayers
+        self.inputNormGains = inputNormGains
+        self.wVoice = wVoice
+        self.bVoice = bVoice
         self.wOut = wOut
         self.bOut = bOut
         self.vocabularyCharacters = vocabularyCharacters
@@ -78,6 +93,37 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             return false
         }
         return rec.isEmpty != true
+    }
+
+    /// 減衰率を学習する構成の初期値の範囲。ニューロンの番号順に等間隔に並べ、
+    /// 速い (0.92: 1 フレームで 0.72 倍) ものから秒単位で保つ (0.995: 1 フレームで 0.98 倍) ものまで混ぜる
+    public static let learnedBetaRange: ClosedRange<Float> = 0.92...0.995
+
+    /// 声の種類の補助ヘッドのクラス数 (0 なし / 1 配信者 / 2 bot / 3 その他の声)
+    public static let voiceClasses = 4
+
+    /// 声の種類の補助ヘッドを持つか
+    public var hasVoiceHead: Bool {
+        guard let w = wVoice, let b = bVoice else {
+            return false
+        }
+        return w.isEmpty != true && b.isEmpty != true
+    }
+
+    /// 各層の入力電流を RMSNorm するか
+    public var hasInputNorm: Bool {
+        guard let g = inputNormGains else {
+            return false
+        }
+        return g.isEmpty != true
+    }
+
+    /// 減衰率をニューロンごとに持つか
+    public var hasLearnedBeta: Bool {
+        guard let b = betaLayers else {
+            return false
+        }
+        return b.isEmpty != true
     }
 
     /// 層数 (層 0 + 上位層)

@@ -55,11 +55,11 @@ public enum ExecutionPrecision: String, Sendable, CaseIterable {
 
 extension Trainer {
     private func acousticFrameStack() -> Int {
-        var stack = acousticNetwork.inputDim / StreamingFeatureFrontEnd.tapDim
-        if stack < 1 {
-            stack = 1
-        }
-        return stack
+        return StreamingFeatureFrontEnd.frameStack(forInputDim: acousticNetwork.inputDim)
+    }
+
+    private func acousticLongContext() -> Bool {
+        return StreamingFeatureFrontEnd.hasLongContext(inputDim: acousticNetwork.inputDim)
     }
 
     /// PCM から音響 greedy でテキストを返す。既定の LanguageDecoder は lmWeight=0。
@@ -69,7 +69,8 @@ extension Trainer {
     ) -> String {
         let featuresSeq = SpeechDataset.extractFeaturesFromPCM(
             pcmData: pcmData,
-            frameStack: acousticFrameStack()
+            frameStack: acousticFrameStack(),
+            longContext: acousticLongContext()
         )
         if featuresSeq.isEmpty {
             return ""
@@ -146,7 +147,8 @@ extension Trainer {
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: pcmData, sampleRate: 16000)
         let featuresSeq = SpeechDataset.extractFeaturesFromPCM(
             pcmData: pcm16k,
-            frameStack: acousticFrameStack()
+            frameStack: acousticFrameStack(),
+            longContext: acousticLongContext()
         )
         return transcribeAcousticDirect(
             featuresSeq: featuresSeq,

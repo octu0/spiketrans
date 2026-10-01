@@ -15,10 +15,28 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     public static let targetRMS: Float = 0.05
     /// ほぼ無音のクリップでノイズだけを増幅しない上限
     public static let maxGain: Float = 20.0
+    /// 長い文脈 (背景音の要約) の次元。平滑メルの指数移動平均 64
+    public static let contextDim = 64
+    /// 背景音の要約の時定数 (秒)。1 ホップ 10 ms ごとに 1 - exp(-0.01 / τ) だけ追従する
+    public static let contextTimeConstant: Float = 1.0
 
     @inline(__always)
-    public static func acousticInputDim(stack: Int = defaultStack) -> Int {
-        return tapDim * max(1, stack)
+    public static func acousticInputDim(stack: Int = defaultStack, longContext: Bool = false) -> Int {
+        var dim = tapDim * max(1, stack)
+        if longContext {
+            dim += contextDim
+        }
+        return dim
+    }
+
+    /// ネットワークの入力次元から束ね数を求める (背景音の要約の有無によらない)
+    public static func frameStack(forInputDim inputDim: Int) -> Int {
+        return max(1, inputDim / tapDim)
+    }
+
+    /// ネットワークの入力次元が背景音の要約を含むか
+    public static func hasLongContext(inputDim: Int) -> Bool {
+        return (inputDim % tapDim) == contextDim
     }
 
     @inline(__always)
@@ -34,6 +52,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     }
 
     public let frameStack: Int
+    public let longContext: Bool
     public let stackedDim: Int
     public let hopSize: Int
     public let frameSize: Int
@@ -47,6 +66,10 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     private var tapFrame: [Float]
     private var stackBuf: [Float]
     private var preemphBuf: [Float]
+    /// 平滑メルの指数移動平均 (背景音の要約)。longContext のときだけ使う
+    private var contextMel: [Float]
+    private var hasContext: Bool = false
+    private let contextRate: Float
 
     private var hasPrevMel: Bool = false
     private var hasCurrMel: Bool = false
@@ -59,10 +82,11 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     private var rmsSumSquares: Float = 0.0
     private var rmsSampleCount: Int = 0
 
-    public init(frameStack: Int = defaultStack, dspConfig: DSPConfig = DSPConfig()) {
+    public init(frameStack: Int = defaultStack, longContext: Bool = false, dspConfig: DSPConfig = DSPConfig()) {
         let stack = max(1, frameStack)
         self.frameStack = stack
-        self.stackedDim = Self.tapDim * stack
+        self.longContext = longContext
+        self.stackedDim = Self.acousticInputDim(stack: stack, longContext: longContext)
         self.hopSize = dspConfig.hopSize
         self.frameSize = dspConfig.frameSize
         self.preemphasisCoeff = dspConfig.preemphasisCoeff
@@ -75,8 +99,11 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         self.prevMel = [Float](repeating: 0.0, count: Self.melChannels)
         self.currMel = [Float](repeating: 0.0, count: Self.melChannels)
         self.tapFrame = [Float](repeating: 0.0, count: Self.tapDim)
-        self.stackBuf = [Float](repeating: 0.0, count: Self.tapDim * stack)
+        self.stackBuf = [Float](repeating: 0.0, count: Self.acousticInputDim(stack: stack, longContext: longContext))
         self.preemphBuf = [Float](repeating: 0.0, count: dspConfig.frameSize)
+        self.contextMel = [Float](repeating: 0.0, count: Self.melChannels)
+        let hopSeconds = Float(dspConfig.hopSize) / Float(dspConfig.sampleRate)
+        self.contextRate = 1.0 - expf(-hopSeconds / Self.contextTimeConstant)
     }
 
     /// オフライン用。クリップ RMS が先に分かるとき、以降の走行 RMS 更新を止める。
@@ -93,6 +120,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         emittedStackCount = 0
         utteranceFirstFrame = true
         streamRawPrev = 0.0
+        hasContext = false
         if gainFrozen != true {
             gain = 1.0
             rmsSumSquares = 0.0
@@ -136,10 +164,11 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         }
         if 0 < stackFill && emittedStackCount == 0 {
             var i = stackFill * Self.tapDim
-            while i < stackBuf.count {
+            while i < Self.tapDim * frameStack {
                 stackBuf[i] = 0.0
                 i += 1
             }
+            writeContext()
             stackFill = 0
             emittedStackCount += 1
             return stackBuf
@@ -247,12 +276,49 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
             stackBuf[offset + d] = tapFrame[d]
             d += 1
         }
+        if longContext {
+            updateContext()
+        }
         stackFill += 1
         if stackFill < frameStack {
             return nil
         }
         stackFill = 0
         emittedStackCount += 1
+        writeContext()
         return stackBuf
+    }
+
+    /// 平滑メルを指数移動平均に取り込む。発話の最初のホップで初期化する
+    @inline(__always)
+    private func updateContext() {
+        let rate = contextRate
+        var c = 0
+        if hasContext != true {
+            while c < Self.melChannels {
+                contextMel[c] = tapFrame[c]
+                c += 1
+            }
+            hasContext = true
+            return
+        }
+        while c < Self.melChannels {
+            contextMel[c] += rate * (tapFrame[c] - contextMel[c])
+            c += 1
+        }
+    }
+
+    /// 束ねた末尾に背景音の要約を書く
+    @inline(__always)
+    private func writeContext() {
+        if longContext != true {
+            return
+        }
+        let offset = Self.tapDim * frameStack
+        var c = 0
+        while c < Self.melChannels {
+            stackBuf[offset + c] = contextMel[c]
+            c += 1
+        }
     }
 }

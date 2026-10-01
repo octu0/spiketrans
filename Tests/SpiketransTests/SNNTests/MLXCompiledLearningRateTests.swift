@@ -159,4 +159,98 @@ final class MLXCompiledLearningRateTests: XCTestCase {
         XCTAssertLessThan(maxAbsDiff(wA.wOut, wB.wOut), 1e-4, "wOut の更新が compile 済みチャンクで違う")
         XCTAssertLessThan(maxAbsDiff(wA.wRec, wB.wRec), 1e-4, "wRec の更新が compile 済みチャンクで違う")
     }
+
+    private func makeVoiceTargets(frames: Int) -> [[Int]] {
+        // 前半は配信者 (1)、真ん中に bot (2)、末尾はラベルなし (-1)。2 件目は「なし (0)」だけ
+        var a = [Int](repeating: 1, count: frames)
+        var t = frames / 3
+        while t < frames / 2 {
+            a[t] = 2
+            t += 1
+        }
+        t = frames - 8
+        while t < frames {
+            a[t] = -1
+            t += 1
+        }
+        return [a, [Int](repeating: 0, count: frames)]
+    }
+
+    func testVoiceLossMatchesManualCrossEntropy() {
+        let logits = MLXArray([1.0, 0.0, -1.0, 0.5, 0.2, 0.2, 0.2, 0.2] as [Float], [1, 2, 4])
+        let targets = MLXArray([Int32(2), Int32(-1)], [1, 2])
+        let loss = MLXBPTTTrainer.voiceLoss(logits: logits, targets: targets)
+        eval(loss)
+        // 有効なのは 1 フレーム目だけ: -log softmax([1, 0, -1, 0.5])[2]
+        let z: [Float] = [1.0, 0.0, -1.0, 0.5]
+        let m = z.max()!
+        let lse = m + log(z.map { exp($0 - m) }.reduce(0, +))
+        XCTAssertEqual(loss.item(Float.self), lse - z[2], accuracy: 1e-5)
+        let grad = MLXBPTTTrainer.voiceLossGradient(logits: logits, targets: targets)
+        eval(grad)
+        let g = grad.asArray(Float.self)
+        // ラベルなしフレームの勾配は 0、有効フレームは softmax - onehot
+        XCTAssertEqual(g[4], 0.0, accuracy: 1e-7)
+        XCTAssertEqual(g[2], exp(z[2] - lse) - 1.0, accuracy: 1e-5)
+    }
+
+    func testVoiceHeadWeightsRoundTrip() throws {
+        let net = MLXSpikingNetwork(numLayers: 3, inputDim: 16, maxHiddenDim: 32, outputDim: 8, voiceHead: true)
+        XCTAssertEqual(net.voiceLayer, 1)
+        let w = net.exportWeights()
+        XCTAssertEqual(w.hasVoiceHead, true)
+        XCTAssertEqual(w.wVoice?.count, SpikingNetworkWeights.voiceClasses * 32)
+        let data = try JSONEncoder().encode(w)
+        let decoded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
+        XCTAssertEqual(decoded, w)
+        XCTAssertEqual(MLXSpikingNetwork(weights: decoded).exportWeights(), w)
+        // CPU 推論側は補助ヘッドを持たずに読める
+        XCTAssertEqual(SpikingNetwork(weights: decoded).numLayers, 3)
+        XCTAssertEqual(MLXSpikingNetwork(numLayers: 3, inputDim: 16, maxHiddenDim: 32, outputDim: 8).exportWeights().hasVoiceHead, false)
+    }
+
+    /// 補助ヘッド付きで、compile 済みチャンク (解析的な補助勾配) と eager (自動微分) の更新が一致する
+    func testVoiceHeadChunkedMatchesEager() {
+        let inputDim = 16
+        let frames = compiledMaxFrames + 40
+        let (feats, targets) = makeBatch(inputDim: inputDim, frames: frames)
+        let voice = makeVoiceTargets(frames: frames)
+        let netA = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8, voiceHead: true)
+        let netB = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8, voiceHead: true)
+        netB.importWeights(from: netA.exportWeights())
+        let trainerA = MLXBPTTTrainer(network: netA, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        let trainerB = MLXBPTTTrainer(network: netB, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        trainerA.chunkLongSequences = false
+        var step = 0
+        while step < 2 {
+            let lossA = trainerA.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: false, voiceTargetsBatch: voice)
+            let lossB = trainerB.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: true, voiceTargetsBatch: voice)
+            XCTAssertEqual(lossA, lossB, accuracy: 1e-3 * max(1.0, abs(lossA)), "補助ヘッド付きの損失が違う (step \(step))")
+            XCTAssertEqual(trainerA.lastVoiceLoss, trainerB.lastVoiceLoss, accuracy: 1e-3, "補助損失が違う (step \(step))")
+            XCTAssertLessThan(0.0, trainerA.lastVoiceLoss)
+            step += 1
+        }
+        let wA = netA.exportWeights()
+        let wB = netB.exportWeights()
+        XCTAssertLessThan(maxAbsDiff(wA.wIn, wB.wIn), 1e-4, "wIn の更新が違う")
+        XCTAssertLessThan(maxAbsDiff(wA.wVoice ?? [], wB.wVoice ?? []), 1e-4, "wVoice の更新が違う")
+        XCTAssertLessThan(maxAbsDiff(wA.wLayers[0], wB.wLayers[0]), 1e-4, "wLayers の更新が違う")
+    }
+
+    /// 短い系列 (compile 済みステップ) でも補助損失が下がる
+    func testVoiceHeadCompiledStepLearns() {
+        let inputDim = 16
+        let (feats, targets) = makeBatch(inputDim: inputDim, frames: 32)
+        let voice = makeVoiceTargets(frames: 32)
+        let net = MLXSpikingNetwork(numLayers: 2, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8, voiceHead: true)
+        let trainer = MLXBPTTTrainer(network: net, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        trainer.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: true, voiceTargetsBatch: voice)
+        let first = trainer.lastVoiceLoss
+        var i = 0
+        while i < 30 {
+            trainer.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: true, voiceTargetsBatch: voice)
+            i += 1
+        }
+        XCTAssertLessThan(trainer.lastVoiceLoss, first * 0.7, "補助損失が下がらない (\(first) → \(trainer.lastVoiceLoss))")
+    }
 }

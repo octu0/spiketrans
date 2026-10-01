@@ -183,6 +183,7 @@ public final class StreamingTranscriber: @unchecked Sendable {
         self.segmentRawFeatures.reserveCapacity(stackedCap)
         self.featureFrontEnd = StreamingFeatureFrontEnd(
             frameStack: stack,
+            longContext: StreamingFeatureFrontEnd.hasLongContext(inputDim: acousticNetwork.inputDim),
             dspConfig: dspCfg
         )
         // 束ね前は 10 ホップごと (100 ms)。束ね後も同じ実時間。

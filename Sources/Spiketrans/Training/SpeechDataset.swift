@@ -32,6 +32,19 @@ public struct AudioTextSample: Sendable {
 /// アクセス時に WAV から特徴を作る。大規模コーパスは遅延モード。
 public final class SpeechDataset: @unchecked Sendable {
     /// 遅延モードの 1 発話ぶんのメタデータ
+    /// 声の種類のラベル区間 (秒、発話 WAV の先頭基準)。cls は SpikingNetworkWeights.voiceClasses の ID
+    public struct VoiceSpan: Sendable {
+        public let start: Float
+        public let end: Float
+        public let cls: Int
+
+        public init(start: Float, end: Float, cls: Int) {
+            self.start = start
+            self.end = end
+            self.cls = cls
+        }
+    }
+
     public struct SampleMeta: Sendable {
         public let path: String
         public let rawText: String
@@ -39,6 +52,8 @@ public final class SpeechDataset: @unchecked Sendable {
         public let textIds: [Int]
         public let phonemeIds: [Int]
         public let frameCount: Int
+        /// 声の種類のラベル区間。無ければ空 (補助ヘッドの学習から除く)
+        public let voiceSpans: [VoiceSpan]
 
         public init(
             path: String,
@@ -46,7 +61,8 @@ public final class SpeechDataset: @unchecked Sendable {
             hiraganaText: String,
             textIds: [Int],
             phonemeIds: [Int],
-            frameCount: Int
+            frameCount: Int,
+            voiceSpans: [VoiceSpan] = []
         ) {
             self.path = (path as NSString).standardizingPath
             self.rawText = rawText
@@ -54,28 +70,54 @@ public final class SpeechDataset: @unchecked Sendable {
             self.textIds = textIds
             self.phonemeIds = phonemeIds
             self.frameCount = frameCount
+            self.voiceSpans = voiceSpans
+        }
+
+        /// フレームごとの声の種類 (-1 = ラベルなし)。フレーム t の中心時刻を含む区間のクラスを取る
+        public func voiceFrameLabels(frameCount: Int, frameSeconds: Float) -> [Int] {
+            var labels = [Int](repeating: -1, count: frameCount)
+            if voiceSpans.isEmpty {
+                return labels
+            }
+            var t = 0
+            while t < frameCount {
+                let center = (Float(t) + 0.5) * frameSeconds
+                for span in voiceSpans {
+                    if span.start <= center && center < span.end {
+                        labels[t] = span.cls
+                        break
+                    }
+                }
+                t += 1
+            }
+            return labels
         }
     }
 
     public let samples: [AudioTextSample]
     public let metaSamples: [SampleMeta]
     public let lazyFrameStack: Int
+    /// 遅延読み込みの特徴量に背景音の要約を付けるか
+    public let lazyLongContext: Bool
     private let isLazy: Bool
 
     public init(samples: [AudioTextSample]) {
         self.samples = samples
         self.metaSamples = []
         self.lazyFrameStack = 1
+        self.lazyLongContext = false
         self.isLazy = false
     }
 
     public init(
         metaSamples: [SampleMeta],
-        frameStack: Int
+        frameStack: Int,
+        longContext: Bool = false
     ) {
         self.samples = []
         self.metaSamples = metaSamples
         self.lazyFrameStack = frameStack
+        self.lazyLongContext = longContext
         self.isLazy = true
     }
 
@@ -128,6 +170,7 @@ public final class SpeechDataset: @unchecked Sendable {
         let (pcm16k, features) = Self.loadFeatures(
             path: meta.path,
             frameStack: lazyFrameStack,
+            longContext: lazyLongContext,
             loadPCM: loadPCM
         )
         return AudioTextSample(
@@ -157,6 +200,7 @@ public final class SpeechDataset: @unchecked Sendable {
     public static func loadFeatures(
         path: String,
         frameStack: Int,
+        longContext: Bool = false,
         loadPCM: Bool = false,
         pcmTransform: (([Float]) -> [Float])? = nil,
         featureTransform: (([[Float]]) -> [[Float]])? = nil
@@ -168,7 +212,7 @@ public final class SpeechDataset: @unchecked Sendable {
         if let transform = pcmTransform {
             pcm16k = transform(pcm16k)
         }
-        var features = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack)
+        var features = extractFeaturesFromPCM(pcmData: pcm16k, frameStack: frameStack, longContext: longContext)
         if let transform = featureTransform {
             features = transform(features)
         }
@@ -181,8 +225,10 @@ public final class SpeechDataset: @unchecked Sendable {
         textVocabulary: TextVocabulary,
         phonemeVocabulary: PhonemeVocabulary = PhonemeVocabulary(),
         frameStack: Int = defaultFrameStack,
+        longContext: Bool = false,
         workers: Int = 8,
-        english: EnglishPronunciations? = nil
+        english: EnglishPronunciations? = nil,
+        voiceSpans: [[VoiceSpan]]? = nil
     ) -> SpeechDataset {
         final class MetaBuffer: @unchecked Sendable {
             var items: [SampleMeta?]
@@ -203,6 +249,7 @@ public final class SpeechDataset: @unchecked Sendable {
                     let (_, features) = loadFeatures(
                         path: pair.path,
                         frameStack: frameStack,
+                        longContext: longContext,
                         loadPCM: false
                     )
                     let frameCount = features.count
@@ -214,7 +261,8 @@ public final class SpeechDataset: @unchecked Sendable {
                             hiraganaText: converter.convertToHiragana(pair.text),
                             textIds: textVocabulary.textToIds(pair.text),
                             phonemeIds: converter.toPhonemeTokenIds(pair.text),
-                            frameCount: frameCount
+                            frameCount: frameCount,
+                            voiceSpans: voiceSpans?[i] ?? []
                         )
                     }
                 }
@@ -231,7 +279,8 @@ public final class SpeechDataset: @unchecked Sendable {
 
         return SpeechDataset(
             metaSamples: metas,
-            frameStack: frameStack
+            frameStack: frameStack,
+            longContext: longContext
         )
     }
 
@@ -366,12 +415,16 @@ public final class SpeechDataset: @unchecked Sendable {
 
     public static let defaultFrameStack = StreamingFeatureFrontEnd.defaultStack
 
-    public static func acousticInputDim(frameStack: Int = defaultFrameStack) -> Int {
-        return StreamingFeatureFrontEnd.acousticInputDim(stack: frameStack)
+    public static func acousticInputDim(frameStack: Int = defaultFrameStack, longContext: Bool = false) -> Int {
+        return StreamingFeatureFrontEnd.acousticInputDim(stack: frameStack, longContext: longContext)
     }
 
     /// クリップ RMS を `setGain` して FrontEnd にホップを流す。データセットとバッチ推論の入口。
-    public static func extractFeaturesFromPCM(pcmData: [Float], frameStack: Int = defaultFrameStack) -> [[Float]] {
+    public static func extractFeaturesFromPCM(
+        pcmData: [Float],
+        frameStack: Int = defaultFrameStack,
+        longContext: Bool = false
+    ) -> [[Float]] {
         let totalSamples = pcmData.count
         if totalSamples < 400 {
             return []
@@ -384,7 +437,7 @@ public final class SpeechDataset: @unchecked Sendable {
             rIdx += 1
         }
         let rms = sqrtf(sumSquares / Float(totalSamples))
-        let front = StreamingFeatureFrontEnd(frameStack: max(1, frameStack))
+        let front = StreamingFeatureFrontEnd(frameStack: max(1, frameStack), longContext: longContext)
         front.setGain(StreamingFeatureFrontEnd.gainForRMS(rms))
         front.beginUtterance()
 

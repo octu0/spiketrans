@@ -18,8 +18,12 @@ print("==================================================")
 // 変更する場合はここを直接書き換える (CLI 引数にはしない)。
 enum Defaults {
     static let frameStack = StreamingFeatureFrontEnd.defaultStack
+    /// 入力に背景音の要約 (平滑メルの 1 秒指数移動平均 64 次元) を足すか
+    static let longContext = false
     static let melFrameDim = StreamingFeatureFrontEnd.tapDim
-    static var acousticInputDim: Int { return melFrameDim * frameStack }
+    static var acousticInputDim: Int {
+        return StreamingFeatureFrontEnd.acousticInputDim(stack: frameStack, longContext: longContext)
+    }
 
     /// 隠れ層の次元
     static let maxHiddenDim = 1024
@@ -33,6 +37,16 @@ enum Defaults {
     static let numLayers = 8
     /// 層 1 以降も同じ層の直前スパイクから再帰結合を持つか (false なら再帰は層 0 だけ)
     static let upperRecurrent = false
+    /// 膜電位の減衰率をニューロンごとに学習するか (false なら全ニューロン lifConfig.beta 共通)
+    static let learnedBeta = false
+    /// 各層の LIF に入る電流全体 (残差込み) を層ごとの RMSNorm に通すか (Pre-LN 相当)
+    static let inputNorm = false
+    /// 入力正規化のゲインの初期値 (LIF に入る電流の RMS)。正規化なしの本番 8 層では実測 10〜12
+    static let inputNormGainInit: Float = 1.0
+    /// 声の種類 (なし / 配信者 / bot / その他) を中間層から判定する補助ヘッドを学習するか。
+    /// マニフェストの "voice": [[開始秒, 終了秒, クラス], ...] を教師にする (無い行は除く)
+    static let voiceHead = false
+    static let voiceLossWeight: Float = 0.3
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
@@ -275,6 +289,7 @@ if let imp = importWeightsPath {
 struct ManifestEntry: Codable {
     let path: String
     let text: String
+    let voice: [[Float]]?
 }
 
 guard let manifestContent = try? String(contentsOfFile: datasetPath, encoding: .utf8) else {
@@ -286,6 +301,7 @@ let manifestDir = (datasetPath as NSString).deletingLastPathComponent
 let jsonDecoder = JSONDecoder()
 var textLines: [String] = []
 var rawPairs: [(path: String, fileId: String, text: String)] = []
+var rawVoiceSpans: [[SpeechDataset.VoiceSpan]] = []
 
 // JSONL は改行 (LF) 区切り。CharacterSet.newlines で分けると U+2028 等の
 // 行区切り文字でも切れてしまい、字幕由来のテキストを含む行が壊れる
@@ -304,6 +320,13 @@ for line in manifestContent.components(separatedBy: "\n") {
         let fileId = ((wavPath as NSString).lastPathComponent as NSString).deletingPathExtension
         textLines.append(entry.text)
         rawPairs.append((path: wavPath, fileId: fileId, text: entry.text))
+        var spans: [SpeechDataset.VoiceSpan] = []
+        for v in entry.voice ?? [] {
+            if v.count == 3 {
+                spans.append(SpeechDataset.VoiceSpan(start: v[0], end: v[1], cls: Int(v[2])))
+            }
+        }
+        rawVoiceSpans.append(spans)
     }
 }
 
@@ -377,8 +400,10 @@ let dataset = SpeechDataset.lazyFromManifest(
     pairs: manifestPairs,
     textVocabulary: textVocabulary,
     frameStack: Defaults.frameStack,
+    longContext: Defaults.longContext,
     workers: numWorkers,
-    english: englishDict
+    english: englishDict,
+    voiceSpans: Array(rawVoiceSpans.prefix(sampleLimit))
 )
 
 let loadElapsed = CFAbsoluteTimeGetCurrent() - startTime
@@ -404,9 +429,9 @@ let trainConfig = TrainingConfig(
 )
 
 let acousticInputDim = Defaults.acousticInputDim
-print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね)")
+print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね、背景音の要約 \(Defaults.longContext))")
 
-print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers), 幅 = \(Defaults.maxHiddenDim), 上位層の再帰 = \(Defaults.upperRecurrent)")
+print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers), 幅 = \(Defaults.maxHiddenDim), 上位層の再帰 = \(Defaults.upperRecurrent), 減衰率の学習 = \(Defaults.learnedBeta), 入力正規化 = \(Defaults.inputNorm) (ゲイン初期値 \(Defaults.inputNormGainInit))")
 
 let trainer = Trainer(
     acousticNetwork: SpikingNetwork(
@@ -416,7 +441,10 @@ let trainer = Trainer(
         outputDim: phoneticVocabulary.size,
         timeSteps: 4,
         lifConfig: Defaults.lifConfig,
-        upperRecurrent: Defaults.upperRecurrent
+        upperRecurrent: Defaults.upperRecurrent,
+        learnedBeta: Defaults.learnedBeta,
+        inputNorm: Defaults.inputNorm,
+        inputNormGainInit: Defaults.inputNormGainInit
     ),
     languageNetwork: SpikingNetwork(
         inputDim: 128,
@@ -434,8 +462,10 @@ if let wData = importedWeights {
           wData.inputDim == acousticInputDim,
           wData.numLayers == Defaults.numLayers,
           wData.maxHiddenDim == Defaults.maxHiddenDim,
-          wData.hasUpperRecurrence == Defaults.upperRecurrent else {
-        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size), 層数 \(wData.numLayers)/\(Defaults.numLayers), 幅 \(wData.maxHiddenDim)/\(Defaults.maxHiddenDim), 上位層の再帰 \(wData.hasUpperRecurrence)/\(Defaults.upperRecurrent))。")
+          wData.hasUpperRecurrence == Defaults.upperRecurrent,
+          wData.hasLearnedBeta == Defaults.learnedBeta,
+          wData.hasInputNorm == Defaults.inputNorm else {
+        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size), 層数 \(wData.numLayers)/\(Defaults.numLayers), 幅 \(wData.maxHiddenDim)/\(Defaults.maxHiddenDim), 上位層の再帰 \(wData.hasUpperRecurrence)/\(Defaults.upperRecurrent), 減衰率の学習 \(wData.hasLearnedBeta)/\(Defaults.learnedBeta), 入力正規化 \(wData.hasInputNorm)/\(Defaults.inputNorm))。")
         exit(1)
     }
     trainer.acousticNetwork.importWeights(from: wData)
@@ -466,7 +496,11 @@ if epochs == 0 {
         outputDim: phoneticVocabulary.size,
         timeSteps: 4,
         lifConfig: trainer.acousticNetwork.lifConfig,
-        upperRecurrent: Defaults.upperRecurrent
+        upperRecurrent: Defaults.upperRecurrent,
+        learnedBeta: Defaults.learnedBeta,
+        inputNorm: Defaults.inputNorm,
+        inputNormGainInit: Defaults.inputNormGainInit,
+        voiceHead: Defaults.voiceHead
     )
     if let wData = importedWeights {
         mlxNet.importWeights(from: wData)
@@ -477,6 +511,11 @@ if epochs == 0 {
         config: trainConfig,
         bpttWindow: Defaults.bpttWindow
     )
+    mlxTrainer.voiceLossWeight = Defaults.voiceLossWeight
+    if Defaults.voiceHead {
+        let labeled = dataset.metaSamples.filter { $0.voiceSpans.isEmpty != true }.count
+        print("  声の種類の補助ヘッド: 層 \(mlxNet.voiceLayer) から \(SpikingNetworkWeights.voiceClasses) クラス、損失の重み \(Defaults.voiceLossWeight)、ラベル付き \(labeled) / \(dataset.count) 件")
+    }
     print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
     let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
     print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
@@ -567,14 +606,22 @@ if epochs == 0 {
     }
 
     // バッチの特徴量を WAV から並列生成する (遅延読み込みの実体)
+    // バッチの特徴量と、声の種類のフレームラベル (ラベルの無い項目は空)
+    struct FeatureBatch {
+    var features: [[[Float]]]
+    var voiceLabels: [[Int]]
+    }
     final class FeatureBatchBuffer: @unchecked Sendable {
     var items: [[[Float]]]
+    var voice: [[Int]]
     init(count: Int) {
         self.items = [[[Float]]](repeating: [], count: count)
+        self.voice = [[Int]](repeating: [], count: count)
     }
     }
     let activeWorkers = numWorkers
-    @Sendable func buildBatchFeatures(_ indices: [Int]) -> [[[Float]]] {
+    let frameSeconds = Float(Defaults.frameStack) * 0.01
+    @Sendable func buildBatchFeatures(_ indices: [Int]) -> FeatureBatch {
     let buffer = FeatureBatchBuffer(count: indices.count)
     let workerCount = max(1, min(activeWorkers, indices.count))
     DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
@@ -585,20 +632,24 @@ if epochs == 0 {
                 SpeechDataset.loadFeatures(
                     path: meta.path,
                     frameStack: Defaults.frameStack,
+                    longContext: Defaults.longContext,
                     loadPCM: false,
                     pcmTransform: augmenter.pcmTransform,
                     featureTransform: augmenter.featureTransform
                 ).features
             }
+            if Defaults.voiceHead && meta.voiceSpans.isEmpty != true {
+                buffer.voice[i] = meta.voiceFrameLabels(frameCount: buffer.items[i].count, frameSeconds: frameSeconds)
+            }
             i += workerCount
         }
     }
-    return buffer.items
+    return FeatureBatch(features: buffer.items, voiceLabels: buffer.voice)
     }
 
     // GPU がバッチを学習している間に、次バッチの特徴量を CPU で先読みする
     final class PrefetchBox: @unchecked Sendable {
-    var value: [[[Float]]] = []
+    var value = FeatureBatch(features: [], voiceLabels: [])
     }
 
     // 学習率はバッチ単位で刻む。エポック単位だとデータが増えたときに
@@ -645,6 +696,7 @@ if epochs == 0 {
         step: globalStep + 1, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
 
     var epLossSum: Float = 0.0
+    var epVoiceLossSum: Float = 0.0
     var batchCount = 0
     // 時間の内訳: GPU の学習ステップ、先読み待ち (特徴量の読み込みが GPU より遅いとき)、
     // compile 済み / eager (系列長が compiledMaxFrames 超) の別、系列長バケットごとの時間
@@ -656,9 +708,9 @@ if epochs == 0 {
     var bucketSwitches = 0
     var previousPaddedFrames = 0
 
-    var currentFeatures: [[[Float]]] = []
+    var currentBatch = FeatureBatch(features: [], voiceLabels: [])
     if 0 < batchGroups.count {
-        currentFeatures = buildBatchFeatures(batchGroups[0])
+        currentBatch = buildBatchFeatures(batchGroups[0])
     }
     var bIdx = 0
     while bIdx < batchGroups.count {
@@ -684,7 +736,7 @@ if epochs == 0 {
         mlxTrainer.updateLearningRate(curLR)
 
         var maxFrames = 0
-        for seq in currentFeatures {
+        for seq in currentBatch.features {
             if maxFrames < seq.count {
                 maxFrames = seq.count
             }
@@ -692,10 +744,12 @@ if epochs == 0 {
         let paddedFrames = ((maxFrames + 31) / 32) * 32
         let gpuStart = CFAbsoluteTimeGetCurrent()
         let res = mlxTrainer.trainBatchCTC(
-            featuresBatch: currentFeatures,
+            featuresBatch: currentBatch.features,
             targetsBatch: tBatch,
-            blankId: TextVocabulary.padId
+            blankId: TextVocabulary.padId,
+            voiceTargetsBatch: currentBatch.voiceLabels
         )
+        epVoiceLossSum += mlxTrainer.lastVoiceLoss
         let gpuElapsed = CFAbsoluteTimeGetCurrent() - gpuStart
         gpuSeconds += gpuElapsed
         if compiledMaxFrames < paddedFrames {
@@ -714,13 +768,17 @@ if epochs == 0 {
         let waitStart = CFAbsoluteTimeGetCurrent()
         prefetchGroup.wait()
         waitSeconds += CFAbsoluteTimeGetCurrent() - waitStart
-        currentFeatures = prefetchBox.value
+        currentBatch = prefetchBox.value
         bIdx += 1
     }
 
     let avgLoss = epLossSum / Float(max(1, batchCount))
     let epElapsed = CFAbsoluteTimeGetCurrent() - epStartTime
-    print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss)) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
+    var voiceNote = ""
+    if Defaults.voiceHead {
+        voiceNote = " 声の種類の損失 \(String(format: "%.4f", epVoiceLossSum / Float(max(1, batchCount))))"
+    }
+    print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss))\(voiceNote) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
     print("    内訳: GPU \(String(format: "%.0f", gpuSeconds)) 秒 (うち eager \(eagerBatches) バッチ \(String(format: "%.0f", eagerSeconds)) 秒) / 先読み待ち \(String(format: "%.0f", waitSeconds)) 秒 / \(batchCount) バッチ / バケット切替 \(bucketSwitches) 回")
     print("    MLX メモリ: 使用中 \(MLX.Memory.activeMemory >> 20) MB / キャッシュ \(MLX.Memory.cacheMemory >> 20) MB / ピーク \(MLX.GPU.peakMemory >> 20) MB")
     let topBuckets = bucketSeconds.sorted { a, b in b.value.seconds < a.value.seconds }.prefix(6)
@@ -1276,7 +1334,11 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
         }
 
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
-        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: evalFrameStack)
+        let features = SpeechDataset.extractFeaturesFromPCM(
+            pcmData: pcm16k,
+            frameStack: evalFrameStack,
+            longContext: Defaults.longContext
+        )
         let isTrain = evalIsTrain[idx]
 
         // 正解のかな読み (第1段の評価基準)
@@ -1541,7 +1603,11 @@ if 0 < rawPairs.count {
         if let wavData = SpeechDataset.loadWavFile(path: wavPath) {
             let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
             benchAudioSeconds += Double(pcm16k.count) / 16000.0
-            benchFeatures.append(SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k, frameStack: Defaults.frameStack))
+            benchFeatures.append(SpeechDataset.extractFeaturesFromPCM(
+                pcmData: pcm16k,
+                frameStack: Defaults.frameStack,
+                longContext: Defaults.longContext
+            ))
         }
         benchIdx += 1
     }

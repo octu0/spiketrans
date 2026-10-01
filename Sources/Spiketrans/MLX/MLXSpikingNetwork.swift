@@ -24,6 +24,17 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     public var gammaRMS: [MLXArray]  // 各 [maxHiddenDim]
     /// 層 1 以降の再帰結合 (同じ層の直前サブステップのスパイクから)。再帰なしの構成では空
     public var wRecLayers: [MLXArray]  // 各 [maxHiddenDim, maxHiddenDim]
+    /// ニューロンごとの減衰率の logit (減衰率 = sigmoid)。共通 beta の構成では空
+    public var betaLogits: [MLXArray]  // 各 [maxHiddenDim]、層 0 から numLayers 本
+    /// 各層の LIF に入る電流全体 (残差込み) を RMSNorm するときのゲイン。正規化しない構成では空
+    public var inputNormGains: [MLXArray]  // 各 [maxHiddenDim]、層 0 から numLayers 本
+    /// 声の種類の補助ヘッド [wVoice [maxHiddenDim, voiceClasses], bVoice [voiceClasses]]。無い構成では空
+    public var voiceHead: [MLXArray]
+
+    /// 補助ヘッドが読む層 (最終層の 1 つ下。層数が足りなければ層 0)
+    public var voiceLayer: Int {
+        return max(0, numLayers - 2)
+    }
 
     // リードアウト
     public var wOut: MLXArray      // [maxHiddenDim, outputDim]
@@ -36,7 +47,11 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         outputDim: Int = 523,
         timeSteps: Int = 4,
         lifConfig: LIFConfig = LIFConfig(),
-        upperRecurrent: Bool = false
+        upperRecurrent: Bool = false,
+        learnedBeta: Bool = false,
+        inputNorm: Bool = false,
+        inputNormGainInit: Float = 1.0,
+        voiceHead: Bool = false
     ) {
         self.numLayers = max(1, numLayers)
         self.inputDim = inputDim
@@ -72,6 +87,44 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         self.bHLayers = bl
         self.gammaRMS = gl
         self.wRecLayers = rl
+        var bLogits: [MLXArray] = []
+        if learnedBeta {
+            let lo = SpikingNetworkWeights.learnedBetaRange.lowerBound
+            let hi = SpikingNetworkWeights.learnedBetaRange.upperBound
+            var values = [Float](repeating: 0.0, count: maxHiddenDim)
+            var n = 0
+            while n < maxHiddenDim {
+                var frac: Float = 0.0
+                if 1 < maxHiddenDim {
+                    frac = Float(n) / Float(maxHiddenDim - 1)
+                }
+                let b = lo + (hi - lo) * frac
+                values[n] = logf(b / (1.0 - b))
+                n += 1
+            }
+            var li = 0
+            while li < self.numLayers {
+                bLogits.append(MLXArray(values, [maxHiddenDim]))
+                li += 1
+            }
+        }
+        self.betaLogits = bLogits
+        var normGains: [MLXArray] = []
+        if inputNorm {
+            var li = 0
+            while li < self.numLayers {
+                normGains.append(MLXArray.ones([maxHiddenDim]) * inputNormGainInit)
+                li += 1
+            }
+        }
+        self.inputNormGains = normGains
+        var head: [MLXArray] = []
+        if voiceHead {
+            let classes = SpikingNetworkWeights.voiceClasses
+            head.append(MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, classes]))
+            head.append(MLXArray.zeros([classes]))
+        }
+        self.voiceHead = head
 
         self.wOut = MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, outputDim])
         self.bOut = MLXArray.zeros([outputDim])
@@ -88,7 +141,10 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             outputDim: weights.outputDim,
             timeSteps: weights.timeSteps,
             lifConfig: weights.lifConfig,
-            upperRecurrent: weights.hasUpperRecurrence
+            upperRecurrent: weights.hasUpperRecurrence,
+            learnedBeta: weights.hasLearnedBeta,
+            inputNorm: weights.hasInputNorm,
+            voiceHead: weights.hasVoiceHead
         )
         self.importWeights(from: weights)
     }
@@ -133,6 +189,39 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
                 params["wRecLayers"] = .array(layerR)
             }
         }
+        if let betas = data.betaLayers {
+            var layerBeta: [NestedItem<String, MLXArray>] = []
+            var bi = 0
+            while bi < min(self.betaLogits.count, betas.count) {
+                let logits = betas[bi].map { b -> Float in
+                    let c = min(max(b, 1e-4), 1.0 - 1e-4)
+                    return logf(c / (1.0 - c))
+                }
+                layerBeta.append(.value(MLXArray(logits, [hSize])))
+                bi += 1
+            }
+            if 0 < layerBeta.count {
+                params["betaLogits"] = .array(layerBeta)
+            }
+        }
+        if let gains = data.inputNormGains {
+            var layerGain: [NestedItem<String, MLXArray>] = []
+            var gi = 0
+            while gi < min(self.inputNormGains.count, gains.count) {
+                layerGain.append(.value(MLXArray(gains[gi], [hSize])))
+                gi += 1
+            }
+            if 0 < layerGain.count {
+                params["inputNormGains"] = .array(layerGain)
+            }
+        }
+        if let w = data.wVoice, let b = data.bVoice, self.voiceHead.count == 2 {
+            let classes = SpikingNetworkWeights.voiceClasses
+            params["voiceHead"] = .array([
+                .value(MLXArray(w, [classes, hSize]).transposed()),
+                .value(MLXArray(b, [classes]))
+            ])
+        }
         self.update(parameters: params)
         eval(self)
     }
@@ -148,6 +237,9 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             l += 1
         }
         arraysToEval.append(contentsOf: wRecLayers)
+        arraysToEval.append(contentsOf: betaLogits)
+        arraysToEval.append(contentsOf: inputNormGains)
+        arraysToEval.append(contentsOf: voiceHead)
         eval(arraysToEval)
 
         var wl: [[Float]] = []
@@ -164,6 +256,20 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         if wRecLayers.isEmpty != true {
             rl = wRecLayers.map { $0.transposed().asArray(Float.self) }
         }
+        var betas: [[Float]]? = nil
+        if betaLogits.isEmpty != true {
+            betas = betaLogits.map { sigmoid($0).asArray(Float.self) }
+        }
+        var normGains: [[Float]]? = nil
+        if inputNormGains.isEmpty != true {
+            normGains = inputNormGains.map { $0.asArray(Float.self) }
+        }
+        var wVoice: [Float]? = nil
+        var bVoice: [Float]? = nil
+        if voiceHead.count == 2 {
+            wVoice = voiceHead[0].transposed().asArray(Float.self)
+            bVoice = voiceHead[1].asArray(Float.self)
+        }
 
         return SpikingNetworkWeights(
             inputDim: inputDim,
@@ -178,6 +284,10 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             bHLayers: bl,
             gammaRMS: gl,
             wRecLayers: rl,
+            betaLayers: betas,
+            inputNormGains: normGains,
+            wVoice: wVoice,
+            bVoice: bVoice,
             wOut: self.wOut.transposed().asArray(Float.self),
             bOut: self.bOut.asArray(Float.self),
             vocabularyCharacters: vocabulary?.serializedCharacters

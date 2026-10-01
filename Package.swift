@@ -38,6 +38,10 @@ let package = Package(
         .executable(
             name: "segment",
             targets: ["segment"]
+        ),
+        .executable(
+            name: "layerprobe",
+            targets: ["layerprobe"]
         )
     ],
     dependencies: [
@@ -95,6 +99,14 @@ let package = Package(
             name: "segment",
             dependencies: ["Spiketrans"],
             path: "script/segment"
+        ),
+        .executableTarget(
+            name: "layerprobe",
+            dependencies: [
+                "Spiketrans",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
+            path: "script/layerprobe"
         ),
         .testTarget(
             name: "SpiketransTests",

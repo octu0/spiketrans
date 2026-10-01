@@ -5,6 +5,9 @@ import MLXOptimizers
 
 /// 上位層の電流 RMSNorm で分散 0 のときの除算を避ける微小値 (推論側と共有)
 internal let rmsNormEpsilon: Float = 1e-5
+/// 入力正規化 (LIF に入る残差電流の RMSNorm) の下限。パディングや発話先頭では電流がちょうど 0 になり、
+/// 1e-5 だと勾配が 1/sqrt(eps) = 316 倍に跳ねてゲイン 10 では float32 があふれる (RMS の下限 0.1 に相当)
+internal let inputNormEpsilon: Float = 1e-2
 
 /// compile() する系列長の上限 (32 の倍数に切り上げた後のフレーム数)。
 /// compile は時間ループを静的に展開するため、1 ステップのピークメモリは系列長と層数に比例する
@@ -24,6 +27,10 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// フレームをまたぐ信用割り当てが完全に消え、第1段は実質フレーム独立の
     /// 分類器になる。大きくすると時間文脈を学習できる一方、計算グラフが深くなる。
     public let bpttWindow: Int
+    /// 声の種類の補助損失の重み (CTC 損失に足す)
+    public var voiceLossWeight: Float = 0.3
+    /// 直近のバッチの補助損失 (重みを掛ける前)。補助ヘッドが無ければ 0
+    public private(set) var lastVoiceLoss: Float = 0.0
 
     /// 系列長 (padded maxT) をキーとするコンパイル済み CTC 学習ステップのキャッシュ
     private var compiledCTCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
@@ -87,6 +94,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// 1 サブステップ分の全層 LIF 更新。
     /// 入力 [層 0 の入力電流, v_0...v_L-1, s_0...s_L-1, a_0...a_L-1]、出力 [v..., s..., a..., 最終層の読み出し]。
     /// 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差 (+ 再帰構成なら同じ層の直前スパイクの再帰電流)。
+    /// 入力正規化の構成では、各層の LIF に入るのは残差電流全体を RMSNorm してゲインを掛けたもの (残差そのものは正規化しない)。
     /// 最終層だけハードリセットせず、閾値単位の膜電位を読んでから余りを残す
     func substep(network: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] {
         let numLayers = network.numLayers
@@ -105,7 +113,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var a = Array(arrays[(1 + 2 * numLayers)..<(1 + 3 * numLayers)])
         var readout = MLXArray.zeros(like: v[0])
 
-        var current = current0 + matmul(s[0], network.wRec)
+        var stream = current0 + matmul(s[0], network.wRec)
         var l = 0
         while l < numLayers {
             if 0 < l {
@@ -114,17 +122,26 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 // MLXFast.rmsNorm は valueAndGrad + compile で Metal 生存バッファ上限を超える
                 let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
                 let rms = sqrt(meanSq + rmsNormEpsilon)
-                current = (denseCur / rms) * network.gammaRMS[upperIdx] + current
+                stream = (denseCur / rms) * network.gammaRMS[upperIdx] + stream
                 if upperIdx < network.wRecLayers.count {
-                    current = current + matmul(s[l], network.wRecLayers[upperIdx])
+                    stream = stream + matmul(s[l], network.wRecLayers[upperIdx])
                 }
+            }
+            var current = stream
+            if l < network.inputNormGains.count {
+                let streamMeanSq = mean(stream * stream, axis: -1, keepDims: true)
+                current = (stream / sqrt(streamMeanSq + inputNormEpsilon)) * network.inputNormGains[l]
             }
 
             let isLast = (l + 1) == numLayers
+            var decayed = v[l] * beta
+            if l < network.betaLogits.count {
+                decayed = v[l] * sigmoid(network.betaLogits[l])
+            }
             if isLast {
-                v[l] = clip(v[l] * beta + current, min: vMin, max: vMax)
+                v[l] = clip(decayed + current, min: vMin, max: vMax)
             } else {
-                v[l] = clip((v[l] * beta) * (1.0 - s[l]) + current, min: vMin, max: vMax)
+                v[l] = clip(decayed * (1.0 - s[l]) + current, min: vMin, max: vMax)
             }
 
             a[l] = (a[l] * rho) + (s[l] * gamma)
@@ -175,7 +192,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
         var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
         var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
-        let readoutList = forwardFrames(network: network, currentSeq0: currentSeq0, from: 0, to: seqLen, v: &v, s: &s, a: &a)
+        var rates: [MLXArray] = []
+        let readoutList = forwardFrames(network: network, currentSeq0: currentSeq0, from: 0, to: seqLen, v: &v, s: &s, a: &a, voiceRates: &rates)
         return matmul(stacked(readoutList, axis: 1), network.wOut) + network.bOut
     }
 
@@ -188,10 +206,13 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         to t1: Int,
         v: inout [MLXArray],
         s: inout [MLXArray],
-        a: inout [MLXArray]
+        a: inout [MLXArray],
+        voiceRates: inout [MLXArray]
     ) -> [MLXArray] {
         let tSteps = network.timeSteps
         let numLayers = network.numLayers
+        let voiceLayer = network.voiceLayer
+        let collectVoice = network.voiceHead.isEmpty != true
         var readoutList: [MLXArray] = []
         readoutList.reserveCapacity(t1 - t0)
 
@@ -199,6 +220,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         while t < t1 {
             let current0_t = currentSeq0[0..., t, 0...]
             var readoutSum = MLXArray.zeros(like: v[0])
+            var voiceSum = MLXArray.zeros(like: v[0])
 
             if (t % bpttWindow) == 0 {
                 var l = 0
@@ -221,13 +243,64 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 s = Array(out[numLayers..<(2 * numLayers)])
                 a = Array(out[(2 * numLayers)..<(3 * numLayers)])
                 readoutSum = readoutSum + out[3 * numLayers]
+                if collectVoice {
+                    voiceSum = voiceSum + s[voiceLayer]
+                }
                 step += 1
             }
 
             readoutList.append(readoutSum / Float(tSteps))
+            if collectVoice {
+                voiceRates.append(voiceSum / Float(tSteps))
+            }
             t += 1
         }
         return readoutList
+    }
+
+    /// 補助ヘッドのロジット [B, T, voiceClasses]。中間層の発火率 (サブステップ平均) の線形読み出し
+    func voiceLogits(network: MLXSpikingNetwork, rates: [MLXArray]) -> MLXArray {
+        return matmul(stacked(rates, axis: 1), network.voiceHead[0]) + network.voiceHead[1]
+    }
+
+    /// 声の種類の交差エントロピー (targets が -1 のフレームは除く。有効フレームの平均)
+    public static func voiceLoss(logits: MLXArray, targets: MLXArray) -> MLXArray {
+        let mask = (MLXArray(Int32(0)) .<= targets).asType(.float32)
+        let safe = maximum(targets, MLXArray(Int32(0))).asType(.int32)
+        let logProbs = logSoftmax(logits, axis: -1)
+        let picked = takeAlong(logProbs, safe.expandedDimensions(axis: -1), axis: -1).squeezed(axis: -1)
+        let count = maximum(sum(mask), MLXArray(Float(1.0)))
+        return -sum(picked * mask) / count
+    }
+
+    /// voiceLoss のロジットについての勾配 (softmax - onehot をマスクして有効フレーム数で割る)
+    static func voiceLossGradient(logits: MLXArray, targets: MLXArray) -> MLXArray {
+        let mask = (MLXArray(Int32(0)) .<= targets).asType(.float32)
+        let safe = maximum(targets, MLXArray(Int32(0))).asType(.int32)
+        let classes = logits.shape[2]
+        let probs = softmax(logits, axis: -1)
+        let onehot = (safe.expandedDimensions(axis: -1) .== MLXArray(0..<Int32(classes))).asType(.float32)
+        let count = maximum(sum(mask), MLXArray(Float(1.0)))
+        return (probs - onehot) * mask.expandedDimensions(axis: -1) / count
+    }
+
+    /// 全フレームの CTC ロジットと補助ヘッドのロジット (ヘッドが無ければ nil)
+    func logitsAndVoiceBatch(network: MLXSpikingNetwork, features: MLXArray) -> (MLXArray, MLXArray?) {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        let hMax = network.maxHiddenDim
+        let numLayers = network.numLayers
+        let currentSeq0 = matmul(features, network.wIn) + network.bH
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var rates: [MLXArray] = []
+        let readoutList = forwardFrames(network: network, currentSeq0: currentSeq0, from: 0, to: seqLen, v: &v, s: &s, a: &a, voiceRates: &rates)
+        let logits = matmul(stacked(readoutList, axis: 1), network.wOut) + network.bOut
+        if rates.isEmpty {
+            return (logits, nil)
+        }
+        return (logits, voiceLogits(network: network, rates: rates))
     }
 
     /// 長い系列の損失とパラメータ勾配をチャンク分割で求める。
@@ -242,6 +315,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     func chunkedLossAndGradients(
         features: MLXArray,
         extTargets: MLXCTCLoss.ExtendedTargets,
+        voiceTargets: MLXArray? = nil,
         compiled: Bool = true
     ) -> (loss: MLXArray, gradients: ModuleParameters) {
         let batchSize = features.shape[0]
@@ -249,6 +323,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let hMax = network.maxHiddenDim
         let numLayers = network.numLayers
         let chunkFrames = max(bpttWindow, (longSequenceChunkFrames / bpttWindow) * bpttWindow)
+        let useVoice = network.voiceHead.isEmpty != true && voiceTargets != nil
+        var headCount = 1
+        if useVoice {
+            headCount = 2
+        }
 
         // チャンクの形 [B, フレーム数] ごとに compile して、以後はトレース済みの関数を使う。
         // 端のチャンクは 32 フレーム単位に切り上げて 0 で埋める (因果系なので前のフレームの結果は変わらない)。
@@ -291,6 +370,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var states = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: 3 * numLayers)
         var chunkStarts: [[MLXArray]] = []
         var logitsChunks: [MLXArray] = []
+        var voiceChunks: [MLXArray] = []
         var t0 = 0
         while t0 < seqLen {
             let t1 = min(seqLen, t0 + chunkFrames)
@@ -299,12 +379,15 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             let out = forwardFn(frames)([padded(features[0..., t0..<t1, 0...], to: frames)] + states)
             eval(out)
             logitsChunks.append(out[0][0..., 0..<(t1 - t0), 0...])
-            states = Array(out[1...])
+            if useVoice {
+                voiceChunks.append(out[1][0..., 0..<(t1 - t0), 0...])
+            }
+            states = Array(out[headCount...])
             t0 = t1
         }
         let logits = concatenated(logitsChunks, axis: 1)
 
-        // 2. CTC 損失のロジット勾配
+        // 2. CTC 損失のロジット勾配 (+ 補助損失のロジット勾配は解析的に求める)
         let (lossOut, cotangents) = vjp(
             { (arrays: [MLXArray]) -> [MLXArray] in
                 return [MLXCTCLoss.loss(logits: arrays[0], targets: extTargets)]
@@ -313,7 +396,17 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             cotangents: [MLXArray(Float(1.0))]
         )
         let gradLogits = cotangents[0]
-        eval(lossOut[0], gradLogits)
+        var totalLoss = lossOut[0]
+        var gradVoice: MLXArray? = nil
+        if useVoice, let vt = voiceTargets {
+            let voice = concatenated(voiceChunks, axis: 1)
+            let vLoss = Self.voiceLoss(logits: voice, targets: vt)
+            totalLoss = totalLoss + vLoss * voiceLossWeight
+            gradVoice = Self.voiceLossGradient(logits: voice, targets: vt) * voiceLossWeight
+            eval(vLoss)
+            lastVoiceLoss = vLoss.item(Float.self)
+        }
+        eval(totalLoss, gradLogits)
 
         // 3. チャンクごとの逆伝播 (パラメータ勾配を足し込む)
         var total: ModuleParameters? = nil
@@ -322,7 +415,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         while t0 < seqLen {
             let t1 = min(seqLen, t0 + chunkFrames)
             let frames = paddedFrames(t1 - t0)
-            let inputs = [padded(features[0..., t0..<t1, 0...], to: frames), padded(gradLogits[0..., t0..<t1, 0...], to: frames)] + chunkStarts[c]
+            var inputs = [padded(features[0..., t0..<t1, 0...], to: frames), padded(gradLogits[0..., t0..<t1, 0...], to: frames)]
+            if let gv = gradVoice {
+                inputs.append(padded(gv[0..., t0..<t1, 0...], to: frames))
+            }
+            inputs.append(contentsOf: chunkStarts[c])
             let gradValues = backwardFn(frames)(inputs)
             let grads = ModuleParameters.unflattened(Array(zip(chunkGradKeys, gradValues)))
             switch total {
@@ -337,7 +434,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             c += 1
             t0 = t1
         }
-        return (lossOut[0], total!)
+        return (totalLoss, total!)
     }
 
     /// チャンク 1 つの勾配なし前向き。入力は [特徴量 [B, C, inDim]] + 状態 (v, s, a を層ごとに)、
@@ -348,23 +445,38 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var v = Array(arrays[1..<(1 + numLayers)])
         var s = Array(arrays[(1 + numLayers)..<(1 + 2 * numLayers)])
         var a = Array(arrays[(1 + 2 * numLayers)..<(1 + 3 * numLayers)])
-        let readouts = forwardFrames(network: network, currentSeq0: cur, from: 0, to: chunkFrames, v: &v, s: &s, a: &a)
+        var rates: [MLXArray] = []
+        let readouts = forwardFrames(network: network, currentSeq0: cur, from: 0, to: chunkFrames, v: &v, s: &s, a: &a, voiceRates: &rates)
         let logits = matmul(stacked(readouts, axis: 1), network.wOut) + network.bOut
-        return [logits] + v + s + a
+        if rates.isEmpty {
+            return [logits] + v + s + a
+        }
+        return [logits, voiceLogits(network: network, rates: rates)] + v + s + a
     }
 
     /// チャンク 1 つの逆伝播。入力は [特徴量, ロジット勾配] + チャンク先頭の状態、
     /// 出力はパラメータ勾配を `chunkGradKeys` の順に並べたもの
     private func chunkBackward(_ arrays: [MLXArray], chunkFrames: Int) -> [MLXArray] {
         let numLayers = network.numLayers
+        // 補助ヘッドがあるときは入力が [特徴量, ロジット勾配, 補助ロジット勾配] + 状態
+        let useVoice = network.voiceHead.isEmpty != true
+        var base = 2
+        if useVoice {
+            base = 3
+        }
         let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
             let cur = matmul(arrays[0], model.wIn) + model.bH
-            var cv = Array(arrays[2..<(2 + numLayers)])
-            var cs = Array(arrays[(2 + numLayers)..<(2 + 2 * numLayers)])
-            var ca = Array(arrays[(2 + 2 * numLayers)..<(2 + 3 * numLayers)])
-            let readouts = self.forwardFrames(network: model, currentSeq0: cur, from: 0, to: chunkFrames, v: &cv, s: &cs, a: &ca)
+            var cv = Array(arrays[base..<(base + numLayers)])
+            var cs = Array(arrays[(base + numLayers)..<(base + 2 * numLayers)])
+            var ca = Array(arrays[(base + 2 * numLayers)..<(base + 3 * numLayers)])
+            var rates: [MLXArray] = []
+            let readouts = self.forwardFrames(network: model, currentSeq0: cur, from: 0, to: chunkFrames, v: &cv, s: &cs, a: &ca, voiceRates: &rates)
             let chunkLogits = matmul(stacked(readouts, axis: 1), model.wOut) + model.bOut
-            return [sum(chunkLogits * arrays[1])]
+            var inner = sum(chunkLogits * arrays[1])
+            if useVoice {
+                inner = inner + sum(self.voiceLogits(network: model, rates: rates) * arrays[2])
+            }
+            return [inner]
         }
         let (_, grads) = lg(network, arrays)
         let flat = grads.flattened()
@@ -466,7 +578,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         featuresBatch: [[[Float]]],
         targetsBatch: [[Int]],
         blankId: Int = 0,
-        compiled: Bool = true
+        compiled: Bool = true,
+        voiceTargetsBatch: [[Int]]? = nil
     ) -> Float {
         let bSize = featuresBatch.count
         if bSize == 0 {
@@ -476,6 +589,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         // ラベルが空のサンプルは CTC を定義できないので除外する
         var validFeatures: [[[Float]]] = []
         var validTargets: [[Int]] = []
+        var validVoice: [[Int]] = []
         var frameCounts: [Int] = []
         var maxT = 0
         var b = 0
@@ -484,6 +598,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             if 0 < frames && targetsBatch[b].isEmpty != true {
                 validFeatures.append(featuresBatch[b])
                 validTargets.append(targetsBatch[b])
+                validVoice.append(voiceTargetsBatch?[b] ?? [])
                 frameCounts.append(frames)
                 if maxT < frames {
                     maxT = frames
@@ -527,9 +642,29 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             frameCounts: frameCounts,
             blankId: blankId
         )
+        // 補助ヘッドがあるときは声の種類のフレームラベル [B, maxT] (無い項目・パディングは -1) を常に渡す。
+        // compile 済みの関数の入力の並びを一定にするため
+        let useVoice = network.voiceHead.isEmpty != true
+        var voiceArray: MLXArray? = nil
+        if useVoice {
+            var flatVoice = [Int32](repeating: -1, count: validCount * maxT)
+            b = 0
+            while b < validCount {
+                let labels = validVoice[b]
+                var t = 0
+                while t < min(labels.count, maxT) {
+                    flatVoice[b * maxT + t] = Int32(labels[t])
+                    t += 1
+                }
+                b += 1
+            }
+            voiceArray = MLXArray(flatVoice, [validCount, maxT])
+        }
+        let voiceWeight = voiceLossWeight
+        lastVoiceLoss = 0.0
 
         if compiledMaxFrames < maxT && chunkLongSequences {
-            let (loss, grads) = chunkedLossAndGradients(features: featArray, extTargets: extTargets, compiled: compiled)
+            let (loss, grads) = chunkedLossAndGradients(features: featArray, extTargets: extTargets, voiceTargets: voiceArray, compiled: compiled)
             let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
             optimizer.update(model: network, gradients: clippedGrads)
             eval(network, optimizer, loss)
@@ -538,14 +673,24 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
         if compiled != true || compiledMaxFrames < maxT {
             let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
-                let logits = self.logitsBatch(network: model, features: arrays[0], compiled: false)
-                return [MLXCTCLoss.loss(logits: logits, targets: extTargets)]
+                let (logits, voice) = self.logitsAndVoiceBatch(network: model, features: arrays[0])
+                let ctc = MLXCTCLoss.loss(logits: logits, targets: extTargets)
+                if let voice = voice, 1 < arrays.count {
+                    let vLoss = Self.voiceLoss(logits: voice, targets: arrays[1])
+                    return [ctc + vLoss * voiceWeight, vLoss]
+                }
+                return [ctc, MLXArray(Float(0.0))]
             }
 
-            let (lossValues, grads) = lg(network, [featArray])
+            var inputs = [featArray]
+            if let va = voiceArray {
+                inputs.append(va)
+            }
+            let (lossValues, grads) = lg(network, inputs)
             let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
             optimizer.update(model: network, gradients: clippedGrads)
             eval(network, optimizer, lossValues)
+            lastVoiceLoss = lossValues[1].item(Float.self)
 
             return lossValues[0].item(Float.self)
         }
@@ -557,7 +702,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         } else {
             ctcCompileCount += 1
             let computeLoss = { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
-                let logits = self.logitsBatch(network: model, features: arrays[0], compiled: false)
+                let (logits, voice) = self.logitsAndVoiceBatch(network: model, features: arrays[0])
                 let targets = MLXCTCLoss.ExtendedTargets(
                     extTargets: arrays[1],
                     skipMask: arrays[2],
@@ -567,18 +712,26 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                     hasSecondFinal: arrays[6],
                     inputLengths: arrays[7]
                 )
-                let loss = MLXCTCLoss.loss(logits: logits, targets: targets)
-                return [loss]
+                let ctc = MLXCTCLoss.loss(logits: logits, targets: targets)
+                if let voice = voice, 8 < arrays.count {
+                    let vLoss = Self.voiceLoss(logits: voice, targets: arrays[8])
+                    return [ctc + vLoss * voiceWeight, vLoss]
+                }
+                return [ctc, MLXArray(Float(0.0))]
             }
             let lg = valueAndGrad(model: self.network, computeLoss)
             // 学習率は最後の入力配列。トレース時にここで差し替えるので、以後の呼び出しでは
             // 入力に渡した値がそのまま更新式に使われる。トレース用のプレースホルダ配列は
             // 実体を持たないので、更新後は元の配列へ戻す
+            var lossInputCount = 8
+            if useVoice {
+                lossInputCount = 9
+            }
             func step(arrays: [MLXArray]) -> [MLXArray] {
-                let (lossValues, grads) = lg(self.network, Array(arrays[0..<8]))
+                let (lossValues, grads) = lg(self.network, Array(arrays[0..<lossInputCount]))
                 let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
                 let outerLearningRate = self.optimizer.learningRate
-                self.optimizer.learningRate = arrays[8]
+                self.optimizer.learningRate = arrays[lossInputCount]
                 self.optimizer.update(model: self.network, gradients: clippedGrads)
                 self.optimizer.learningRate = outerLearningRate
                 return lossValues
@@ -594,6 +747,9 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
         var inputs: [MLXArray] = [featArray]
         inputs.append(contentsOf: extTargets.toArrays())
+        if let va = voiceArray {
+            inputs.append(va)
+        }
         inputs.append(optimizer.learningRate)
 
         let lossValues = stepFn(inputs)
@@ -601,6 +757,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         // Adam の m/v が遅延グラフとして積み上がり、生存バッファ数が
         // Metal のリソース上限 (約 50 万) に達して落ちる
         eval(network, optimizer, lossValues)
+        lastVoiceLoss = lossValues[1].item(Float.self)
 
         return lossValues[0].item(Float.self)
     }
