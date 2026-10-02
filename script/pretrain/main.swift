@@ -9,6 +9,9 @@ import Spiketrans
 //   HuBERT 型: 先に k-means で特徴量のクラス中心を作り、入力の区間を隠して、隠したフレームのクラス番号を当てる (交差エントロピー)
 //     pretrain -d <マニフェスト> --kmeans <中心.json>                 (中心を作って終わる)
 //     pretrain -d <マニフェスト> -e <epoch> --targets <中心.json> --export-weights <json>
+//   HuBERT 型の 2 周目: 事前学習済みの先生 (--teacher) の層 Config.teacherLayer の発火率を k-means して目標にし、新しいモデルを学習
+//     pretrain -d <マニフェスト> --kmeans <中心.json> --teacher <重み.json>
+//     pretrain -d <マニフェスト> -e <epoch> --targets <中心.json> --teacher <重み.json> --export-weights <json>
 //
 // ネットワークの構成は train の既定 (8 層・幅 1024・512 次元入力・同じ LIF) と揃える
 
@@ -31,6 +34,10 @@ enum Config {
     static let predictShifts = [SpikingNetworkWeights.predictShift]
     /// HuBERT 型: クラス数、k-means に使うフレーム数と反復回数
     static let clusterCount = 256
+    /// HuBERT 型の 2 周目: 先生の目標にする層 (8 層中 6 番目) と、そのときのクラス数 (本家 HuBERT の 2 周目と同じ 500)
+    static let teacherLayer = 5
+    static let teacherClusterCount = 500
+    static let teacherKmeansFrames = 100_000
     static let kmeansFrames = 200_000
     static let kmeansIterations = 25
     /// HuBERT 型: 隠す区間。各フレームを確率 maskStartProb で開始点にし、maskSpan フレーム (200 ms) 隠す (全体の約 3 割)
@@ -46,6 +53,7 @@ var workers = 8
 var maxItems = Int.max
 var kmeansOutPath = ""
 var targetsPath = ""
+var teacherPath = ""
 var argIdx = 1
 let args = CommandLine.arguments
 while argIdx < args.count {
@@ -78,6 +86,9 @@ while argIdx < args.count {
         argIdx += 1
     case "--targets":
         targetsPath = value
+        argIdx += 1
+    case "--teacher":
+        teacherPath = value
         argIdx += 1
     default:
         break
@@ -135,26 +146,61 @@ var totalSeconds = 0.0
 for b in buckets {
     totalSeconds += Double(b) * 0.04
 }
-// k-means: 無作為に選んだ発話から最大 kmeansFrames フレームを集めて中心を作り、保存して終わる
+// 2 周目の先生 (重みは固定、目標を作るだけ)
+var teacherTrainer: MLXBPTTTrainer? = nil
+if teacherPath.isEmpty != true {
+    guard let tw = try? SpikingNetworkWeights.load(from: URL(fileURLWithPath: teacherPath)) else {
+        print("エラー: 先生の重みが読めません: \(teacherPath)")
+        exit(1)
+    }
+    teacherTrainer = MLXBPTTTrainer(network: MLXSpikingNetwork(weights: tw), bpttWindow: Config.bpttWindow)
+    print("先生: \(teacherPath) の層 \(Config.teacherLayer) の発火率を目標にする")
+}
+
+// k-means: 無作為に選んだ発話から最大 kmeansFrames フレームを集めて中心を作り、保存して終わる。
+// 先生があれば、そのフレームの特徴量ではなく先生の層の発火率を集める
 if kmeansOutPath.isEmpty != true {
     var frames: [[Float]] = []
     var order = Array(0..<paths.count).shuffled()
     let perFile = 50
-    while frames.count < Config.kmeansFrames && order.isEmpty != true {
+    var target = Config.kmeansFrames
+    var classes = Config.clusterCount
+    if teacherTrainer != nil {
+        target = Config.teacherKmeansFrames
+        classes = Config.teacherClusterCount
+    }
+    while frames.count < target && order.isEmpty != true {
         let idx = order.removeLast()
-        let feats = SpeechDataset.loadFeatures(path: paths[idx], frameStack: StreamingFeatureFrontEnd.defaultStack).features
+        var feats = SpeechDataset.loadFeatures(path: paths[idx], frameStack: StreamingFeatureFrontEnd.defaultStack).features
         if feats.isEmpty {
             continue
         }
+        if Config.cropFrames < feats.count {
+            feats = Array(feats[0..<Config.cropFrames])
+        }
+        var rows = feats
+        if let teacher = teacherTrainer {
+            let x = MLXArray(feats.flatMap { $0 }, [1, feats.count, feats[0].count])
+            let rates = teacher.layerRatesEager(network: teacher.network, features: x, layer: Config.teacherLayer)
+            eval(rates)
+            let h = rates.shape[2]
+            let flat = rates.asArray(Float.self)
+            rows = []
+            var t = 0
+            while t < feats.count {
+                rows.append(Array(flat[(t * h)..<((t + 1) * h)]))
+                t += 1
+            }
+        }
         var k = 0
-        while k < min(perFile, feats.count) {
-            frames.append(feats[Int.random(in: 0..<feats.count)])
+        while k < min(perFile, rows.count) {
+            frames.append(rows[Int.random(in: 0..<rows.count)])
             k += 1
         }
     }
-    print("k-means: \(frames.count) フレーム → \(Config.clusterCount) クラス、\(Config.kmeansIterations) 回")
+    print("k-means: \(frames.count) フレーム (\(frames[0].count) 次元) → \(classes) クラス、\(Config.kmeansIterations) 回")
     let started = CFAbsoluteTimeGetCurrent()
-    let book = ClusterCodebook.fit(frames: frames, k: Config.clusterCount, iterations: Config.kmeansIterations)
+    let book = ClusterCodebook.fit(frames: frames, k: classes, iterations: Config.kmeansIterations)
     let arrays = book.arrays()
     let ids = ClusterCodebook.assign(features: MLXArray(frames.prefix(50_000).flatMap { $0 }, [min(50_000, frames.count), frames[0].count]), codebook: arrays)
     eval(ids)
@@ -181,7 +227,11 @@ if targetsPath.isEmpty != true {
         exit(1)
     }
     codebookArrays = book.arrays()
-    print("事前学習 (HuBERT 型、\(book.count) クラス、\(Config.maskSpan) フレームの区間を開始確率 \(Config.maskStartProb) で隠し、隠したフレームのクラスを当てる)")
+    var round = ""
+    if teacherTrainer != nil {
+        round = " 2 周目"
+    }
+    print("事前学習 (HuBERT 型\(round)、\(book.count) クラス、\(Config.maskSpan) フレームの区間を開始確率 \(Config.maskStartProb) で隠し、隠したフレームのクラスを当てる)")
 } else {
     print("事前学習 (APC、\(Config.predictShifts.map { String($0) }.joined(separator: "・")) フレーム先の特徴量を予測)")
 }
@@ -300,7 +350,8 @@ while ep <= epochs {
             loss = trainer.trainBatchAPC(featuresBatch: current, shifts: Config.predictShifts)
         } else {
             loss = trainer.trainBatchMaskedCluster(featuresBatch: current, codebook: codebookArrays,
-                                                   startProb: Config.maskStartProb, spanFrames: Config.maskSpan)
+                                                   startProb: Config.maskStartProb, spanFrames: Config.maskSpan,
+                                                   teacher: teacherTrainer, teacherLayer: Config.teacherLayer)
         }
         if loss.isFinite != true {
             print("  ✕ 損失が有限でなくなりました (step \(globalStep))。止めます")

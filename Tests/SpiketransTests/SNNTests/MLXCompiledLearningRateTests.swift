@@ -377,4 +377,23 @@ final class MLXCompiledLearningRateTests: XCTestCase {
         XCTAssertLessThan(last, first * 0.8, "クラス予測の損失が下がらない (\(first) → \(last))")
         XCTAssertEqual(net.exportWeights().bPred?.count, 8)
     }
+
+    /// 先生の層の発火率は compile 版と eager 版で一致し、値は 0〜1 (サブステップ平均の発火率)
+    func testTeacherLayerRatesCompiledMatchesEager() {
+        let inputDim = 16
+        let (feats, _) = makeBatch(inputDim: inputDim, frames: 32)
+        let net = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 1)
+        net.wIn = net.wIn * 4.0
+        let trainer = MLXBPTTTrainer(network: net, bpttWindow: 4)
+        let x = MLXArray(feats.flatMap { $0 }.flatMap { $0 }, [2, 32, inputDim])
+        let a = trainer.layerRates(network: net, features: x, layer: 1)
+        let b = trainer.layerRatesEager(network: net, features: x, layer: 1)
+        eval(a, b)
+        let fa = a.asArray(Float.self)
+        let fb = b.asArray(Float.self)
+        XCTAssertEqual(a.shape, [2, 32, 64])
+        XCTAssertLessThan(maxAbsDiff(fa, fb), 1e-5)
+        XCTAssertLessThanOrEqual(fa.max() ?? 2.0, 1.0)
+        XCTAssertLessThan(0.0, fa.reduce(0, +))
+    }
 }

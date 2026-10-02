@@ -36,6 +36,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     private var compiledCTCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
     private var compiledAPCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
     private var compiledClusterSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledTeacherRates: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
     /// 系列長 (T) をキーとするコンパイル済み logitsBatch のキャッシュ
     private var compiledLogitsSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
@@ -297,15 +298,14 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     }
 
     /// 事前学習 (HuBERT 型) の損失。入力の隠したフレーム (spanMask が 1) を 0 にして流し、
-    /// 隠したフレームのクラスタ番号 (元の特徴量から codebook で求める) を最終層の読み出しから当てる交差エントロピー。
+    /// 隠したフレームのクラス番号 targets [B, T] (Int32) を最終層の読み出しから当てる交差エントロピー。
     /// 因果なので、隠したフレームの番号はそれより前の文脈だけから推測することになる
     func maskedClusterLoss(network: MLXSpikingNetwork, features: MLXArray, valid: MLXArray, spanMask: MLXArray,
-                           codebook: [MLXArray]) -> MLXArray {
+                           targets: MLXArray) -> MLXArray {
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
         let numLayers = network.numLayers
-        let targets = stopGradient(ClusterCodebook.assign(features: features, codebook: codebook))
         let masked = features * (1.0 - spanMask).expandedDimensions(axis: -1)
         let currentSeq0 = matmul(masked, network.wIn) + network.bH
         var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
@@ -321,11 +321,56 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         return -sum(picked * weight) / count
     }
 
+    /// 層 layer の発火率 (サブステップ平均) [B, T, H]。HuBERT の 2 周目で、先生のモデルから目標を作るのに使う (勾配なし)
+    public func layerRates(network: MLXSpikingNetwork, features: MLXArray, layer: Int) -> MLXArray {
+        let key = features.shape[0] << 16 | features.shape[1]
+        if let cached = compiledTeacherRates[key] {
+            return cached([features])[0]
+        }
+        let fn = compile(inputs: [network]) { arrays in
+            return [self.layerRatesEager(network: network, features: arrays[0], layer: layer)]
+        }
+        compiledTeacherRates[key] = fn
+        return fn([features])[0]
+    }
+
+    public func layerRatesEager(network: MLXSpikingNetwork, features: MLXArray, layer: Int) -> MLXArray {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        let hMax = network.maxHiddenDim
+        let numLayers = network.numLayers
+        let tSteps = network.timeSteps
+        let currentSeq0 = matmul(features, network.wIn) + network.bH
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var rates: [MLXArray] = []
+        var t = 0
+        while t < seqLen {
+            var sum = MLXArray.zeros([batchSize, hMax])
+            var step = 0
+            while step < tSteps {
+                let out = substep(network: network, arrays: [currentSeq0[0..., t, 0...]] + v + s + a)
+                v = Array(out[0..<numLayers])
+                s = Array(out[numLayers..<(2 * numLayers)])
+                a = Array(out[(2 * numLayers)..<(3 * numLayers)])
+                sum = sum + s[layer]
+                step += 1
+            }
+            rates.append(sum / Float(tSteps))
+            t += 1
+        }
+        return stopGradient(stacked(rates, axis: 1))
+    }
+
     /// 事前学習 (HuBERT 型) の 1 ステップ。隠す区間は spanFrames フレーム単位で、各フレームを開始点にする確率 startProb。
+    /// 目標は codebook (中心 [mean, invStd, centroids, centroidSq]) に最も近いクラス番号で、
+    /// teacher があればその層 teacherLayer の発火率から (2 周目)、無ければ入力の特徴量から (1 周目) 求める。
     /// 系列は 32 フレーム単位に切り上げて 0 で埋め、形ごとに compile する
     @discardableResult
     public func trainBatchMaskedCluster(featuresBatch: [[[Float]]], codebook: [MLXArray],
-                                        startProb: Double, spanFrames: Int) -> Float {
+                                        startProb: Double, spanFrames: Int,
+                                        teacher: MLXBPTTTrainer? = nil, teacherLayer: Int = 0) -> Float {
         var maxT = 0
         for f in featuresBatch {
             maxT = max(maxT, f.count)
@@ -366,6 +411,14 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let featArray = MLXArray(flatFeat, [bSize, maxT, inDim])
         let validArray = MLXArray(flatValid, [bSize, maxT])
         let spanArray = MLXArray(flatSpan, [bSize, maxT])
+        var targets: MLXArray
+        if let teacher = teacher {
+            let rates = teacher.layerRates(network: teacher.network, features: featArray, layer: teacherLayer)
+            targets = ClusterCodebook.assign(features: rates, codebook: codebook)
+        } else {
+            targets = ClusterCodebook.assign(features: featArray, codebook: codebook)
+        }
+        eval(targets)
         let key = bSize << 16 | maxT
         let stepFn: ([MLXArray]) -> [MLXArray]
         if let cached = compiledClusterSteps[key] {
@@ -373,13 +426,13 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         } else {
             let lg = valueAndGrad(model: self.network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
                 return [self.maskedClusterLoss(network: model, features: arrays[0], valid: arrays[1], spanMask: arrays[2],
-                                               codebook: Array(arrays[3..<7]))]
+                                               targets: arrays[3])]
             }
             func step(arrays: [MLXArray]) -> [MLXArray] {
-                let (lossValues, grads) = lg(self.network, Array(arrays[0..<7]))
+                let (lossValues, grads) = lg(self.network, Array(arrays[0..<4]))
                 let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
                 let outerLearningRate = self.optimizer.learningRate
-                self.optimizer.learningRate = arrays[7]
+                self.optimizer.learningRate = arrays[4]
                 self.optimizer.update(model: self.network, gradients: clippedGrads)
                 self.optimizer.learningRate = outerLearningRate
                 return lossValues
@@ -388,7 +441,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             compiledClusterSteps[key] = newStep
             stepFn = newStep
         }
-        let lossValues = stepFn([featArray, validArray, spanArray] + codebook + [optimizer.learningRate])
+        let lossValues = stepFn([featArray, validArray, spanArray, targets, optimizer.learningRate])
         eval(network, optimizer, lossValues)
         return lossValues[0].item(Float.self)
     }
