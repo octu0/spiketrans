@@ -42,6 +42,10 @@ let package = Package(
         .executable(
             name: "layerprobe",
             targets: ["layerprobe"]
+        ),
+        .executable(
+            name: "pretrain",
+            targets: ["pretrain"]
         )
     ],
     dependencies: [
@@ -107,6 +111,14 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift")
             ],
             path: "script/layerprobe"
+        ),
+        .executableTarget(
+            name: "pretrain",
+            dependencies: [
+                "Spiketrans",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
+            path: "script/pretrain"
         ),
         .testTarget(
             name: "SpiketransTests",

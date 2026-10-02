@@ -32,6 +32,10 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// 声の種類 (なし / 配信者 / bot / その他) を中間層の発火率から判定する補助ヘッド。学習時だけ使う
     public let wVoice: [Float]?   // [voiceClasses * maxHiddenDim]
     public let bVoice: [Float]?   // [voiceClasses]
+    /// 自己教師ありの事前学習 (APC) で、最終層の読み出しから先のフレームの入力特徴量を予測するヘッド。
+    /// 予測先が n 個なら出力は n × inputDim。事前学習の重みだけが持つ。CTC の学習を始めるときに捨てる
+    public let wPred: [Float]?    // [(n * inputDim) * maxHiddenDim]
+    public let bPred: [Float]?    // [n * inputDim]
 
     public let wOut: [Float]   // [outputDim * maxHiddenDim]
     public let bOut: [Float]   // [outputDim]
@@ -57,6 +61,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         inputNormGains: [[Float]]? = nil,
         wVoice: [Float]? = nil,
         bVoice: [Float]? = nil,
+        wPred: [Float]? = nil,
+        bPred: [Float]? = nil,
         wOut: [Float],
         bOut: [Float],
         vocabularyCharacters: String? = nil
@@ -82,6 +88,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.inputNormGains = inputNormGains
         self.wVoice = wVoice
         self.bVoice = bVoice
+        self.wPred = wPred
+        self.bPred = bPred
         self.wOut = wOut
         self.bOut = bOut
         self.vocabularyCharacters = vocabularyCharacters
@@ -98,6 +106,51 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// 減衰率を学習する構成の初期値の範囲。ニューロンの番号順に等間隔に並べ、
     /// 速い (0.92: 1 フレームで 0.72 倍) ものから秒単位で保つ (0.995: 1 フレームで 0.98 倍) ものまで混ぜる
     public static let learnedBetaRange: ClosedRange<Float> = 0.92...0.995
+
+    /// 事前学習の予測ヘッドを持つか (= APC で事前学習した重み)
+    public var hasPredictionHead: Bool {
+        guard let w = wPred, let b = bPred else {
+            return false
+        }
+        return w.isEmpty != true && b.isEmpty != true
+    }
+
+    /// 事前学習の既定の予測先 (フレーム数。40 ms × 3 = 120 ms 先)
+    public static let predictShift = 3
+
+    /// 予測ヘッドの予測先の数 (出力次元 / inputDim)
+    public var predictionTargets: Int {
+        guard let b = bPred, 0 < inputDim else {
+            return 0
+        }
+        return b.count / inputDim
+    }
+
+    /// 事前学習の重みから CTC の学習を始めるための重み。隠れ層はそのまま、
+    /// 読み出し (wOut / bOut / 語彙) は `readout` (新しく作ったネットワーク) のものに替え、予測ヘッドを捨てる
+    public func startingCTC(readout: SpikingNetworkWeights) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: inputDim,
+            maxHiddenDim: maxHiddenDim,
+            outputDim: readout.outputDim,
+            timeSteps: timeSteps,
+            lifConfig: lifConfig,
+            wIn: wIn,
+            wRec: wRec,
+            bH: bH,
+            wLayers: wLayers,
+            bHLayers: bHLayers,
+            gammaRMS: gammaRMS,
+            wRecLayers: wRecLayers,
+            betaLayers: betaLayers,
+            inputNormGains: inputNormGains,
+            wVoice: readout.wVoice,
+            bVoice: readout.bVoice,
+            wOut: readout.wOut,
+            bOut: readout.bOut,
+            vocabularyCharacters: readout.vocabularyCharacters
+        )
+    }
 
     /// 声の種類の補助ヘッドのクラス数 (0 なし / 1 配信者 / 2 bot / 3 その他の声)
     public static let voiceClasses = 4

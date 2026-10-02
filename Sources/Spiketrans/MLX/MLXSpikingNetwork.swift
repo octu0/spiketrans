@@ -30,6 +30,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     public var inputNormGains: [MLXArray]  // 各 [maxHiddenDim]、層 0 から numLayers 本
     /// 声の種類の補助ヘッド [wVoice [maxHiddenDim, voiceClasses], bVoice [voiceClasses]]。無い構成では空
     public var voiceHead: [MLXArray]
+    /// 事前学習の予測ヘッド [wPred [maxHiddenDim, n * inputDim], bPred [n * inputDim]] (n = 予測先の数)。無い構成では空
+    public var predictionHead: [MLXArray]
 
     /// 補助ヘッドが読む層 (最終層の 1 つ下。層数が足りなければ層 0)
     public var voiceLayer: Int {
@@ -51,7 +53,10 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         learnedBeta: Bool = false,
         inputNorm: Bool = false,
         inputNormGainInit: Float = 1.0,
-        voiceHead: Bool = false
+        voiceHead: Bool = false,
+        predictionHead: Bool = false,
+        predictionTargets: Int = 1,
+        predictionClasses: Int = 0
     ) {
         self.numLayers = max(1, numLayers)
         self.inputDim = inputDim
@@ -125,6 +130,16 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             head.append(MLXArray.zeros([classes]))
         }
         self.voiceHead = head
+        var pred: [MLXArray] = []
+        if predictionHead {
+            var outDim = inputDim * max(1, predictionTargets)
+            if 0 < predictionClasses {
+                outDim = predictionClasses
+            }
+            pred.append(MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, outDim]))
+            pred.append(MLXArray.zeros([outDim]))
+        }
+        self.predictionHead = pred
 
         self.wOut = MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, outputDim])
         self.bOut = MLXArray.zeros([outputDim])
@@ -144,7 +159,9 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             upperRecurrent: weights.hasUpperRecurrence,
             learnedBeta: weights.hasLearnedBeta,
             inputNorm: weights.hasInputNorm,
-            voiceHead: weights.hasVoiceHead
+            voiceHead: weights.hasVoiceHead,
+            predictionHead: weights.hasPredictionHead,
+            predictionTargets: max(1, weights.predictionTargets)
         )
         self.importWeights(from: weights)
     }
@@ -215,6 +232,12 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
                 params["inputNormGains"] = .array(layerGain)
             }
         }
+        if let w = data.wPred, let b = data.bPred, self.predictionHead.count == 2 {
+            params["predictionHead"] = .array([
+                .value(MLXArray(w, [b.count, hSize]).transposed()),
+                .value(MLXArray(b, [b.count]))
+            ])
+        }
         if let w = data.wVoice, let b = data.bVoice, self.voiceHead.count == 2 {
             let classes = SpikingNetworkWeights.voiceClasses
             params["voiceHead"] = .array([
@@ -240,6 +263,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         arraysToEval.append(contentsOf: betaLogits)
         arraysToEval.append(contentsOf: inputNormGains)
         arraysToEval.append(contentsOf: voiceHead)
+        arraysToEval.append(contentsOf: predictionHead)
         eval(arraysToEval)
 
         var wl: [[Float]] = []
@@ -263,6 +287,12 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         var normGains: [[Float]]? = nil
         if inputNormGains.isEmpty != true {
             normGains = inputNormGains.map { $0.asArray(Float.self) }
+        }
+        var wPred: [Float]? = nil
+        var bPred: [Float]? = nil
+        if predictionHead.count == 2 {
+            wPred = predictionHead[0].transposed().asArray(Float.self)
+            bPred = predictionHead[1].asArray(Float.self)
         }
         var wVoice: [Float]? = nil
         var bVoice: [Float]? = nil
@@ -288,6 +318,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             inputNormGains: normGains,
             wVoice: wVoice,
             bVoice: bVoice,
+            wPred: wPred,
+            bPred: bPred,
             wOut: self.wOut.transposed().asArray(Float.self),
             bOut: self.bOut.asArray(Float.self),
             vocabularyCharacters: vocabulary?.serializedCharacters

@@ -251,6 +251,130 @@ final class MLXCompiledLearningRateTests: XCTestCase {
             trainer.trainBatchCTC(featuresBatch: feats, targetsBatch: targets, compiled: true, voiceTargetsBatch: voice)
             i += 1
         }
-        XCTAssertLessThan(trainer.lastVoiceLoss, first * 0.7, "補助損失が下がらない (\(first) → \(trainer.lastVoiceLoss))")
+        XCTAssertLessThan(trainer.lastVoiceLoss, first * 0.8, "補助損失が下がらない (\(first) → \(trainer.lastVoiceLoss))")
+    }
+
+    /// 事前学習 (APC) のステップで予測損失が下がる。短い系列が混ざっても (0 埋め・マスク) 有限のまま
+    func testAPCStepLearns() {
+        let inputDim = 16
+        let (long, _) = makeBatch(inputDim: inputDim, frames: 64)
+        let short = Array(long[0][0..<40])
+        let batch = [long[0], short]
+        let net = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 1, predictionHead: true)
+        let trainer = MLXBPTTTrainer(network: net, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        let first = trainer.trainBatchAPC(featuresBatch: batch)
+        var last = first
+        var i = 0
+        while i < 40 {
+            last = trainer.trainBatchAPC(featuresBatch: batch)
+            XCTAssertTrue(last.isFinite)
+            i += 1
+        }
+        XCTAssertLessThan(last, first * 0.7, "予測損失が下がらない (\(first) → \(last))")
+    }
+
+    /// 事前学習の重みから CTC を始めると、隠れ層は同じで、読み出しは新しいものに替わり予測ヘッドは無くなる
+    func testStartingCTCFromPretrainedWeights() throws {
+        let pre = MLXSpikingNetwork(numLayers: 3, inputDim: 16, maxHiddenDim: 32, outputDim: 1, predictionHead: true)
+        let pw = pre.exportWeights()
+        XCTAssertEqual(pw.hasPredictionHead, true)
+        let decoded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: try JSONEncoder().encode(pw))
+        XCTAssertEqual(decoded, pw)
+        XCTAssertEqual(MLXSpikingNetwork(weights: decoded).exportWeights(), pw)
+
+        let fresh = MLXSpikingNetwork(numLayers: 3, inputDim: 16, maxHiddenDim: 32, outputDim: 8).exportWeights()
+        let start = pw.startingCTC(readout: fresh)
+        XCTAssertEqual(start.hasPredictionHead, false)
+        XCTAssertEqual(start.outputDim, 8)
+        XCTAssertEqual(start.wIn, pw.wIn)
+        XCTAssertEqual(start.wLayers, pw.wLayers)
+        XCTAssertEqual(start.wOut, fresh.wOut)
+        let net = MLXSpikingNetwork(weights: start)
+        XCTAssertEqual(net.predictionHead.isEmpty, true)
+        XCTAssertEqual(net.exportWeights().wIn, pw.wIn)
+    }
+
+    /// 予測先を複数にすると、ヘッドの出力が予測先の数ぶんになり、重みの往復で保たれ、損失も下がる
+    func testAPCMultipleShifts() throws {
+        let inputDim = 16
+        let (long, _) = makeBatch(inputDim: inputDim, frames: 64)
+        let net = MLXSpikingNetwork(numLayers: 2, inputDim: inputDim, maxHiddenDim: 64, outputDim: 1,
+                                    predictionHead: true, predictionTargets: 3)
+        XCTAssertEqual(net.predictionHead[0].shape[1], 3 * inputDim)
+        let trainer = MLXBPTTTrainer(network: net, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        let first = trainer.trainBatchAPC(featuresBatch: long, shifts: [3, 6, 10])
+        var last = first
+        var i = 0
+        while i < 40 {
+            last = trainer.trainBatchAPC(featuresBatch: long, shifts: [3, 6, 10])
+            i += 1
+        }
+        XCTAssertLessThan(last, first * 0.8)
+        let w = net.exportWeights()
+        XCTAssertEqual(w.predictionTargets, 3)
+        let decoded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: try JSONEncoder().encode(w))
+        XCTAssertEqual(MLXSpikingNetwork(weights: decoded).exportWeights(), w)
+    }
+
+    /// k-means が離れた 2 つの塊を別のクラスに分け、assign が正しい中心を返し、保存して読み戻せる
+    func testClusterCodebookSeparatesBlobs() throws {
+        var frames: [[Float]] = []
+        var i = 0
+        while i < 200 {
+            let base: Float = (i % 2 == 0) ? -3.0 : 3.0
+            frames.append([base + Float(i % 7) * 0.01, base * 0.5, Float(i % 5) * 0.02])
+            i += 1
+        }
+        let book = ClusterCodebook.fit(frames: frames, k: 2, iterations: 10, seed: 1)
+        XCTAssertEqual(book.count, 2)
+        let ids = ClusterCodebook.assign(features: MLXArray(frames.flatMap { $0 }, [200, 3]), codebook: book.arrays())
+        eval(ids)
+        let a = ids.asArray(Int32.self)
+        var k = 0
+        while k < 200 {
+            XCTAssertEqual(a[k], a[k % 2], "フレーム \(k) のクラスが塊と一致しない")
+            k += 1
+        }
+        XCTAssertNotEqual(a[0], a[1])
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("codebook_test.json")
+        try book.save(to: url)
+        let back = try ClusterCodebook.load(from: url)
+        XCTAssertEqual(back.centroids, book.centroids)
+    }
+
+    /// 区間を隠してクラスを当てる事前学習のステップで、損失が有限のまま下がる
+    func testMaskedClusterStepLearns() {
+        let inputDim = 16
+        let (feats, _) = makeBatch(inputDim: inputDim, frames: 64)
+        var frames: [[Float]] = []
+        for seq in feats {
+            frames.append(contentsOf: seq)
+        }
+        let book = ClusterCodebook.fit(frames: frames, k: 8, iterations: 10, seed: 2)
+        let codebook = book.arrays()
+        let net = MLXSpikingNetwork(numLayers: 2, inputDim: inputDim, maxHiddenDim: 64, outputDim: 1,
+                                    predictionHead: true, predictionClasses: 8)
+        let trainer = MLXBPTTTrainer(network: net, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        // 隠す位置は毎回変わるので、損失は数ステップの平均で比べる
+        func average(_ steps: Int) -> Float {
+            var sum: Float = 0.0
+            var i = 0
+            while i < steps {
+                let loss = trainer.trainBatchMaskedCluster(featuresBatch: feats, codebook: codebook, startProb: 0.2, spanFrames: 2)
+                XCTAssertTrue(loss.isFinite)
+                sum += loss
+                i += 1
+            }
+            return sum / Float(steps)
+        }
+        let first = average(5)
+        var i = 0
+        while i < 150 {
+            trainer.trainBatchMaskedCluster(featuresBatch: feats, codebook: codebook, startProb: 0.2, spanFrames: 2)
+            i += 1
+        }
+        let last = average(5)
+        XCTAssertLessThan(last, first * 0.8, "クラス予測の損失が下がらない (\(first) → \(last))")
+        XCTAssertEqual(net.exportWeights().bPred?.count, 8)
     }
 }

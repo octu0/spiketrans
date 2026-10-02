@@ -456,6 +456,14 @@ let trainer = Trainer(
     phonemeVocabulary: PhonemeVocabulary()
 )
 
+// 事前学習 (pretrain) の重みは隠れ層だけを引き継ぎ、読み出しを作り直して最初の学習率から CTC を学習する
+var startsFromPretraining = false
+if let raw = importedWeights, raw.hasPredictionHead {
+    importedWeights = raw.startingCTC(readout: trainer.acousticNetwork.exportWeights(vocabulary: phoneticVocabulary))
+    startsFromPretraining = true
+    print("  事前学習の重み: 隠れ層を引き継ぎ、読み出し (\(phoneticVocabulary.size) 文字) を新しく作る。学習率は暖機から")
+}
+
 // 重みのインポート。-e 0 なら評価のみ、-e N なら読み込んだ重みから追加学習する
 if let wData = importedWeights {
     guard wData.outputDim == phoneticVocabulary.size,
@@ -680,7 +688,7 @@ if epochs == 0 {
     var globalStep = 0
     // 学習済みの重みから続けるときは暖機と減衰をやり直さず、最初から lrMin 一定で進める。
     // 収束した重みを lrMax でなぞると壊れる。減衰上限に達した長い学習の続きと同じ形になる
-    if importedWeights != nil {
+    if importedWeights != nil && startsFromPretraining != true {
     globalStep = scheduleSteps
     print("  学習済みの重みから再開: 学習率は最初から lrMin \(Defaults.lrMin) 一定")
     }

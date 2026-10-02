@@ -34,6 +34,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
     /// 系列長 (padded maxT) をキーとするコンパイル済み CTC 学習ステップのキャッシュ
     private var compiledCTCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledAPCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledClusterSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
     /// 系列長 (T) をキーとするコンパイル済み logitsBatch のキャッシュ
     private var compiledLogitsSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
@@ -85,6 +87,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         network.importWeights(from: weights)
         optimizer.resetState()
         compiledCTCSteps.removeAll()
+        compiledAPCSteps.removeAll()
+        compiledClusterSteps.removeAll()
         compiledLogitsSteps.removeAll()
         compiledChunkForward.removeAll()
         compiledChunkBackward.removeAll()
@@ -256,6 +260,197 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             t += 1
         }
         return readoutList
+    }
+
+    /// 事前学習 (APC) の損失。最終層の読み出しから shifts の各フレーム先の入力特徴量を予測し
+    /// (ヘッドの出力を予測先ごとに inputDim ずつ使う)、有効なフレーム (mask [B, T] が 1、かつ t + shift が発話内) の
+    /// L1 誤差を予測先ごとに平均してから、予測先の間で平均する
+    func predictionLoss(network: MLXSpikingNetwork, features: MLXArray, mask: MLXArray, shifts: [Int]) -> MLXArray {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        let hMax = network.maxHiddenDim
+        let numLayers = network.numLayers
+        let currentSeq0 = matmul(features, network.wIn) + network.bH
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var rates: [MLXArray] = []
+        let readoutList = forwardFrames(network: network, currentSeq0: currentSeq0, from: 0, to: seqLen, v: &v, s: &s, a: &a, voiceRates: &rates)
+        let pred = matmul(stacked(readoutList, axis: 1), network.predictionHead[0]) + network.predictionHead[1]
+        let inDim = features.shape[2]
+        var total = MLXArray(Float(0.0))
+        var used = 0
+        var k = 0
+        while k < shifts.count {
+            let shift = shifts[k]
+            if shift < seqLen {
+                let past = pred[0..., 0..<(seqLen - shift), (k * inDim)..<((k + 1) * inDim)]
+                let future = features[0..., shift..<seqLen, 0...]
+                let valid = mask[0..., shift..<seqLen].expandedDimensions(axis: -1)
+                let count = maximum(sum(valid) * Float(inDim), MLXArray(Float(1.0)))
+                total = total + sum(abs(past - future) * valid) / count
+                used += 1
+            }
+            k += 1
+        }
+        return total / Float(max(1, used))
+    }
+
+    /// 事前学習 (HuBERT 型) の損失。入力の隠したフレーム (spanMask が 1) を 0 にして流し、
+    /// 隠したフレームのクラスタ番号 (元の特徴量から codebook で求める) を最終層の読み出しから当てる交差エントロピー。
+    /// 因果なので、隠したフレームの番号はそれより前の文脈だけから推測することになる
+    func maskedClusterLoss(network: MLXSpikingNetwork, features: MLXArray, valid: MLXArray, spanMask: MLXArray,
+                           codebook: [MLXArray]) -> MLXArray {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        let hMax = network.maxHiddenDim
+        let numLayers = network.numLayers
+        let targets = stopGradient(ClusterCodebook.assign(features: features, codebook: codebook))
+        let masked = features * (1.0 - spanMask).expandedDimensions(axis: -1)
+        let currentSeq0 = matmul(masked, network.wIn) + network.bH
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var rates: [MLXArray] = []
+        let readoutList = forwardFrames(network: network, currentSeq0: currentSeq0, from: 0, to: seqLen, v: &v, s: &s, a: &a, voiceRates: &rates)
+        let logits = matmul(stacked(readoutList, axis: 1), network.predictionHead[0]) + network.predictionHead[1]
+        let logProbs = logSoftmax(logits, axis: -1)
+        let picked = takeAlong(logProbs, targets.expandedDimensions(axis: -1), axis: -1).squeezed(axis: -1)
+        let weight = valid * spanMask
+        let count = maximum(sum(weight), MLXArray(Float(1.0)))
+        return -sum(picked * weight) / count
+    }
+
+    /// 事前学習 (HuBERT 型) の 1 ステップ。隠す区間は spanFrames フレーム単位で、各フレームを開始点にする確率 startProb。
+    /// 系列は 32 フレーム単位に切り上げて 0 で埋め、形ごとに compile する
+    @discardableResult
+    public func trainBatchMaskedCluster(featuresBatch: [[[Float]]], codebook: [MLXArray],
+                                        startProb: Double, spanFrames: Int) -> Float {
+        var maxT = 0
+        for f in featuresBatch {
+            maxT = max(maxT, f.count)
+        }
+        if featuresBatch.isEmpty || maxT == 0 {
+            return 0.0
+        }
+        maxT = ((maxT + 31) / 32) * 32
+        let bSize = featuresBatch.count
+        let inDim = network.inputDim
+        var flatFeat = [Float](repeating: 0.0, count: bSize * maxT * inDim)
+        var flatValid = [Float](repeating: 0.0, count: bSize * maxT)
+        var flatSpan = [Float](repeating: 0.0, count: bSize * maxT)
+        var rng = SystemRandomNumberGenerator()
+        var b = 0
+        while b < bSize {
+            let seq = featuresBatch[b]
+            var t = 0
+            while t < seq.count {
+                let offset = ((b * maxT) + t) * inDim
+                var d = 0
+                while d < inDim {
+                    flatFeat[offset + d] = seq[t][d]
+                    d += 1
+                }
+                flatValid[b * maxT + t] = 1.0
+                if Double.random(in: 0.0..<1.0, using: &rng) < startProb {
+                    var k = 0
+                    while k < spanFrames && (t + k) < seq.count {
+                        flatSpan[b * maxT + t + k] = 1.0
+                        k += 1
+                    }
+                }
+                t += 1
+            }
+            b += 1
+        }
+        let featArray = MLXArray(flatFeat, [bSize, maxT, inDim])
+        let validArray = MLXArray(flatValid, [bSize, maxT])
+        let spanArray = MLXArray(flatSpan, [bSize, maxT])
+        let key = bSize << 16 | maxT
+        let stepFn: ([MLXArray]) -> [MLXArray]
+        if let cached = compiledClusterSteps[key] {
+            stepFn = cached
+        } else {
+            let lg = valueAndGrad(model: self.network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+                return [self.maskedClusterLoss(network: model, features: arrays[0], valid: arrays[1], spanMask: arrays[2],
+                                               codebook: Array(arrays[3..<7]))]
+            }
+            func step(arrays: [MLXArray]) -> [MLXArray] {
+                let (lossValues, grads) = lg(self.network, Array(arrays[0..<7]))
+                let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+                let outerLearningRate = self.optimizer.learningRate
+                self.optimizer.learningRate = arrays[7]
+                self.optimizer.update(model: self.network, gradients: clippedGrads)
+                self.optimizer.learningRate = outerLearningRate
+                return lossValues
+            }
+            let newStep = compile(inputs: [self.network, self.optimizer], outputs: [self.network, self.optimizer], step)
+            compiledClusterSteps[key] = newStep
+            stepFn = newStep
+        }
+        let lossValues = stepFn([featArray, validArray, spanArray] + codebook + [optimizer.learningRate])
+        eval(network, optimizer, lossValues)
+        return lossValues[0].item(Float.self)
+    }
+
+    /// 事前学習 (APC) の 1 ステップ。系列は 32 フレーム単位に切り上げて 0 で埋め、形ごとに compile する
+    @discardableResult
+    public func trainBatchAPC(featuresBatch: [[[Float]]], shifts: [Int] = [SpikingNetworkWeights.predictShift]) -> Float {
+        var maxT = 0
+        for f in featuresBatch {
+            maxT = max(maxT, f.count)
+        }
+        let minShift = shifts.min() ?? SpikingNetworkWeights.predictShift
+        if featuresBatch.isEmpty || maxT <= minShift {
+            return 0.0
+        }
+        maxT = ((maxT + 31) / 32) * 32
+        let bSize = featuresBatch.count
+        let inDim = network.inputDim
+        var flatFeat = [Float](repeating: 0.0, count: bSize * maxT * inDim)
+        var flatMask = [Float](repeating: 0.0, count: bSize * maxT)
+        var b = 0
+        while b < bSize {
+            let seq = featuresBatch[b]
+            var t = 0
+            while t < seq.count {
+                let offset = ((b * maxT) + t) * inDim
+                var d = 0
+                while d < inDim {
+                    flatFeat[offset + d] = seq[t][d]
+                    d += 1
+                }
+                flatMask[b * maxT + t] = 1.0
+                t += 1
+            }
+            b += 1
+        }
+        let featArray = MLXArray(flatFeat, [bSize, maxT, inDim])
+        let maskArray = MLXArray(flatMask, [bSize, maxT])
+        let key = bSize << 16 | maxT
+        let stepFn: ([MLXArray]) -> [MLXArray]
+        if let cached = compiledAPCSteps[key] {
+            stepFn = cached
+        } else {
+            let lg = valueAndGrad(model: self.network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
+                return [self.predictionLoss(network: model, features: arrays[0], mask: arrays[1], shifts: shifts)]
+            }
+            func step(arrays: [MLXArray]) -> [MLXArray] {
+                let (lossValues, grads) = lg(self.network, Array(arrays[0..<2]))
+                let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+                let outerLearningRate = self.optimizer.learningRate
+                self.optimizer.learningRate = arrays[2]
+                self.optimizer.update(model: self.network, gradients: clippedGrads)
+                self.optimizer.learningRate = outerLearningRate
+                return lossValues
+            }
+            let newStep = compile(inputs: [self.network, self.optimizer], outputs: [self.network, self.optimizer], step)
+            compiledAPCSteps[key] = newStep
+            stepFn = newStep
+        }
+        let lossValues = stepFn([featArray, maskArray, optimizer.learningRate])
+        eval(network, optimizer, lossValues)
+        return lossValues[0].item(Float.self)
     }
 
     /// 補助ヘッドのロジット [B, T, voiceClasses]。中間層の発火率 (サブステップ平均) の線形読み出し
