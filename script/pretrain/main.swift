@@ -25,7 +25,9 @@ enum Config {
     static let lifConfig = LIFConfig(beta: 0.92, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
     static let lrMax: Float = 0.003
     static let lrMin: Float = 0.0005
-    /// 1 発話から切り出す最大フレーム数 (compile 済みの経路に乗る上限 = 5.12 秒)
+    /// 学習項目 1 つの最大フレーム数 (compile 済みの経路に乗る上限 = 5.12 秒)。
+    /// これより長い発話は先頭から cropFrames ずつの連続した窓に分け、窓をすべて学習項目にする
+    /// (配信の区間は 17 秒前後が多く、1 区間 1 窓だと配信の音声の半分以上を使えない)
     static let cropFrames = 128
     /// これより短い発話は使わない (予測先を引くと損失を取れるフレームがほとんど残らない)
     static let minFrames = 16
@@ -111,7 +113,13 @@ guard let content = try? String(contentsOfFile: manifestPath, encoding: .utf8) e
     exit(1)
 }
 var paths: [String] = []
-var buckets: [Int] = []
+/// 学習項目 = 発話 paths[path] のフレーム [start, start + length) の窓
+struct Window: Sendable {
+    let path: Int
+    let start: Int
+    let length: Int
+}
+var windows: [Window] = []
 for line in content.components(separatedBy: "\n") {
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty {
@@ -129,7 +137,14 @@ for line in content.components(separatedBy: "\n") {
         continue
     }
     paths.append(row.path)
-    buckets.append(((min(frames, Config.cropFrames) + 31) / 32) * 32)
+    var start = 0
+    while start < frames {
+        let length = min(Config.cropFrames, frames - start)
+        if Config.minFrames <= length {
+            windows.append(Window(path: paths.count - 1, start: start, length: length))
+        }
+        start += Config.cropFrames
+    }
     if maxItems <= paths.count {
         break
     }
@@ -139,12 +154,12 @@ if paths.isEmpty {
     exit(1)
 }
 let itemPaths = paths
-let itemBuckets = buckets
+let itemWindows = windows
 let batchItems = batchSize
 let loadWorkers = workers
 var totalSeconds = 0.0
-for b in buckets {
-    totalSeconds += Double(b) * 0.04
+for w in windows {
+    totalSeconds += Double(w.length) * 0.04
 }
 // 2 周目の先生 (重みは固定、目標を作るだけ)
 var teacherTrainer: MLXBPTTTrainer? = nil
@@ -235,7 +250,7 @@ if targetsPath.isEmpty != true {
 } else {
     print("事前学習 (APC、\(Config.predictShifts.map { String($0) }.joined(separator: "・")) フレーム先の特徴量を予測)")
 }
-print("  音声 \(paths.count) 件 (切り出し後 \(String(format: "%.1f", totalSeconds / 3600.0)) 時間/epoch) / epoch \(epochs) / バッチ \(batchSize)")
+print("  音声 \(paths.count) 件 → \(Config.cropFrames) フレームずつの窓 \(windows.count) 個 (\(String(format: "%.1f", totalSeconds / 3600.0)) 時間/epoch) / epoch \(epochs) / バッチ \(batchSize)")
 
 let inputDim = StreamingFeatureFrontEnd.acousticInputDim()
 var classCount = 0
@@ -264,8 +279,8 @@ print("  ネットワーク: \(Config.numLayers) 層・幅 \(Config.maxHiddenDim
 func makeBatches() -> [[Int]] {
     var byBucket: [Int: [Int]] = [:]
     var i = 0
-    while i < itemPaths.count {
-        byBucket[itemBuckets[i], default: []].append(i)
+    while i < itemWindows.count {
+        byBucket[((itemWindows[i].length + 31) / 32) * 32, default: []].append(i)
         i += 1
     }
     var batches: [[Int]] = []
@@ -281,6 +296,22 @@ func makeBatches() -> [[Int]] {
     return batches.shuffled()
 }
 
+/// 窓の部分の音声だけを切り出して特徴量にする (1 フレーム = 4 ホップ × 160 サンプル。端の 3-tap のぶん 1 フレーム余分に読む)
+@Sendable func windowFeatures(_ w: Window) -> [[Float]] {
+    guard let wav = SpeechDataset.loadWavFile(path: itemPaths[w.path]) else {
+        return []
+    }
+    let pcm = SpeechDataset.resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
+    let samplesPerFrame = 160 * StreamingFeatureFrontEnd.defaultStack
+    let from = min(pcm.count, w.start * samplesPerFrame)
+    let to = min(pcm.count, (w.start + w.length + 1) * samplesPerFrame + 400)
+    if to <= from {
+        return []
+    }
+    let feats = SpeechDataset.extractFeaturesFromPCM(pcmData: Array(pcm[from..<to]), frameStack: StreamingFeatureFrontEnd.defaultStack)
+    return Array(feats.prefix(w.length))
+}
+
 final class BatchBuffer: @unchecked Sendable {
     var items: [[[Float]]]
     init(count: Int) {
@@ -292,16 +323,10 @@ final class BatchBuffer: @unchecked Sendable {
     let buffer = BatchBuffer(count: indices.count)
     let workerCount = max(1, min(loadWorkers, indices.count))
     DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
-        var rng = SystemRandomNumberGenerator()
         var k = worker
         while k < indices.count {
             buffer.items[k] = autoreleasepool {
-                let feats = SpeechDataset.loadFeatures(path: itemPaths[indices[k]], frameStack: StreamingFeatureFrontEnd.defaultStack).features
-                if feats.count <= Config.cropFrames {
-                    return feats
-                }
-                let start = Int.random(in: 0...(feats.count - Config.cropFrames), using: &rng)
-                return Array(feats[start..<(start + Config.cropFrames)])
+                return windowFeatures(itemWindows[indices[k]])
             }
             k += workerCount
         }
