@@ -47,10 +47,16 @@ enum Defaults {
     /// マニフェストの "voice": [[開始秒, 終了秒, クラス], ...] を教師にする (無い行は除く)
     static let voiceHead = false
     static let voiceLossWeight: Float = 0.3
+    /// 発火 (0/1) の代わりに、閾値の前後だけ連続値になる出力を次の層へ渡す対照実験 (0/1 への量子化が学習を妨げているかの切り分け)。
+    /// CPU 推論は発火前提なので、評価の音響モデル推論も MLX で行う
+    static let continuousSpikes = false
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
     static let bpttWindow = 4
+    /// エポックごとの BPTT 窓幅 (1 エポック目から順に。尽きたら最後の値のまま)。空なら bpttWindow で一定。
+    /// 最初から長い窓で学習すると崩れるので、短い窓で慣らしてから伸ばすためのもの
+    static let bpttWindowGrowth: [Int] = []
 
     /// Cosine 学習率スケジュール
     static let lrMax: Float = 0.003
@@ -65,7 +71,7 @@ enum Defaults {
     static let lrRollbackFactor: Float = 0.5
     static let maxLRRollbacks = 2
 
-    /// LIF 設定。ALIF (gamma > 0) は損失・CER とも悪化したため無効。
+    /// LIF 設定。適応閾値 (gamma > 0) は戻りの時定数 60 ms でも 600 ms でも改善しなかったため無効。
     static let lifConfig = LIFConfig(beta: 0.92, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
 
     /// N エポックごとの重み書き出し
@@ -510,6 +516,7 @@ if epochs == 0 {
         inputNormGainInit: Defaults.inputNormGainInit,
         voiceHead: Defaults.voiceHead
     )
+    mlxNet.continuousSpikes = Defaults.continuousSpikes
     if let wData = importedWeights {
         mlxNet.importWeights(from: wData)
         print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
@@ -695,6 +702,13 @@ if epochs == 0 {
     var ep = 1
     while ep <= epochs {
     let epStartTime = CFAbsoluteTimeGetCurrent()
+    if Defaults.bpttWindowGrowth.isEmpty != true {
+        let window = Defaults.bpttWindowGrowth[min(ep - 1, Defaults.bpttWindowGrowth.count - 1)]
+        if window != mlxTrainer.bpttWindow {
+            mlxTrainer.setBPTTWindow(window)
+            print("  BPTT 窓幅: \(window) フレーム (epoch \(ep) から)")
+        }
+    }
     // バッチの並びは毎エポック混ぜる。長さ順のまま流すと 1 エポックの前半は
     // 短い断片ばかり、後半は長い発話ばかりになり、100 万件規模では最初の
     // 数千ステップが 1 秒未満の断片だけで埋まって blank 一色に崩れる
@@ -1273,6 +1287,27 @@ func computeSummary(_ results: [EvalResult]) -> GroupSummary {
 
 let dummyEval = EvalResult(index: 0, fileId: "", corpus: "", targetText: "", predText: "", editDistance: 0, cer: 1.0, isExact: false, isTrain: false, targetKana: "", predKana: "", kanaCer: 1.0, goldKanaKanji: "", goldKanaKanjiCer: 1.0, goldKanaKanjiCerNoPunct: 1.0, goldExactNoPunct: false)
 
+/// 評価用に MLX で求めた発話ごとの音響対数確率 [フレーム][文字]
+final class EvalLogProbBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var features: [[[Float]]]
+    var logProbs: [[[Float]]?]
+    init(count: Int) {
+        self.features = [[[Float]]](repeating: [], count: count)
+        self.logProbs = [[[Float]]?](repeating: nil, count: count)
+    }
+    func setFeatures(_ idx: Int, _ value: [[Float]]) {
+        lock.lock()
+        features[idx] = value
+        lock.unlock()
+    }
+    func takeFeatures(_ idx: Int) -> [[Float]] {
+        let value = features[idx]
+        features[idx] = []
+        return value
+    }
+}
+
 final class BatchEvalBuffer: @unchecked Sendable {
     var results: [EvalResult]
     var valid: [Bool]
@@ -1328,6 +1363,84 @@ if trainEvalTarget < sampleLimit {
 }
 print("全 \(evalPairs.count) 件の WAV 読み込み・並列推論実行中 (\(evalWorkers) ワーカー)...")
 let evalStartTime = Date()
+let evalMLX = EvalLogProbBuffer(count: evalPairs.count)
+if Defaults.continuousSpikes {
+    print("  連続値の対照: 音響モデルの推論を MLX で行う")
+    let evalNet = MLXSpikingNetwork(weights: trainer.acousticNetwork.exportWeights(vocabulary: phoneticVocabulary))
+    evalNet.continuousSpikes = true
+    let evalRunner = MLXBPTTTrainer(network: evalNet)
+    let chunkSize = 256
+    let batchLimit = 32
+    let padUnit = 16
+    var chunkStart = 0
+    while chunkStart < evalPairs.count {
+        let chunkEnd = min(evalPairs.count, chunkStart + chunkSize)
+        DispatchQueue.concurrentPerform(iterations: chunkEnd - chunkStart) { k in
+            let idx = chunkStart + k
+            guard let wavData = SpeechDataset.loadWavFile(path: evalPairs[idx].path) else {
+                return
+            }
+            let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
+            evalMLX.setFeatures(idx, SpeechDataset.extractFeaturesFromPCM(
+                pcmData: pcm16k,
+                frameStack: evalFrameStack,
+                longContext: Defaults.longContext
+            ))
+        }
+        var order: [(idx: Int, feats: [[Float]])] = []
+        var idx = chunkStart
+        while idx < chunkEnd {
+            let feats = evalMLX.takeFeatures(idx)
+            if feats.isEmpty != true {
+                order.append((idx: idx, feats: feats))
+            }
+            idx += 1
+        }
+        order.sort { $0.feats.count < $1.feats.count }
+        var b0 = 0
+        while b0 < order.count {
+            let b1 = min(order.count, b0 + batchLimit)
+            let longest = order[b1 - 1].feats.count
+            let padded = ((longest + padUnit - 1) / padUnit) * padUnit
+            let dim = evalNet.inputDim
+            var flat = [Float](repeating: 0.0, count: (b1 - b0) * padded * dim)
+            var r = b0
+            while r < b1 {
+                var t = 0
+                while t < order[r].feats.count {
+                    let base = ((r - b0) * padded + t) * dim
+                    var d = 0
+                    while d < dim {
+                        flat[base + d] = order[r].feats[t][d]
+                        d += 1
+                    }
+                    t += 1
+                }
+                r += 1
+            }
+            let logits = evalRunner.logitsInChunks(network: evalNet, features: MLXArray(flat, [b1 - b0, padded, dim]))
+            let logp = logits - logSumExp(logits, axis: -1, keepDims: true)
+            eval(logp)
+            let values = logp.asArray(Float.self)
+            let outDim = evalNet.outputDim
+            r = b0
+            while r < b1 {
+                var rows: [[Float]] = []
+                rows.reserveCapacity(order[r].feats.count)
+                var t = 0
+                while t < order[r].feats.count {
+                    let base = ((r - b0) * padded + t) * outDim
+                    rows.append(Array(values[base..<(base + outDim)]))
+                    t += 1
+                }
+                evalMLX.logProbs[order[r].idx] = rows
+                r += 1
+            }
+            b0 = b1
+        }
+        chunkStart = chunkEnd
+    }
+}
 DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
     // 第2段デコーダはワーカー内で使い回し、発話ごとの再確保を避ける
     let goldDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
@@ -1361,7 +1474,8 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
                 minConfidence: 0.05,
                 useCTC: true,
                 languageBonus: evalLanguageBonus,
-                blankPenalty: Defaults.blankPenalty
+                blankPenalty: Defaults.blankPenalty,
+                acousticLogProbs: evalMLX.logProbs[idx]
             )
             let dist = levenshteinDistance(pair.text, res.kanji)
             let cer = Float(dist) / Float(max(1, pair.text.count))

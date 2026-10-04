@@ -127,7 +127,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     }
 
     /// 事前学習の重みから CTC の学習を始めるための重み。隠れ層はそのまま、
-    /// 読み出し (wOut / bOut / 語彙) は `readout` (新しく作ったネットワーク) のものに替え、予測ヘッドを捨てる
+    /// 読み出し (wOut / bOut / 語彙) は `readout` (新しく作ったネットワーク) のものに替え、予測ヘッドを捨てる。
+    /// 事前学習に無い減衰率は `readout` の初期値を使う
     public func startingCTC(readout: SpikingNetworkWeights) -> SpikingNetworkWeights {
         return SpikingNetworkWeights(
             inputDim: inputDim,
@@ -142,7 +143,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             bHLayers: bHLayers,
             gammaRMS: gammaRMS,
             wRecLayers: wRecLayers,
-            betaLayers: betaLayers,
+            betaLayers: betaLayers ?? readout.betaLayers,
             inputNormGains: inputNormGains,
             wVoice: readout.wVoice,
             bVoice: readout.bVoice,

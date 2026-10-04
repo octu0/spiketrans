@@ -26,7 +26,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// この本数ごとに膜電位・スパイク・適応閾値の勾配を切り離す。1 にすると
     /// フレームをまたぐ信用割り当てが完全に消え、第1段は実質フレーム独立の
     /// 分類器になる。大きくすると時間文脈を学習できる一方、計算グラフが深くなる。
-    public let bpttWindow: Int
+    public private(set) var bpttWindow: Int
     /// 声の種類の補助損失の重み (CTC 損失に足す)
     public var voiceLossWeight: Float = 0.3
     /// 直近のバッチの補助損失 (重みを掛ける前)。補助ヘッドが無ければ 0
@@ -80,6 +80,21 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// 学習率を更新。配列で持つので compile 済みステップにも入力として渡る
     public func updateLearningRate(_ lr: Float) {
         self.optimizer.learningRate = MLXArray(lr)
+    }
+
+    /// 切り詰め BPTT の窓幅を変える。窓幅はトレース済みのステップに焼き込まれているので作り直す
+    public func setBPTTWindow(_ frames: Int) {
+        let next = max(1, frames)
+        if next == bpttWindow {
+            return
+        }
+        bpttWindow = next
+        compiledCTCSteps.removeAll()
+        compiledAPCSteps.removeAll()
+        compiledClusterSteps.removeAll()
+        compiledLogitsSteps.removeAll()
+        compiledChunkForward.removeAll()
+        compiledChunkBackward.removeAll()
     }
 
     /// 重みを保存済みの状態へ巻き戻す。Adam のモーメントも捨て、
@@ -153,8 +168,12 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             let dynVTh = vTh + a[l]
             let vRel = (v[l] - dynVTh) * alpha
             let sSurrogate = 0.5 * (vRel / (1.0 + abs(vRel)) + 1.0)
-            let sHard = (dynVTh .<= v[l]).asType(.float32)
-            s[l] = stopGradient(sHard - sSurrogate) + sSurrogate
+            var sReset = (dynVTh .<= v[l]).asType(.float32)
+            if network.continuousSpikes {
+                // 閾値の前後 0.5 だけ 0〜1 の連続値、それより下は 0・上は 1 (疎なまま)。勾配は発火と同じ代理勾配
+                sReset = clip(v[l] - dynVTh + 0.5, min: 0.0, max: 1.0)
+            }
+            s[l] = stopGradient(sReset - sSurrogate) + sSurrogate
 
             if isLast {
                 // 読み出しは閾値単位でクリップするが、勾配はクリップ前の値を通す (straight-through)。
@@ -163,7 +182,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 let scaled = v[l] / vTh
                 let clipped = clip(scaled, min: -readoutK, max: readoutK)
                 readout = stopGradient(clipped - scaled) + scaled
-                v[l] = clip(v[l] - sHard * vTh, min: vMin, max: vMax)
+                v[l] = clip(v[l] - sReset * vTh, min: vMin, max: vMax)
             }
             l += 1
         }
@@ -200,6 +219,36 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var rates: [MLXArray] = []
         let readoutList = forwardFrames(network: network, currentSeq0: currentSeq0, from: 0, to: seqLen, v: &v, s: &s, a: &a, voiceRates: &rates)
         return matmul(stacked(readoutList, axis: 1), network.wOut) + network.bOut
+    }
+
+    /// 推論用のロジット系列 [B, T, outputDim]。chunkFrames フレームずつ状態を引き継いで前向きに進め、
+    /// 区切りごとに評価してグラフを切る (長い系列を一度に組むと Metal のバッファ数の上限を超える)
+    public func logitsInChunks(
+        network: MLXSpikingNetwork,
+        features: MLXArray,          // [B, T, inputDim]
+        chunkFrames: Int = 32
+    ) -> MLXArray {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        let hMax = network.maxHiddenDim
+        let numLayers = network.numLayers
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var rates: [MLXArray] = []
+        var outputs: [MLXArray] = []
+        var t0 = 0
+        while t0 < seqLen {
+            let t1 = min(seqLen, t0 + max(1, chunkFrames))
+            let current = matmul(features[0..., t0..<t1, 0...], network.wIn) + network.bH
+            let readouts = forwardFrames(network: network, currentSeq0: current, from: 0, to: t1 - t0, v: &v, s: &s, a: &a, voiceRates: &rates)
+            let logits = matmul(stacked(readouts, axis: 1), network.wOut) + network.bOut
+            rates.removeAll()
+            eval(v + s + a + [logits])
+            outputs.append(logits)
+            t0 = t1
+        }
+        return concatenated(outputs, axis: 1)
     }
 
     /// フレーム [t0, t1) を前向きに進め、各フレームの読み出し (サブステップ平均、[B, hMax]) を返す。

@@ -325,17 +325,29 @@ extension Trainer {
         minConfidence: Float = 0.05,
         useCTC: Bool = false,
         languageBonus: Float = 4.0,
-        blankPenalty: Float = 0.0
+        blankPenalty: Float = 0.0,
+        acousticLogProbs: [[Float]]? = nil
     ) -> (kana: String, kanji: String) {
-        let kanaText: String
-        if useCTC {
-            kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, beamWidth: 16, blankPenalty: blankPenalty)
-        } else {
-            kanaText = transcribeAcousticDirect(
-                featuresSeq: featuresSeq,
-                minDurationFrames: minDurationFrames,
-                minConfidence: minConfidence
+        var kanaText = ""
+        switch acousticLogProbs {
+        case .some(let logProbs):
+            // 音響モデルの対数確率を外で求めてある (MLX でしか推論できない構成の評価)
+            let decoder = CTCBeamDecoder(
+                vocabulary: textVocabulary,
+                blankId: TextVocabulary.padId,
+                beamWidth: 16
             )
+            kanaText = decoder.decode(logProbs: logProbs).text
+        case .none:
+            if useCTC {
+                kanaText = transcribeAcousticCTC(featuresSeq: featuresSeq, beamWidth: 16, blankPenalty: blankPenalty)
+            } else {
+                kanaText = transcribeAcousticDirect(
+                    featuresSeq: featuresSeq,
+                    minDurationFrames: minDurationFrames,
+                    minConfidence: minConfidence
+                )
+            }
         }
 
         var kanjiText = ""

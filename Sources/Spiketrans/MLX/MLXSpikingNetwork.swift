@@ -38,6 +38,10 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         return max(0, numLayers - 2)
     }
 
+    /// 発火 (0/1) の代わりに、閾値の前後だけ 0〜1 の連続値になる出力を次の層へ渡す対照実験用の切り替え。
+    /// 重みには保存しない。CPU 推論は発火したニューロンだけを足す作りなので、この構成は MLX でしか推論できない
+    public var continuousSpikes: Bool = false
+
     // リードアウト
     public var wOut: MLXArray      // [maxHiddenDim, outputDim]
     public var bOut: MLXArray      // [outputDim]
