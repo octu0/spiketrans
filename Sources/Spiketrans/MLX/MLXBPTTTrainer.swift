@@ -113,6 +113,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
 
     /// 1 サブステップ分の全層 LIF 更新。
     /// 入力 [層 0 の入力電流, v_0...v_L-1, s_0...s_L-1, a_0...a_L-1]、出力 [v..., s..., a..., 最終層の読み出し]。
+    /// a は適応閾値の状態。ゲート付き記憶の構成では、その層の記憶 (適応閾値は使わない)。
     /// 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差 (+ 再帰構成なら同じ層の直前スパイクの再帰電流)。
     /// 入力正規化の構成では、各層の LIF に入るのは残差電流全体を RMSNorm してゲインを掛けたもの (残差そのものは正規化しない)。
     /// 最終層だけハードリセットせず、閾値単位の膜電位を読んでから余りを残す
@@ -136,16 +137,30 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var stream = current0 + matmul(s[0], network.wRec)
         var l = 0
         while l < numLayers {
+            // この層が残差に足す電流 (層 0 は入力と再帰の電流そのもの)
+            var own = stream
             if 0 < l {
                 let upperIdx = l - 1
                 let denseCur = matmul(s[l - 1], network.wLayers[upperIdx]) + network.bHLayers[upperIdx]
                 // MLXFast.rmsNorm は valueAndGrad + compile で Metal 生存バッファ上限を超える
                 let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
                 let rms = sqrt(meanSq + rmsNormEpsilon)
-                stream = (denseCur / rms) * network.gammaRMS[upperIdx] + stream
+                own = (denseCur / rms) * network.gammaRMS[upperIdx]
                 if upperIdx < network.wRecLayers.count {
-                    stream = stream + matmul(s[l], network.wRecLayers[upperIdx])
+                    own = own + matmul(s[l], network.wRecLayers[upperIdx])
                 }
+                stream = own + stream
+            }
+            let gated = l < network.gateParams.count
+            if gated {
+                // ゲート付き記憶 (RG-LRU 型): 発火でリセットされない連続値の記憶。状態は a[l] に持つ。
+                // 残す割合を入力に応じて毎サブステップ決め、出力の重みを掛けて残差に足す
+                let g = network.gateParams[l]
+                let keep = sigmoid(g[1] * own + g[2])
+                let admit = sigmoid(g[3] * own + g[4])
+                let decay = exp((SpikingNetworkWeights.gateDecayExponent * keep) * log(sigmoid(g[0])))
+                a[l] = decay * a[l] + sqrt(1.0 - decay * decay + 1e-6) * (admit * own)
+                stream = stream + g[5] * a[l]
             }
             var current = stream
             if l < network.inputNormGains.count {
@@ -164,8 +179,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 v[l] = clip(decayed * (1.0 - s[l]) + current, min: vMin, max: vMax)
             }
 
-            a[l] = (a[l] * rho) + (s[l] * gamma)
-            let dynVTh = vTh + a[l]
+            var dynVTh = MLXArray(vTh)
+            if gated != true {
+                a[l] = (a[l] * rho) + (s[l] * gamma)
+                dynVTh = vTh + a[l]
+            }
             let vRel = (v[l] - dynVTh) * alpha
             let sSurrogate = 0.5 * (vRel / (1.0 + abs(vRel)) + 1.0)
             var sReset = (dynVTh .<= v[l]).asType(.float32)

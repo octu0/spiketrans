@@ -29,6 +29,9 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let betaLayers: [[Float]]?  // [numLayers][maxHiddenDim]
     /// 各層の LIF に入る電流全体を RMSNorm するときのゲイン (無ければ残差をそのまま入れる)
     public let inputNormGains: [[Float]]?  // [numLayers][maxHiddenDim]
+    /// ゲート付き記憶 (RG-LRU 型) の係数。層ごとに 6 行 × maxHiddenDim を行優先で並べる:
+    /// 0 減衰の logit Λ、1・2 保持ゲートの重みとバイアス、3・4 入力ゲートの重みとバイアス、5 出力の重み。無い構成では nil
+    public let gateLayers: [[Float]]?  // [numLayers][gateRows * maxHiddenDim]
     /// 声の種類 (なし / 配信者 / bot / その他) を中間層の発火率から判定する補助ヘッド。学習時だけ使う
     public let wVoice: [Float]?   // [voiceClasses * maxHiddenDim]
     public let bVoice: [Float]?   // [voiceClasses]
@@ -59,6 +62,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         wRecLayers: [[Float]]? = nil,
         betaLayers: [[Float]]? = nil,
         inputNormGains: [[Float]]? = nil,
+        gateLayers: [[Float]]? = nil,
         wVoice: [Float]? = nil,
         bVoice: [Float]? = nil,
         wPred: [Float]? = nil,
@@ -86,6 +90,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.wRecLayers = wRecLayers
         self.betaLayers = betaLayers
         self.inputNormGains = inputNormGains
+        self.gateLayers = gateLayers
         self.wVoice = wVoice
         self.bVoice = bVoice
         self.wPred = wPred
@@ -128,7 +133,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
 
     /// 事前学習の重みから CTC の学習を始めるための重み。隠れ層はそのまま、
     /// 読み出し (wOut / bOut / 語彙) は `readout` (新しく作ったネットワーク) のものに替え、予測ヘッドを捨てる。
-    /// 事前学習に無い減衰率は `readout` の初期値を使う
+    /// 事前学習に無い減衰率・ゲート付き記憶は `readout` の初期値を使う
     public func startingCTC(readout: SpikingNetworkWeights) -> SpikingNetworkWeights {
         return SpikingNetworkWeights(
             inputDim: inputDim,
@@ -145,6 +150,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wRecLayers: wRecLayers,
             betaLayers: betaLayers ?? readout.betaLayers,
             inputNormGains: inputNormGains,
+            gateLayers: gateLayers ?? readout.gateLayers,
             wVoice: readout.wVoice,
             bVoice: readout.bVoice,
             wOut: readout.wOut,
@@ -170,6 +176,42 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             return false
         }
         return g.isEmpty != true
+    }
+
+    /// ゲート付き記憶を持つか
+    public var hasGatedMemory: Bool {
+        guard let g = gateLayers else {
+            return false
+        }
+        return g.isEmpty != true
+    }
+
+    /// ゲート付き記憶の係数の行数 (Λ, 保持ゲート重み, 同バイアス, 入力ゲート重み, 同バイアス, 出力の重み)
+    public static let gateRows = 6
+    /// 保持ゲート r に対するサブステップあたりの減衰 = sigmoid(Λ)^(gateDecayExponent * r) (RG-LRU の c)
+    public static let gateDecayExponent: Float = 8.0
+    /// 減衰の初期値の時定数の範囲 (サブステップ = 10 ms 単位)。保持ゲート 0.5 のとき 40 ms 〜 4 秒を対数等間隔に並べる
+    public static let gateTimeConstantRange: ClosedRange<Float> = 4.0...400.0
+
+    /// ゲート付き記憶の初期値。ゲートは入力によらず 0.5 から、出力の重みは 0 から始める
+    /// (学習の始めは記憶の無いネットワークと同じ出力になる)
+    public static func initialGateLayers(numLayers: Int, hidden: Int) -> [[Float]] {
+        var values = [Float](repeating: 0.0, count: gateRows * hidden)
+        let lo = logf(gateTimeConstantRange.lowerBound)
+        let hi = logf(gateTimeConstantRange.upperBound)
+        var n = 0
+        while n < hidden {
+            var frac: Float = 0.0
+            if 1 < hidden {
+                frac = Float(n) / Float(hidden - 1)
+            }
+            let tau = expf(lo + (hi - lo) * frac)
+            // sigmoid(Λ)^(c * 0.5) = exp(-1 / τ) となる Λ
+            let a = expf(-1.0 / (tau * gateDecayExponent * 0.5))
+            values[n] = logf(a / (1.0 - a))
+            n += 1
+        }
+        return [[Float]](repeating: values, count: max(1, numLayers))
     }
 
     /// 減衰率をニューロンごとに持つか

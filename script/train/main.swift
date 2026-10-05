@@ -50,6 +50,9 @@ enum Defaults {
     /// 発火 (0/1) の代わりに、閾値の前後だけ連続値になる出力を次の層へ渡す対照実験 (0/1 への量子化が学習を妨げているかの切り分け)。
     /// CPU 推論は発火前提なので、評価の音響モデル推論も MLX で行う
     static let continuousSpikes = false
+    /// 各層にゲート付き記憶 (RG-LRU 型: 発火でリセットされず、残す割合を入力で決める連続値の記憶) を持たせるか。
+    /// CPU 推論は未対応なので、評価の音響モデル推論は MLX で行う
+    static let gatedMemory = false
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
@@ -437,7 +440,7 @@ let trainConfig = TrainingConfig(
 let acousticInputDim = Defaults.acousticInputDim
 print("音響特徴量: \(acousticInputDim) 次元 (\(Defaults.melFrameDim) 次元 3-tap Mel × \(Defaults.frameStack) フレーム束ね、背景音の要約 \(Defaults.longContext))")
 
-print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers), 幅 = \(Defaults.maxHiddenDim), 上位層の再帰 = \(Defaults.upperRecurrent), 減衰率の学習 = \(Defaults.learnedBeta), 入力正規化 = \(Defaults.inputNorm) (ゲイン初期値 \(Defaults.inputNormGainInit))")
+print("第1段 LIF: beta = \(Defaults.lifConfig.beta), 層数 = \(Defaults.numLayers), 幅 = \(Defaults.maxHiddenDim), 上位層の再帰 = \(Defaults.upperRecurrent), 減衰率の学習 = \(Defaults.learnedBeta), 入力正規化 = \(Defaults.inputNorm) (ゲイン初期値 \(Defaults.inputNormGainInit)), ゲート付き記憶 = \(Defaults.gatedMemory)")
 
 let trainer = Trainer(
     acousticNetwork: SpikingNetwork(
@@ -450,7 +453,8 @@ let trainer = Trainer(
         upperRecurrent: Defaults.upperRecurrent,
         learnedBeta: Defaults.learnedBeta,
         inputNorm: Defaults.inputNorm,
-        inputNormGainInit: Defaults.inputNormGainInit
+        inputNormGainInit: Defaults.inputNormGainInit,
+        gatedMemory: Defaults.gatedMemory
     ),
     languageNetwork: SpikingNetwork(
         inputDim: 128,
@@ -478,8 +482,9 @@ if let wData = importedWeights {
           wData.maxHiddenDim == Defaults.maxHiddenDim,
           wData.hasUpperRecurrence == Defaults.upperRecurrent,
           wData.hasLearnedBeta == Defaults.learnedBeta,
-          wData.hasInputNorm == Defaults.inputNorm else {
-        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size), 層数 \(wData.numLayers)/\(Defaults.numLayers), 幅 \(wData.maxHiddenDim)/\(Defaults.maxHiddenDim), 上位層の再帰 \(wData.hasUpperRecurrence)/\(Defaults.upperRecurrent), 減衰率の学習 \(wData.hasLearnedBeta)/\(Defaults.learnedBeta), 入力正規化 \(wData.hasInputNorm)/\(Defaults.inputNorm))。")
+          wData.hasInputNorm == Defaults.inputNorm,
+          wData.hasGatedMemory == Defaults.gatedMemory else {
+        print("  ✕ 重みの次元が現在の構成と一致しません (入力 \(wData.inputDim)/\(acousticInputDim), 出力 \(wData.outputDim)/\(phoneticVocabulary.size), 層数 \(wData.numLayers)/\(Defaults.numLayers), 幅 \(wData.maxHiddenDim)/\(Defaults.maxHiddenDim), 上位層の再帰 \(wData.hasUpperRecurrence)/\(Defaults.upperRecurrent), 減衰率の学習 \(wData.hasLearnedBeta)/\(Defaults.learnedBeta), 入力正規化 \(wData.hasInputNorm)/\(Defaults.inputNorm), ゲート付き記憶 \(wData.hasGatedMemory)/\(Defaults.gatedMemory))。")
         exit(1)
     }
     trainer.acousticNetwork.importWeights(from: wData)
@@ -514,7 +519,8 @@ if epochs == 0 {
         learnedBeta: Defaults.learnedBeta,
         inputNorm: Defaults.inputNorm,
         inputNormGainInit: Defaults.inputNormGainInit,
-        voiceHead: Defaults.voiceHead
+        voiceHead: Defaults.voiceHead,
+        gatedMemory: Defaults.gatedMemory
     )
     mlxNet.continuousSpikes = Defaults.continuousSpikes
     if let wData = importedWeights {
@@ -1364,10 +1370,10 @@ if trainEvalTarget < sampleLimit {
 print("全 \(evalPairs.count) 件の WAV 読み込み・並列推論実行中 (\(evalWorkers) ワーカー)...")
 let evalStartTime = Date()
 let evalMLX = EvalLogProbBuffer(count: evalPairs.count)
-if Defaults.continuousSpikes {
-    print("  連続値の対照: 音響モデルの推論を MLX で行う")
+if Defaults.continuousSpikes || Defaults.gatedMemory {
+    print("  連続値の対照・ゲート付き記憶: 音響モデルの推論を MLX で行う")
     let evalNet = MLXSpikingNetwork(weights: trainer.acousticNetwork.exportWeights(vocabulary: phoneticVocabulary))
-    evalNet.continuousSpikes = true
+    evalNet.continuousSpikes = Defaults.continuousSpikes
     let evalRunner = MLXBPTTTrainer(network: evalNet)
     let chunkSize = 256
     let batchLimit = 32

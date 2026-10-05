@@ -345,6 +345,73 @@ final class MultiLayerSNNTests: XCTestCase {
         }
     }
 
+    /// ゲート付き記憶は出力の重み 0 から始まるので、学習前は記憶の無いネットワークと同じロジットになる。
+    /// 係数は JSON と CPU 側のネットワークを往復しても保たれる
+    func testGatedMemoryStartsAsPlainNetworkAndRoundTrips() throws {
+        let inputDim = 16
+        let hidden = 64
+        let outputDim = 12
+        let frames = 10
+        let layers = 3
+        let plainNet = MLXSpikingNetwork(numLayers: layers, inputDim: inputDim, maxHiddenDim: hidden, outputDim: outputDim)
+        plainNet.wIn = plainNet.wIn * 4.0
+        let plain = plainNet.exportWeights()
+        let gatedNet = MLXSpikingNetwork(
+            numLayers: layers, inputDim: inputDim, maxHiddenDim: hidden, outputDim: outputDim, gatedMemory: true
+        )
+        gatedNet.importWeights(from: plain)
+        let weights = gatedNet.exportWeights()
+        XCTAssertEqual(weights.hasGatedMemory, true)
+        XCTAssertEqual(weights.gateLayers?.count, layers)
+        XCTAssertEqual(weights.gateLayers?[0].count, SpikingNetworkWeights.gateRows * hidden)
+
+        let data = try JSONEncoder().encode(weights)
+        let decoded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
+        XCTAssertEqual(decoded, weights)
+        XCTAssertEqual(SpikingNetwork(weights: decoded).exportWeights(), weights)
+
+        var flat: [Float] = []
+        for frame in makeFeatures(frames: frames, dim: inputDim) {
+            flat.append(contentsOf: frame)
+        }
+        let features = MLXArray(flat, [1, frames, inputDim])
+        let plainLogits = MLXBPTTTrainer(network: plainNet, bpttWindow: 4).logitsBatch(network: plainNet, features: features)
+        let gatedLogits = MLXBPTTTrainer(network: gatedNet, bpttWindow: 4).logitsBatch(network: gatedNet, features: features)
+        eval(plainLogits, gatedLogits)
+        let a = plainLogits.asArray(Float.self)
+        let b = gatedLogits.asArray(Float.self)
+        var i = 0
+        while i < a.count {
+            XCTAssertEqual(a[i], b[i], accuracy: 1e-4)
+            i += 1
+        }
+    }
+
+    /// ゲート付き記憶の構成で CTC 学習が進み、記憶の出力の重みとゲートの係数が動く
+    func testGatedMemoryCTCTrainingUpdatesGates() {
+        let inputDim = 16
+        let hidden = 64
+        let mlxNet = MLXSpikingNetwork(numLayers: 2, inputDim: inputDim, maxHiddenDim: hidden, outputDim: 8, gatedMemory: true)
+        let before = mlxNet.exportWeights().gateLayers ?? []
+        let trainer = MLXBPTTTrainer(network: mlxNet, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+        let batch: [[[Float]]] = [makeFeatures(frames: 24, dim: inputDim), makeFeatures(frames: 20, dim: inputDim)]
+        let targets: [[Int]] = [[1, 2, 3, 2], [4, 5, 6]]
+        let first = trainer.trainBatchCTC(featuresBatch: batch, targetsBatch: targets)
+        var last = first
+        var step = 0
+        while step < 30 {
+            last = trainer.trainBatchCTC(featuresBatch: batch, targetsBatch: targets)
+            step += 1
+        }
+        XCTAssertFalse(last.isNaN)
+        XCTAssertLessThan(last, first)
+        let after = mlxNet.exportWeights().gateLayers ?? []
+        XCTAssertEqual(after.count, before.count)
+        let outRow = (SpikingNetworkWeights.gateRows - 1) * hidden
+        XCTAssertNotEqual(Array(after[1][outRow..<(outRow + hidden)]), Array(before[1][outRow..<(outRow + hidden)]))
+        XCTAssertNotEqual(Array(after[1][hidden..<(2 * hidden)]), Array(before[1][hidden..<(2 * hidden)]))
+    }
+
     func testTwoLayerCTCTrainingReducesLoss() {
         let inputDim = 16
         let outputDim = 8

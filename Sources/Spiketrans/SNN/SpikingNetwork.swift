@@ -36,6 +36,8 @@ public final class SpikingNetwork: @unchecked Sendable {
     public let pBetaLayers: [Parameter]
     /// 各層の LIF に入る電流全体を RMSNorm するときのゲイン (層 0 から numLayers 本)。正規化しない構成では空
     public let pInputNormGains: [Parameter]
+    /// ゲート付き記憶の係数 (`SpikingNetworkWeights.gateLayers`)。CPU 推論は未対応で、保存と受け渡しだけ行う
+    public private(set) var gateLayers: [[Float]]?
 
     // リードアウト
     public let pWOut: Parameter        // [outputDim, maxHiddenDim]
@@ -52,7 +54,8 @@ public final class SpikingNetwork: @unchecked Sendable {
         upperRecurrent: Bool = false,
         learnedBeta: Bool = false,
         inputNorm: Bool = false,
-        inputNormGainInit: Float = 1.0
+        inputNormGainInit: Float = 1.0,
+        gatedMemory: Bool = false
     ) {
         self.numLayers = max(1, numLayers)
         self.inputDim = inputDim
@@ -160,6 +163,9 @@ public final class SpikingNetwork: @unchecked Sendable {
             }
         }
         self.pInputNormGains = normList
+        if gatedMemory {
+            self.gateLayers = SpikingNetworkWeights.initialGateLayers(numLayers: self.numLayers, hidden: maxHiddenDim)
+        }
         self.pWOut = Parameter(count: outputDim * maxHiddenDim, initialData: initWOut)
         self.pBOut = Parameter(count: outputDim, initialData: initBOut)
 
@@ -177,7 +183,8 @@ public final class SpikingNetwork: @unchecked Sendable {
             lifConfig: weights.lifConfig,
             upperRecurrent: weights.hasUpperRecurrence,
             learnedBeta: weights.hasLearnedBeta,
-            inputNorm: weights.hasInputNorm
+            inputNorm: weights.hasInputNorm,
+            gatedMemory: weights.hasGatedMemory
         )
         self.importWeights(from: weights)
     }
@@ -216,6 +223,7 @@ public final class SpikingNetwork: @unchecked Sendable {
             wRecLayers: exportedRecLayers(),
             betaLayers: exportedBetaLayers(),
             inputNormGains: exportedNormGains(),
+            gateLayers: gateLayers,
             wOut: pWOut.data,
             bOut: pBOut.data,
             vocabularyCharacters: vocabulary?.serializedCharacters
@@ -294,6 +302,9 @@ public final class SpikingNetwork: @unchecked Sendable {
                 }
                 gi += 1
             }
+        }
+        if let gates = weightsData.gateLayers, let current = gateLayers, gates.count == current.count {
+            gateLayers = gates
         }
         if weightsData.wOut.count == pWOut.data.count {
             pWOut.data = weightsData.wOut

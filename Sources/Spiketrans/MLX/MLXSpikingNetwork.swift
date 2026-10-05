@@ -28,6 +28,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     public var betaLogits: [MLXArray]  // 各 [maxHiddenDim]、層 0 から numLayers 本
     /// 各層の LIF に入る電流全体 (残差込み) を RMSNorm するときのゲイン。正規化しない構成では空
     public var inputNormGains: [MLXArray]  // 各 [maxHiddenDim]、層 0 から numLayers 本
+    /// ゲート付き記憶 (RG-LRU 型) の係数。行の意味は `SpikingNetworkWeights.gateLayers`。無い構成では空
+    public var gateParams: [MLXArray]  // 各 [gateRows, maxHiddenDim]、層 0 から numLayers 本
     /// 声の種類の補助ヘッド [wVoice [maxHiddenDim, voiceClasses], bVoice [voiceClasses]]。無い構成では空
     public var voiceHead: [MLXArray]
     /// 事前学習の予測ヘッド [wPred [maxHiddenDim, n * inputDim], bPred [n * inputDim]] (n = 予測先の数)。無い構成では空
@@ -58,6 +60,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         inputNorm: Bool = false,
         inputNormGainInit: Float = 1.0,
         voiceHead: Bool = false,
+        gatedMemory: Bool = false,
         predictionHead: Bool = false,
         predictionTargets: Int = 1,
         predictionClasses: Int = 0
@@ -127,6 +130,13 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             }
         }
         self.inputNormGains = normGains
+        var gates: [MLXArray] = []
+        if gatedMemory {
+            for layer in SpikingNetworkWeights.initialGateLayers(numLayers: self.numLayers, hidden: maxHiddenDim) {
+                gates.append(MLXArray(layer, [SpikingNetworkWeights.gateRows, maxHiddenDim]))
+            }
+        }
+        self.gateParams = gates
         var head: [MLXArray] = []
         if voiceHead {
             let classes = SpikingNetworkWeights.voiceClasses
@@ -164,6 +174,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             learnedBeta: weights.hasLearnedBeta,
             inputNorm: weights.hasInputNorm,
             voiceHead: weights.hasVoiceHead,
+            gatedMemory: weights.hasGatedMemory,
             predictionHead: weights.hasPredictionHead,
             predictionTargets: max(1, weights.predictionTargets)
         )
@@ -236,6 +247,9 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
                 params["inputNormGains"] = .array(layerGain)
             }
         }
+        if let gates = data.gateLayers, gates.count == self.gateParams.count {
+            params["gateParams"] = .array(gates.map { .value(MLXArray($0, [SpikingNetworkWeights.gateRows, hSize])) })
+        }
         if let w = data.wPred, let b = data.bPred, self.predictionHead.count == 2 {
             params["predictionHead"] = .array([
                 .value(MLXArray(w, [b.count, hSize]).transposed()),
@@ -266,6 +280,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         arraysToEval.append(contentsOf: wRecLayers)
         arraysToEval.append(contentsOf: betaLogits)
         arraysToEval.append(contentsOf: inputNormGains)
+        arraysToEval.append(contentsOf: gateParams)
         arraysToEval.append(contentsOf: voiceHead)
         arraysToEval.append(contentsOf: predictionHead)
         eval(arraysToEval)
@@ -291,6 +306,10 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
         var normGains: [[Float]]? = nil
         if inputNormGains.isEmpty != true {
             normGains = inputNormGains.map { $0.asArray(Float.self) }
+        }
+        var gates: [[Float]]? = nil
+        if gateParams.isEmpty != true {
+            gates = gateParams.map { $0.asArray(Float.self) }
         }
         var wPred: [Float]? = nil
         var bPred: [Float]? = nil
@@ -320,6 +339,7 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
             wRecLayers: rl,
             betaLayers: betas,
             inputNormGains: normGains,
+            gateLayers: gates,
             wVoice: wVoice,
             bVoice: bVoice,
             wPred: wPred,
