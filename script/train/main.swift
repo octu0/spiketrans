@@ -51,8 +51,8 @@ enum Defaults {
     /// CPU 推論は発火前提なので、評価の音響モデル推論も MLX で行う
     static let continuousSpikes = false
     /// 各層にゲート付き記憶 (RG-LRU 型: 発火でリセットされず、残す割合を入力で決める連続値の記憶) を持たせるか。
-    /// CPU 推論は未対応なので、評価の音響モデル推論は MLX で行う
-    static let gatedMemory = false
+    /// 1.7 万件・8 epoch で実況 73.7 → 71.2%、告知 39.6 → 36.4%。学習は約 1.4 倍、CPU 推論の記憶の計算は約 5%
+    static let gatedMemory = true
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
@@ -1370,8 +1370,8 @@ if trainEvalTarget < sampleLimit {
 print("全 \(evalPairs.count) 件の WAV 読み込み・並列推論実行中 (\(evalWorkers) ワーカー)...")
 let evalStartTime = Date()
 let evalMLX = EvalLogProbBuffer(count: evalPairs.count)
-if Defaults.continuousSpikes || Defaults.gatedMemory {
-    print("  連続値の対照・ゲート付き記憶: 音響モデルの推論を MLX で行う")
+if Defaults.continuousSpikes {
+    print("  連続値の対照: 音響モデルの推論を MLX で行う")
     let evalNet = MLXSpikingNetwork(weights: trainer.acousticNetwork.exportWeights(vocabulary: phoneticVocabulary))
     evalNet.continuousSpikes = Defaults.continuousSpikes
     let evalRunner = MLXBPTTTrainer(network: evalNet)

@@ -188,10 +188,10 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
 
     /// ゲート付き記憶の係数の行数 (Λ, 保持ゲート重み, 同バイアス, 入力ゲート重み, 同バイアス, 出力の重み)
     public static let gateRows = 6
-    /// 保持ゲート r に対するサブステップあたりの減衰 = sigmoid(Λ)^(gateDecayExponent * r) (RG-LRU の c)
+    /// 保持ゲート r に対する 1 回の更新あたりの減衰 = sigmoid(Λ)^(gateDecayExponent * r) (RG-LRU の c)。記憶は 1 フレームに 1 回更新する
     public static let gateDecayExponent: Float = 8.0
-    /// 減衰の初期値の時定数の範囲 (サブステップ = 10 ms 単位)。保持ゲート 0.5 のとき 40 ms 〜 4 秒を対数等間隔に並べる
-    public static let gateTimeConstantRange: ClosedRange<Float> = 4.0...400.0
+    /// 減衰の初期値の時定数の範囲 (フレーム = 40 ms 単位)。保持ゲート 0.5 のとき 40 ms 〜 4 秒を対数等間隔に並べる
+    public static let gateTimeConstantRange: ClosedRange<Float> = 1.0...100.0
 
     /// ゲート付き記憶の初期値。ゲートは入力によらず 0.5 から、出力の重みは 0 から始める
     /// (学習の始めは記憶の無いネットワークと同じ出力になる)

@@ -117,7 +117,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     /// 層 0 は再帰、層 1 以降は前層スパイクの RMSNorm 電流 + 前層電流の残差 (+ 再帰構成なら同じ層の直前スパイクの再帰電流)。
     /// 入力正規化の構成では、各層の LIF に入るのは残差電流全体を RMSNorm してゲインを掛けたもの (残差そのものは正規化しない)。
     /// 最終層だけハードリセットせず、閾値単位の膜電位を読んでから余りを残す
-    func substep(network: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] {
+    func substep(network: MLXSpikingNetwork, arrays: [MLXArray], updatesMemory: Bool) -> [MLXArray] {
         let numLayers = network.numLayers
         let beta = network.lifConfig.beta
         let vTh = network.lifConfig.vTh
@@ -154,12 +154,15 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             let gated = l < network.gateParams.count
             if gated {
                 // ゲート付き記憶 (RG-LRU 型): 発火でリセットされない連続値の記憶。状態は a[l] に持つ。
-                // 残す割合を入力に応じて毎サブステップ決め、出力の重みを掛けて残差に足す
+                // 1 フレームに 1 回 (最初のサブステップで) 残す割合を入力に応じて決めて更新し、
+                // 出力の重みを掛けて毎サブステップ残差に足す
                 let g = network.gateParams[l]
-                let keep = sigmoid(g[1] * own + g[2])
-                let admit = sigmoid(g[3] * own + g[4])
-                let decay = exp((SpikingNetworkWeights.gateDecayExponent * keep) * log(sigmoid(g[0])))
-                a[l] = decay * a[l] + sqrt(1.0 - decay * decay + 1e-6) * (admit * own)
+                if updatesMemory {
+                    let keep = sigmoid(g[1] * own + g[2])
+                    let admit = sigmoid(g[3] * own + g[4])
+                    let decay = exp((SpikingNetworkWeights.gateDecayExponent * keep) * log(sigmoid(g[0])))
+                    a[l] = decay * a[l] + sqrt(1.0 - decay * decay + 1e-6) * (admit * own)
+                }
                 stream = stream + g[5] * a[l]
             }
             var current = stream
@@ -310,7 +313,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 inputs.append(contentsOf: v)
                 inputs.append(contentsOf: s)
                 inputs.append(contentsOf: a)
-                let out = substep(network: network, arrays: inputs)
+                let out = substep(network: network, arrays: inputs, updatesMemory: step == 0)
                 v = Array(out[0..<numLayers])
                 s = Array(out[numLayers..<(2 * numLayers)])
                 a = Array(out[(2 * numLayers)..<(3 * numLayers)])
@@ -417,7 +420,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             var sum = MLXArray.zeros([batchSize, hMax])
             var step = 0
             while step < tSteps {
-                let out = substep(network: network, arrays: [currentSeq0[0..., t, 0...]] + v + s + a)
+                let out = substep(network: network, arrays: [currentSeq0[0..., t, 0...]] + v + s + a, updatesMemory: step == 0)
                 v = Array(out[0..<numLayers])
                 s = Array(out[numLayers..<(2 * numLayers)])
                 a = Array(out[(2 * numLayers)..<(3 * numLayers)])

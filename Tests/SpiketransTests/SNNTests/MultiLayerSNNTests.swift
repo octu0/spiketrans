@@ -387,6 +387,76 @@ final class MultiLayerSNNTests: XCTestCase {
         }
     }
 
+    /// ゲート付き記憶の係数を 0 でない値にして、MLX (学習側) と Pure Swift (推論側) のロジットが一致する。
+    /// 記憶は 1 フレームに 1 回更新され、フレームをまたいで aPrev に残る
+    func testGatedMemoryForwardMatchesBetweenMLXAndPureSwift() {
+        for upperRecurrent in [false, true] {
+            let inputDim = 16
+            let hidden = 64
+            let outputDim = 12
+            let frames = 12
+            let layers = 3
+            let mlxNet = MLXSpikingNetwork(
+                numLayers: layers, inputDim: inputDim, maxHiddenDim: hidden, outputDim: outputDim, timeSteps: 4,
+                upperRecurrent: upperRecurrent, gatedMemory: true
+            )
+            mlxNet.wIn = mlxNet.wIn * 4.0
+            var l = 0
+            while l < layers {
+                let g = mlxNet.gateParams[l]
+                let rows: [MLXArray] = [
+                    g[0],
+                    MLXArray.ones([hidden]) * 0.3,
+                    MLXArray.ones([hidden]) * 0.1,
+                    MLXArray.ones([hidden]) * -0.2,
+                    MLXArray.ones([hidden]) * 0.2,
+                    MLXArray.ones([hidden]) * Float(0.5 + 0.2 * Float(l))
+                ]
+                mlxNet.gateParams[l] = stacked(rows, axis: 0)
+                l += 1
+            }
+            let cpuNet = SpikingNetwork(weights: mlxNet.exportWeights())
+
+            let features = makeFeatures(frames: frames, dim: inputDim)
+            var flat: [Float] = []
+            for frame in features {
+                flat.append(contentsOf: frame)
+            }
+            let trainer = MLXBPTTTrainer(network: mlxNet, bpttWindow: 4)
+            let mlxLogits = trainer.logitsBatch(network: mlxNet, features: MLXArray(flat, [1, frames, inputDim]))
+            eval(mlxLogits)
+            let mlxFlat = mlxLogits.asArray(Float.self)
+
+            var vPrev = [Float](repeating: 0.0, count: layers * hidden)
+            var sPrev = [Float](repeating: 0.0, count: layers * hidden)
+            var aPrev = [Float](repeating: 0.0, count: layers * hidden)
+            var readoutSum = [Float](repeating: 0.0, count: hidden)
+            var logits = [Float](repeating: 0.0, count: outputDim)
+            var probs = [Float](repeating: 0.0, count: outputDim)
+            let scratch = ForwardScratch(maxHiddenDim: hidden)
+            var t = 0
+            while t < frames {
+                cpuNet.forward(
+                    features: features[t], vPrev: &vPrev, sPrev: &sPrev, aPrev: &aPrev,
+                    readoutSum: &readoutSum, logits: &logits, probabilities: &probs, scratch: scratch
+                )
+                var c = 0
+                while c < outputDim {
+                    XCTAssertEqual(logits[c], mlxFlat[t * outputDim + c], accuracy: 1e-3, "rec \(upperRecurrent) frame \(t) class \(c)")
+                    c += 1
+                }
+                t += 1
+            }
+            var nonZero = 0
+            for value in aPrev {
+                if value != 0.0 {
+                    nonZero += 1
+                }
+            }
+            XCTAssertLessThan(layers * hidden / 2, nonZero)
+        }
+    }
+
     /// ゲート付き記憶の構成で CTC 学習が進み、記憶の出力の重みとゲートの係数が動く
     func testGatedMemoryCTCTrainingUpdatesGates() {
         let inputDim = 16

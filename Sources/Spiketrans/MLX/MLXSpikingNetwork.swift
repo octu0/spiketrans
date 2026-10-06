@@ -28,7 +28,8 @@ public final class MLXSpikingNetwork: Module, @unchecked Sendable {
     public var betaLogits: [MLXArray]  // 各 [maxHiddenDim]、層 0 から numLayers 本
     /// 各層の LIF に入る電流全体 (残差込み) を RMSNorm するときのゲイン。正規化しない構成では空
     public var inputNormGains: [MLXArray]  // 各 [maxHiddenDim]、層 0 から numLayers 本
-    /// ゲート付き記憶 (RG-LRU 型) の係数。行の意味は `SpikingNetworkWeights.gateLayers`。無い構成では空
+    /// ゲート付き記憶 (RG-LRU 型) の係数。行の意味は `SpikingNetworkWeights.gateLayers`。無い構成では空。
+    /// 記憶の状態は適応閾値の状態 a に持つので、適応閾値とは併用しない
     public var gateParams: [MLXArray]  // 各 [gateRows, maxHiddenDim]、層 0 から numLayers 本
     /// 声の種類の補助ヘッド [wVoice [maxHiddenDim, voiceClasses], bVoice [voiceClasses]]。無い構成では空
     public var voiceHead: [MLXArray]

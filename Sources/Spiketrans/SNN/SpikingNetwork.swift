@@ -36,8 +36,14 @@ public final class SpikingNetwork: @unchecked Sendable {
     public let pBetaLayers: [Parameter]
     /// 各層の LIF に入る電流全体を RMSNorm するときのゲイン (層 0 から numLayers 本)。正規化しない構成では空
     public let pInputNormGains: [Parameter]
-    /// ゲート付き記憶の係数 (`SpikingNetworkWeights.gateLayers`)。CPU 推論は未対応で、保存と受け渡しだけ行う
-    public private(set) var gateLayers: [[Float]]?
+    /// ゲート付き記憶の係数 (`SpikingNetworkWeights.gateLayers`)。記憶の状態は aPrev に持つ (適応閾値とは排他)
+    public private(set) var gateLayers: [[Float]]? {
+        didSet {
+            refreshGateCache()
+        }
+    }
+    /// 層ごとの log sigmoid(Λ) (推論のたびに計算しない)
+    private var gateLogDecay: [[Float]] = []
 
     // リードアウト
     public let pWOut: Parameter        // [outputDim, maxHiddenDim]
@@ -163,13 +169,15 @@ public final class SpikingNetwork: @unchecked Sendable {
             }
         }
         self.pInputNormGains = normList
-        if gatedMemory {
-            self.gateLayers = SpikingNetworkWeights.initialGateLayers(numLayers: self.numLayers, hidden: maxHiddenDim)
-        }
         self.pWOut = Parameter(count: outputDim * maxHiddenDim, initialData: initWOut)
         self.pBOut = Parameter(count: outputDim, initialData: initBOut)
 
         rebuildInferenceLayout()
+        if gatedMemory {
+            precondition(lifConfig.gamma == 0.0, "ゲート付き記憶は適応閾値の状態を記憶に使うので、適応閾値 (gamma > 0) とは併用できない")
+            self.gateLayers = SpikingNetworkWeights.initialGateLayers(numLayers: self.numLayers, hidden: maxHiddenDim)
+            refreshGateCache()
+        }
     }
 
     /// 保存済み重みから構成ごと復元する
@@ -315,6 +323,81 @@ public final class SpikingNetwork: @unchecked Sendable {
         rebuildInferenceLayout()
     }
 
+    private func refreshGateCache() {
+        guard let gates = gateLayers else {
+            gateLogDecay = []
+            return
+        }
+        let hidden = maxHiddenDim
+        gateLogDecay = gates.map { g in
+            var out = [Float](repeating: 0.0, count: hidden)
+            var n = 0
+            while n < hidden {
+                // log sigmoid(x) = -log(1 + exp(-x))
+                out[n] = -log1pf(expf(-g[n]))
+                n += 1
+            }
+            return out
+        }
+    }
+
+    /// ゲート付き記憶を 1 層ぶん更新し (1 フレームに 1 回)、記憶の出力 m = w_o ⊙ h を out に書く。
+    /// own はその層が残差に足す電流 (学習側 `MLXBPTTTrainer.substep` の own)
+    @inline(__always)
+    private func updateGatedMemory(
+        layer: Int,
+        own: UnsafePointer<Float>,
+        h: UnsafeMutablePointer<Float>,
+        out: UnsafeMutablePointer<Float>,
+        count: Int
+    ) {
+        guard let gates = gateLayers, layer < gates.count else {
+            return
+        }
+        let hidden = maxHiddenDim
+        let c = SpikingNetworkWeights.gateDecayExponent
+        gates[layer].withUnsafeBufferPointer { gBuf in
+            gateLogDecay[layer].withUnsafeBufferPointer { lBuf in
+                let g = gBuf.baseAddress!
+                let logDecay = lBuf.baseAddress!
+                let limit = count - (count % 8)
+                let cVec = SIMD8<Float>(repeating: c)
+                let one = SIMD8<Float>(repeating: 1.0)
+                let eps = SIMD8<Float>(repeating: 1e-6)
+                let zero = SIMD8<Float>(repeating: 0.0)
+                var n = 0
+                while n < limit {
+                    let u = UnsafeRawPointer(own.advanced(by: n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let wr = UnsafeRawPointer(g.advanced(by: hidden + n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let br = UnsafeRawPointer(g.advanced(by: 2 * hidden + n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let wi = UnsafeRawPointer(g.advanced(by: 3 * hidden + n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let bi = UnsafeRawPointer(g.advanced(by: 4 * hidden + n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let wo = UnsafeRawPointer(g.advanced(by: 5 * hidden + n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let ld = UnsafeRawPointer(logDecay.advanced(by: n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let hPrev = UnsafeRawPointer(h.advanced(by: n)).loadUnaligned(as: SIMD8<Float>.self)
+                    let keep = SIMDMath.sigmoid(wr * u + br)
+                    let admit = SIMDMath.sigmoid(wi * u + bi)
+                    let decay = SIMDMath.exp((cVec * keep) * ld)
+                    var gain = one - decay * decay + eps
+                    gain = gain.replacing(with: zero, where: gain .< zero)
+                    let hNext = decay * hPrev + gain.squareRoot() * (admit * u)
+                    UnsafeMutableRawPointer(h.advanced(by: n)).storeBytes(of: hNext, as: SIMD8<Float>.self)
+                    UnsafeMutableRawPointer(out.advanced(by: n)).storeBytes(of: wo * hNext, as: SIMD8<Float>.self)
+                    n += 8
+                }
+                while n < count {
+                    let u = own[n]
+                    let keep = 1.0 / (1.0 + expf(-(g[hidden + n] * u + g[2 * hidden + n])))
+                    let admit = 1.0 / (1.0 + expf(-(g[3 * hidden + n] * u + g[4 * hidden + n])))
+                    let decay = expf((c * keep) * logDecay[n])
+                    h[n] = decay * h[n] + sqrtf(max(0.0, 1.0 - decay * decay + 1e-6)) * (admit * u)
+                    out[n] = g[5 * hidden + n] * h[n]
+                    n += 1
+                }
+            }
+        }
+    }
+
     /// 推論用の転置レイアウトを再構築する。
     public func rebuildInferenceLayout() {
         let hSize = maxHiddenDim
@@ -423,6 +506,9 @@ public final class SpikingNetwork: @unchecked Sendable {
             vPrev = [Float](repeating: 0.0, count: totalStateSize)
             sPrev = [Float](repeating: 0.0, count: totalStateSize)
             aPrev = [Float](repeating: 0.0, count: totalStateSize)
+        }
+        if gateLayers != nil && scratch.memoryOut.count < totalStateSize {
+            scratch.memoryOut = [Float](repeating: 0.0, count: totalStateSize)
         }
 
         // 1. 読み出し用の膜電位積算をリセット
@@ -548,6 +634,24 @@ public final class SpikingNetwork: @unchecked Sendable {
                 }
             }
 
+            let gated = gateLayers != nil
+            if gated {
+                // 記憶の出力は 1 フレームに 1 回 (最初のサブステップで) 更新し、毎サブステップ電流に足す
+                scratch.stepCurrents.withUnsafeMutableBufferPointer { stepBuf in
+                    scratch.memoryOut.withUnsafeMutableBufferPointer { memBuf in
+                        if t == 0 {
+                            aPrev.withUnsafeMutableBufferPointer { aBuf in
+                                updateGatedMemory(
+                                    layer: 0, own: UnsafePointer(stepBuf.baseAddress!), h: aBuf.baseAddress!,
+                                    out: memBuf.baseAddress!, count: hSize
+                                )
+                            }
+                        }
+                        Self.addRow(UnsafePointer(memBuf.baseAddress!), to: stepBuf.baseAddress!, count: hSize)
+                    }
+                }
+            }
+
             if 1 < numLayers {
                 scratch.stepCurrentsPrev.withUnsafeMutableBufferPointer { prevBuf in
                     scratch.stepCurrents.withUnsafeBufferPointer { curBuf in
@@ -566,7 +670,7 @@ public final class SpikingNetwork: @unchecked Sendable {
                                     layer: 0,
                                     vPtr: vBuf.baseAddress!,
                                     sPtr: sBuf.baseAddress!,
-                                    aPtr: aBuf.baseAddress!,
+                                    aPtr: adaptPointer(aBuf.baseAddress!, gated: gated, scratch: scratch),
                                     curPtr: curBuf.baseAddress!,
                                     readoutSumPtr: sumBuf.baseAddress!,
                                     count: hSize,
@@ -645,9 +749,11 @@ public final class SpikingNetwork: @unchecked Sendable {
                 let gammaData = pGammaRMS[upperIdx].data
                 scratch.stepCurrents.withUnsafeMutableBufferPointer { stepBuf in
                     scratch.stepCurrentsPrev.withUnsafeMutableBufferPointer { prevBuf in
+                        scratch.ownCurrents.withUnsafeMutableBufferPointer { ownBuf in
                         gammaData.withUnsafeBufferPointer { gammaBuf in
                             let step = stepBuf.baseAddress!
                             let prev = prevBuf.baseAddress!
+                            let own = ownBuf.baseAddress!
                             let gamma = gammaBuf.baseAddress!
 
                             // RMS 計算
@@ -687,6 +793,7 @@ public final class SpikingNetwork: @unchecked Sendable {
                                     prev[n+4], prev[n+5], prev[n+6], prev[n+7]
                                 )
                                 let norm = (raw * invRmsVec) * g
+                                UnsafeMutableRawPointer(own.advanced(by: n)).storeBytes(of: norm, as: SIMD8<Float>.self)
                                 let totalCur = norm + p
                                 step[n+0] = totalCur[0]
                                 step[n+1] = totalCur[1]
@@ -700,6 +807,7 @@ public final class SpikingNetwork: @unchecked Sendable {
                             }
                             while n < hSize {
                                 let norm = (step[n] * invRms) * gamma[n]
+                                own[n] = norm
                                 step[n] = norm + prev[n]
                                 n += 1
                             }
@@ -708,6 +816,7 @@ public final class SpikingNetwork: @unchecked Sendable {
                             if (layerIdx + 1) < numLayers {
                                 prev.update(from: step, count: hSize)
                             }
+                        }
                         }
                     }
                 }
@@ -736,7 +845,38 @@ public final class SpikingNetwork: @unchecked Sendable {
                                     if hasNext {
                                         Self.addRow(row, to: prevBuf.baseAddress!, count: hSize)
                                     }
+                                    if gated {
+                                        scratch.ownCurrents.withUnsafeMutableBufferPointer { ownBuf in
+                                            Self.addRow(row, to: ownBuf.baseAddress!, count: hSize)
+                                        }
+                                    }
                                     a += 1
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if gated {
+                    let hasNext = (layerIdx + 1) < numLayers
+                    scratch.stepCurrents.withUnsafeMutableBufferPointer { stepBuf in
+                        scratch.stepCurrentsPrev.withUnsafeMutableBufferPointer { prevBuf in
+                            scratch.memoryOut.withUnsafeMutableBufferPointer { memBuf in
+                                let mem = memBuf.baseAddress!.advanced(by: thisLayerOffset)
+                                if t == 0 {
+                                    aPrev.withUnsafeMutableBufferPointer { aBuf in
+                                        scratch.ownCurrents.withUnsafeBufferPointer { ownBuf in
+                                            updateGatedMemory(
+                                                layer: layerIdx, own: ownBuf.baseAddress!,
+                                                h: aBuf.baseAddress!.advanced(by: thisLayerOffset),
+                                                out: mem, count: hSize
+                                            )
+                                        }
+                                    }
+                                }
+                                Self.addRow(UnsafePointer(mem), to: stepBuf.baseAddress!, count: hSize)
+                                if hasNext {
+                                    Self.addRow(UnsafePointer(mem), to: prevBuf.baseAddress!, count: hSize)
                                 }
                             }
                         }
@@ -753,7 +893,7 @@ public final class SpikingNetwork: @unchecked Sendable {
                                         layer: layerIdx,
                                         vPtr: vBuf.baseAddress!.advanced(by: thisLayerOffset),
                                         sPtr: sBuf.baseAddress!.advanced(by: thisLayerOffset),
-                                        aPtr: aBuf.baseAddress!.advanced(by: thisLayerOffset),
+                                        aPtr: adaptPointer(aBuf.baseAddress!.advanced(by: thisLayerOffset), gated: gated, scratch: scratch),
                                         curPtr: curBuf.baseAddress!,
                                         readoutSumPtr: sumBuf.baseAddress!,
                                         count: hSize,
@@ -867,6 +1007,7 @@ public final class SpikingNetwork: @unchecked Sendable {
     }
 
     /// `aPrev` と `ForwardScratch` を都度確保する版。ストリーミングでは使わない。
+    /// 適応閾値・ゲート付き記憶の状態はフレームをまたいで残らないので、それらの構成の音響モデルには使えない
     public func forward(
         features: [Float],
         vPrev: inout [Float],
@@ -887,6 +1028,15 @@ public final class SpikingNetwork: @unchecked Sendable {
             probabilities: &probabilities,
             scratch: scratch
         )
+    }
+
+    /// LIF に渡す適応閾値の状態。ゲート付き記憶の構成では a を記憶に使うので、常に 0 の作業領域を渡して適応閾値を無効にする
+    @inline(__always)
+    private func adaptPointer(_ a: UnsafeMutablePointer<Float>, gated: Bool, scratch: ForwardScratch) -> UnsafeMutablePointer<Float> {
+        if gated {
+            return scratch.adaptZeros
+        }
+        return a
     }
 
     /// dst[0..<count] に row を足す
@@ -1025,6 +1175,16 @@ public final class ForwardScratch: @unchecked Sendable {
     public var activeReadoutIndices: [Int]
     public var activeRates: [Float]
     public var readoutSums: [Float]
+    /// ゲート付き記憶の構成で、各層が残差に足す電流
+    public var ownCurrents: [Float]
+    /// ゲート付き記憶の構成で、各層の記憶の出力 (1 フレームに 1 回更新) [層数 × 幅]
+    public var memoryOut: [Float]
+    /// ゲート付き記憶の構成で LIF に渡す適応閾値の状態 (gamma = 0 なので常に 0 のまま)
+    public let adaptZeros: UnsafeMutablePointer<Float>
+
+    deinit {
+        adaptZeros.deallocate()
+    }
 
     public init(maxHiddenDim: Int) {
         let size = max(1, maxHiddenDim)
@@ -1037,5 +1197,9 @@ public final class ForwardScratch: @unchecked Sendable {
         self.activeReadoutIndices = [Int](repeating: 0, count: size)
         self.activeRates = [Float](repeating: 0.0, count: size)
         self.readoutSums = []
+        self.ownCurrents = [Float](repeating: 0.0, count: size)
+        self.memoryOut = []
+        self.adaptZeros = UnsafeMutablePointer<Float>.allocate(capacity: size)
+        self.adaptZeros.initialize(repeating: 0.0, count: size)
     }
 }
