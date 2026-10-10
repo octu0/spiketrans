@@ -9,7 +9,7 @@ import Spiketrans
 //   HuBERT 型: 先に k-means で特徴量のクラス中心を作り、入力の区間を隠して、隠したフレームのクラス番号を当てる (交差エントロピー)
 //     pretrain -d <マニフェスト> --kmeans <中心.json>                 (中心を作って終わる)
 //     pretrain -d <マニフェスト> -e <epoch> --targets <中心.json> --export-weights <json>
-//   HuBERT 型の 2 周目: 事前学習済みの先生 (--teacher) の層 Config.teacherLayer の発火率を k-means して目標にし、新しいモデルを学習
+//   HuBERT 型の 2 周目: 事前学習済みのモデル (--teacher) の層 Config.teacherLayer の発火率を k-means して教師データにし、新しいモデルを学習
 //     pretrain -d <マニフェスト> --kmeans <中心.json> --teacher <重み.json>
 //     pretrain -d <マニフェスト> -e <epoch> --targets <中心.json> --teacher <重み.json> --export-weights <json>
 //
@@ -36,7 +36,7 @@ enum Config {
     static let predictShifts = [SpikingNetworkWeights.predictShift]
     /// HuBERT 型: クラス数、k-means に使うフレーム数と反復回数
     static let clusterCount = 256
-    /// HuBERT 型の 2 周目: 先生の目標にする層 (8 層中 6 番目) と、そのときのクラス数 (本家 HuBERT の 2 周目と同じ 500)
+    /// HuBERT 型の 2 周目: 教師データを作る層 (8 層中 6 番目) と、そのときのクラス数 (本家 HuBERT の 2 周目と同じ 500)
     static let teacherLayer = 5
     static let teacherClusterCount = 500
     static let teacherKmeansFrames = 100_000
@@ -161,19 +161,19 @@ var totalSeconds = 0.0
 for w in windows {
     totalSeconds += Double(w.length) * 0.04
 }
-// 2 周目の先生 (重みは固定、目標を作るだけ)
+// 2 周目の教師データを生成するモデル (重みは固定、教師データを作るだけ)
 var teacherTrainer: MLXBPTTTrainer? = nil
 if teacherPath.isEmpty != true {
     guard let tw = try? SpikingNetworkWeights.load(from: URL(fileURLWithPath: teacherPath)) else {
-        print("エラー: 先生の重みが読めません: \(teacherPath)")
+        print("エラー: 教師データ生成モデルの重みが読めません: \(teacherPath)")
         exit(1)
     }
     teacherTrainer = MLXBPTTTrainer(network: MLXSpikingNetwork(weights: tw), bpttWindow: Config.bpttWindow)
-    print("先生: \(teacherPath) の層 \(Config.teacherLayer) の発火率を目標にする")
+    print("教師データ生成モデル: \(teacherPath) の層 \(Config.teacherLayer) の発火率から教師データを作る")
 }
 
 // k-means: 無作為に選んだ発話から最大 kmeansFrames フレームを集めて中心を作り、保存して終わる。
-// 先生があれば、そのフレームの特徴量ではなく先生の層の発火率を集める
+// 教師データ生成モデルがあれば、そのフレームの特徴量ではなくそのモデルの層の発火率を集める
 if kmeansOutPath.isEmpty != true {
     var frames: [[Float]] = []
     var order = Array(0..<paths.count).shuffled()

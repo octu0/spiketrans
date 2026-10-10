@@ -482,6 +482,50 @@ final class MultiLayerSNNTests: XCTestCase {
         XCTAssertNotEqual(Array(after[1][hidden..<(2 * hidden)]), Array(before[1][hidden..<(2 * hidden)]))
     }
 
+    /// 表現をそろえる損失の勾配の式が自動微分と一致する
+    func testConsistencyGradientMatchesAutograd() {
+        let rates = MLXRandom.uniform(low: 0.0, high: 1.0, [2, 5, 8])
+        let targets = MLXRandom.uniform(low: 0.0, high: 1.0, [2, 5, 8])
+        let mask = MLXArray([1, 1, 1, 0, 0, 1, 1, 1, 1, 1] as [Float], [2, 5])
+        let auto = grad { (r: MLXArray) -> MLXArray in
+            MLXBPTTTrainer.consistencyLoss(rates: r, targets: targets, mask: mask)
+        }(rates)
+        let manual = MLXBPTTTrainer.consistencyGradient(rates: rates, targets: targets, mask: mask)
+        eval(auto, manual)
+        let a = auto.asArray(Float.self)
+        let m = manual.asArray(Float.self)
+        var i = 0
+        while i < a.count {
+            XCTAssertEqual(a[i], m[i], accuracy: 1e-6)
+            i += 1
+        }
+    }
+
+    /// 雑音を重ねた入力ときれいな入力が同じなら表現をそろえる損失は 0、違えば正。
+    /// 短い系列 (compile 済みのステップ) と長い系列 (チャンク分割の逆伝播) の両方で学習が進む
+    func testConsistencyLossZeroForCleanAndPositiveForNoisy() {
+        let inputDim = 16
+        for frames in [24, 300] {
+            let mlxNet = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8, gatedMemory: true)
+            mlxNet.wIn = mlxNet.wIn * 4.0
+            let trainer = MLXBPTTTrainer(network: mlxNet, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
+            trainer.consistencyWeight = 1.0
+            let clean: [[[Float]]] = [makeFeatures(frames: frames, dim: inputDim), makeFeatures(frames: frames - 4, dim: inputDim)]
+            let noisy: [[[Float]]] = clean.map { seq in
+                seq.enumerated().map { (t, frame) in
+                    frame.enumerated().map { (d, x) in x + 0.8 * sin(Float(t * 3 + d * 5)) }
+                }
+            }
+            let targets: [[Int]] = [[1, 2, 3, 2], [4, 5, 6]]
+            let same = trainer.trainBatchCTC(featuresBatch: clean, targetsBatch: targets, cleanFeaturesBatch: clean)
+            XCTAssertFalse(same.isNaN, "frames \(frames)")
+            XCTAssertEqual(trainer.lastConsistencyLoss, 0.0, accuracy: 1e-7, "frames \(frames)")
+            let mixed = trainer.trainBatchCTC(featuresBatch: noisy, targetsBatch: targets, cleanFeaturesBatch: clean)
+            XCTAssertFalse(mixed.isNaN, "frames \(frames)")
+            XCTAssertLessThan(0.0, trainer.lastConsistencyLoss, "frames \(frames)")
+        }
+    }
+
     func testTwoLayerCTCTrainingReducesLoss() {
         let inputDim = 16
         let outputDim = 8

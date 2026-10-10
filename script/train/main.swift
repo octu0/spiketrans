@@ -47,12 +47,21 @@ enum Defaults {
     /// マニフェストの "voice": [[開始秒, 終了秒, クラス], ...] を教師にする (無い行は除く)
     static let voiceHead = false
     static let voiceLossWeight: Float = 0.3
+    /// 雑音の有無で中間層の表現をそろえる損失の重み (0 なら使わない)。雑音バンク (--noise-bank) で雑音を重ねた入力の
+    /// 層 voiceLayer の発火率を、同じ発話のきれいな入力の発火率 (勾配なし) に近づける。CTC は雑音を重ねた入力で学習する。
+    /// 話速の変化・SpecAugment・声の種類の補助ヘッドとは併用しない
+    static let noiseConsistencyWeight: Float = 0.0
     /// 発火 (0/1) の代わりに、閾値の前後だけ連続値になる出力を次の層へ渡す対照実験 (0/1 への量子化が学習を妨げているかの切り分け)。
     /// CPU 推論は発火前提なので、評価の音響モデル推論も MLX で行う
     static let continuousSpikes = false
     /// 各層にゲート付き記憶 (RG-LRU 型: 発火でリセットされず、残す割合を入力で決める連続値の記憶) を持たせるか。
     /// 1.7 万件・8 epoch で実況 73.7 → 71.2%、告知 39.6 → 36.4%。学習は約 1.4 倍、CPU 推論の記憶の計算は約 5%
     static let gatedMemory = true
+
+    /// 学習に使う発話の最大フレーム数 (40 ms 単位、60 秒)。CTC 損失は計算グラフの深さが発話長に比例し、
+    /// 逆伝播でグラフを再帰でたどるため、極端に長い発話 (TTS の生成の暴走など) でスタックがあふれて落ちる。
+    /// 実データの発話は最長 38 秒
+    static let maxTrainFrames = 1500
 
     /// 切り詰め BPTT の窓幅 (フレーム単位)。
     /// 1 だとフレーム間の信用割り当てが消え、16 では発散した。
@@ -533,6 +542,14 @@ if epochs == 0 {
         bpttWindow: Defaults.bpttWindow
     )
     mlxTrainer.voiceLossWeight = Defaults.voiceLossWeight
+    mlxTrainer.consistencyWeight = Defaults.noiseConsistencyWeight
+    if 0.0 < Defaults.noiseConsistencyWeight {
+        guard noiseBank != nil, augmentOptions.isEmpty, Defaults.voiceHead != true else {
+            print("  ✕ 表現をそろえる損失には雑音バンク (--noise-bank) が要り、話速の変化・SpecAugment・声の種類の補助ヘッドとは併用できません")
+            exit(1)
+        }
+        print("  雑音の有無で表現をそろえる損失: 重み \(Defaults.noiseConsistencyWeight)、層 \(mlxNet.voiceLayer) の発火率")
+    }
     if Defaults.voiceHead {
         let labeled = dataset.metaSamples.filter { $0.voiceSpans.isEmpty != true }.count
         print("  声の種類の補助ヘッド: 層 \(mlxNet.voiceLayer) から \(SpikingNetworkWeights.voiceClasses) クラス、損失の重み \(Defaults.voiceLossWeight)、ラベル付き \(labeled) / \(dataset.count) 件")
@@ -558,18 +575,28 @@ if epochs == 0 {
     }
     var feasibleIndices: [Int] = []
     var infeasibleCount = 0
+    var tooLongCount = 0
     var di = 0
     while di < dataset.count {
     let frames = dataset.frameCount(at: di)
-    if ctcMinimumFrames(allTargets[di]) <= frames {
-        feasibleIndices.append(di)
-    } else {
-        infeasibleCount += 1
+    let tooLong = Defaults.maxTrainFrames < frames
+    if tooLong {
+        tooLongCount += 1
+    }
+    if tooLong != true {
+        if ctcMinimumFrames(allTargets[di]) <= frames {
+            feasibleIndices.append(di)
+        } else {
+            infeasibleCount += 1
+        }
     }
     di += 1
     }
     if 0 < infeasibleCount {
     print("  CTC 整合不可のため学習から除外: \(infeasibleCount) 件 (フレーム数 < 必要ラベル長)")
+    }
+    if 0 < tooLongCount {
+    print("  長すぎるため学習から除外: \(tooLongCount) 件 (\(Defaults.maxTrainFrames) フレーム超)")
     }
 
     // 長さ順にバッチを組む。バッチ内の最長フレーム数までパディングされるため、
@@ -631,13 +658,16 @@ if epochs == 0 {
     struct FeatureBatch {
     var features: [[[Float]]]
     var voiceLabels: [[Int]]
+    var clean: [[[Float]]] = []
     }
     final class FeatureBatchBuffer: @unchecked Sendable {
     var items: [[[Float]]]
     var voice: [[Int]]
+    var clean: [[[Float]]]
     init(count: Int) {
         self.items = [[[Float]]](repeating: [], count: count)
         self.voice = [[Int]](repeating: [], count: count)
+        self.clean = [[[Float]]](repeating: [], count: count)
     }
     }
     let activeWorkers = numWorkers
@@ -659,13 +689,24 @@ if epochs == 0 {
                     featureTransform: augmenter.featureTransform
                 ).features
             }
+            if 0.0 < Defaults.noiseConsistencyWeight {
+                // 表現をそろえる損失の教師データ用に、雑音を重ねない同じ発話の特徴量も作る
+                buffer.clean[i] = autoreleasepool {
+                    SpeechDataset.loadFeatures(
+                        path: meta.path,
+                        frameStack: Defaults.frameStack,
+                        longContext: Defaults.longContext,
+                        loadPCM: false
+                    ).features
+                }
+            }
             if Defaults.voiceHead && meta.voiceSpans.isEmpty != true {
                 buffer.voice[i] = meta.voiceFrameLabels(frameCount: buffer.items[i].count, frameSeconds: frameSeconds)
             }
             i += workerCount
         }
     }
-    return FeatureBatch(features: buffer.items, voiceLabels: buffer.voice)
+    return FeatureBatch(features: buffer.items, voiceLabels: buffer.voice, clean: buffer.clean)
     }
 
     // GPU がバッチを学習している間に、次バッチの特徴量を CPU で先読みする
@@ -775,9 +816,10 @@ if epochs == 0 {
             featuresBatch: currentBatch.features,
             targetsBatch: tBatch,
             blankId: TextVocabulary.padId,
-            voiceTargetsBatch: currentBatch.voiceLabels
+            voiceTargetsBatch: currentBatch.voiceLabels,
+            cleanFeaturesBatch: currentBatch.clean
         )
-        epVoiceLossSum += mlxTrainer.lastVoiceLoss
+        epVoiceLossSum += mlxTrainer.lastVoiceLoss + mlxTrainer.lastConsistencyLoss
         let gpuElapsed = CFAbsoluteTimeGetCurrent() - gpuStart
         gpuSeconds += gpuElapsed
         if compiledMaxFrames < paddedFrames {
@@ -805,6 +847,9 @@ if epochs == 0 {
     var voiceNote = ""
     if Defaults.voiceHead {
         voiceNote = " 声の種類の損失 \(String(format: "%.4f", epVoiceLossSum / Float(max(1, batchCount))))"
+    }
+    if 0.0 < Defaults.noiseConsistencyWeight {
+        voiceNote = " 表現をそろえる損失 \(String(format: "%.5f", epVoiceLossSum / Float(max(1, batchCount))))"
     }
     print("  Epoch [\(ep)/\(epochs)] - 音響損失: \(String(format: "%.4f", avgLoss))\(voiceNote) (LR: \(String(format: "%.5f", curLR)), 所要時間: \(String(format: "%.2f", epElapsed)) 秒)")
     print("    内訳: GPU \(String(format: "%.0f", gpuSeconds)) 秒 (うち eager \(eagerBatches) バッチ \(String(format: "%.0f", eagerSeconds)) 秒) / 先読み待ち \(String(format: "%.0f", waitSeconds)) 秒 / \(batchCount) バッチ / バケット切替 \(bucketSwitches) 回")

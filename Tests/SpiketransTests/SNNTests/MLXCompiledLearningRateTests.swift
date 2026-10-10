@@ -378,7 +378,7 @@ final class MLXCompiledLearningRateTests: XCTestCase {
         XCTAssertEqual(net.exportWeights().bPred?.count, 8)
     }
 
-    /// 先生の層の発火率は compile 版と eager 版で一致し、値は 0〜1 (サブステップ平均の発火率)
+    /// 教師データ生成モデルの層の発火率は compile 版と eager 版で一致し、値は 0〜1 (サブステップ平均の発火率)
     func testTeacherLayerRatesCompiledMatchesEager() {
         let inputDim = 16
         let (feats, _) = makeBatch(inputDim: inputDim, frames: 32)

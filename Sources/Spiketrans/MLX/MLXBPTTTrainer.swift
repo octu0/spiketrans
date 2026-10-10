@@ -31,6 +31,17 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     public var voiceLossWeight: Float = 0.3
     /// 直近のバッチの補助損失 (重みを掛ける前)。補助ヘッドが無ければ 0
     public private(set) var lastVoiceLoss: Float = 0.0
+    /// 雑音の有無で中間層の表現をそろえる損失の重み (0 なら使わない)。
+    /// 雑音を重ねた入力の層 voiceLayer の発火率を、同じ発話のきれいな入力の発火率 (勾配なし) に近づける。
+    /// 声の種類の補助ヘッドとは併用しない (同じ層の発火率の集め方を共有する)
+    public var consistencyWeight: Float = 0.0
+    /// 直近のバッチの表現をそろえる損失 (重みを掛ける前)
+    public private(set) var lastConsistencyLoss: Float = 0.0
+
+    /// 前向き計算で層 voiceLayer の発火率を集めるか (補助ヘッドか、表現をそろえる損失があるとき)
+    var collectsLayerRates: Bool {
+        return network.voiceHead.isEmpty != true || 0.0 < consistencyWeight
+    }
 
     /// 系列長 (padded maxT) をキーとするコンパイル済み CTC 学習ステップのキャッシュ
     private var compiledCTCSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
@@ -287,7 +298,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let tSteps = network.timeSteps
         let numLayers = network.numLayers
         let voiceLayer = network.voiceLayer
-        let collectVoice = network.voiceHead.isEmpty != true
+        let collectVoice = network.voiceHead.isEmpty != true || 0.0 < consistencyWeight
         var readoutList: [MLXArray] = []
         readoutList.reserveCapacity(t1 - t0)
 
@@ -391,7 +402,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         return -sum(picked * weight) / count
     }
 
-    /// 層 layer の発火率 (サブステップ平均) [B, T, H]。HuBERT の 2 周目で、先生のモデルから目標を作るのに使う (勾配なし)
+    /// 層 layer の発火率 (サブステップ平均) [B, T, H]。HuBERT の 2 周目で、事前学習済みのモデルから教師データを作るのに使う (勾配なし)
     public func layerRates(network: MLXSpikingNetwork, features: MLXArray, layer: Int) -> MLXArray {
         let key = features.shape[0] << 16 | features.shape[1]
         if let cached = compiledTeacherRates[key] {
@@ -581,6 +592,52 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         return matmul(stacked(rates, axis: 1), network.voiceHead[0]) + network.voiceHead[1]
     }
 
+    /// 補助の出力: 補助ヘッドがあればそのロジット、無ければ層 voiceLayer の発火率 [B, T, H] (表現をそろえる損失用)
+    func auxiliaryOutput(network: MLXSpikingNetwork, rates: [MLXArray]) -> MLXArray {
+        if network.voiceHead.isEmpty != true {
+            return voiceLogits(network: network, rates: rates)
+        }
+        return stacked(rates, axis: 1)
+    }
+
+    /// 表現をそろえる損失: 有効フレーム (mask [B, T] が 1) の発火率の二乗誤差を、フレーム数 × 幅で割った平均
+    public static func consistencyLoss(rates: MLXArray, targets: MLXArray, mask: MLXArray) -> MLXArray {
+        let diff = (rates - targets) * mask.expandedDimensions(axis: -1)
+        let count = maximum(sum(mask), MLXArray(Float(1.0))) * Float(rates.shape[2])
+        return sum(diff * diff) / count
+    }
+
+    /// consistencyLoss の発火率についての勾配
+    static func consistencyGradient(rates: MLXArray, targets: MLXArray, mask: MLXArray) -> MLXArray {
+        let m = mask.expandedDimensions(axis: -1)
+        let count = maximum(sum(mask), MLXArray(Float(1.0))) * Float(rates.shape[2])
+        return 2.0 * (rates - targets) * m / count
+    }
+
+    /// 層 voiceLayer の発火率 [B, T, H] を chunkFrames フレームずつ状態を引き継いで求める (勾配なし、表現をそろえる損失の教師データ)
+    func layerRatesInChunks(network: MLXSpikingNetwork, features: MLXArray, chunkFrames: Int = 64) -> MLXArray {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        let hMax = network.maxHiddenDim
+        let numLayers = network.numLayers
+        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hMax]), count: numLayers)
+        var outputs: [MLXArray] = []
+        var t0 = 0
+        while t0 < seqLen {
+            let t1 = min(seqLen, t0 + max(1, chunkFrames))
+            let current = matmul(features[0..., t0..<t1, 0...], network.wIn) + network.bH
+            var rates: [MLXArray] = []
+            _ = forwardFrames(network: network, currentSeq0: current, from: 0, to: t1 - t0, v: &v, s: &s, a: &a, voiceRates: &rates)
+            let chunk = stacked(rates, axis: 1)
+            eval(v + s + a + [chunk])
+            outputs.append(chunk)
+            t0 = t1
+        }
+        return stopGradient(concatenated(outputs, axis: 1))
+    }
+
     /// 声の種類の交差エントロピー (targets が -1 のフレームは除く。有効フレームの平均)
     public static func voiceLoss(logits: MLXArray, targets: MLXArray) -> MLXArray {
         let mask = (MLXArray(Int32(0)) .<= targets).asType(.float32)
@@ -618,7 +675,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         if rates.isEmpty {
             return (logits, nil)
         }
-        return (logits, voiceLogits(network: network, rates: rates))
+        return (logits, auxiliaryOutput(network: network, rates: rates))
     }
 
     /// 長い系列の損失とパラメータ勾配をチャンク分割で求める。
@@ -634,6 +691,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         features: MLXArray,
         extTargets: MLXCTCLoss.ExtendedTargets,
         voiceTargets: MLXArray? = nil,
+        consistencyTargets: MLXArray? = nil,
+        frameMask: MLXArray? = nil,
         compiled: Bool = true
     ) -> (loss: MLXArray, gradients: ModuleParameters) {
         let batchSize = features.shape[0]
@@ -641,7 +700,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let hMax = network.maxHiddenDim
         let numLayers = network.numLayers
         let chunkFrames = max(bpttWindow, (longSequenceChunkFrames / bpttWindow) * bpttWindow)
-        let useVoice = network.voiceHead.isEmpty != true && voiceTargets != nil
+        // chunkForward は層の発火率を集めるときは補助の出力も返す (補助ヘッドのロジットか発火率)
+        let useVoice = collectsLayerRates
         var headCount = 1
         if useVoice {
             headCount = 2
@@ -716,13 +776,23 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let gradLogits = cotangents[0]
         var totalLoss = lossOut[0]
         var gradVoice: MLXArray? = nil
-        if useVoice, let vt = voiceTargets {
-            let voice = concatenated(voiceChunks, axis: 1)
-            let vLoss = Self.voiceLoss(logits: voice, targets: vt)
-            totalLoss = totalLoss + vLoss * voiceLossWeight
-            gradVoice = Self.voiceLossGradient(logits: voice, targets: vt) * voiceLossWeight
-            eval(vLoss)
-            lastVoiceLoss = vLoss.item(Float.self)
+        if useVoice {
+            let aux = concatenated(voiceChunks, axis: 1)
+            gradVoice = MLXArray.zeros(like: aux)
+            if network.voiceHead.isEmpty != true, let vt = voiceTargets {
+                let vLoss = Self.voiceLoss(logits: aux, targets: vt)
+                totalLoss = totalLoss + vLoss * voiceLossWeight
+                gradVoice = Self.voiceLossGradient(logits: aux, targets: vt) * voiceLossWeight
+                eval(vLoss)
+                lastVoiceLoss = vLoss.item(Float.self)
+            }
+            if network.voiceHead.isEmpty, let ct = consistencyTargets, let mask = frameMask {
+                let cLoss = Self.consistencyLoss(rates: aux, targets: ct, mask: mask)
+                totalLoss = totalLoss + cLoss * consistencyWeight
+                gradVoice = Self.consistencyGradient(rates: aux, targets: ct, mask: mask) * consistencyWeight
+                eval(cLoss)
+                lastConsistencyLoss = cLoss.item(Float.self)
+            }
         }
         eval(totalLoss, gradLogits)
 
@@ -769,15 +839,16 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         if rates.isEmpty {
             return [logits] + v + s + a
         }
-        return [logits, voiceLogits(network: network, rates: rates)] + v + s + a
+        return [logits, auxiliaryOutput(network: network, rates: rates)] + v + s + a
     }
 
     /// チャンク 1 つの逆伝播。入力は [特徴量, ロジット勾配] + チャンク先頭の状態、
     /// 出力はパラメータ勾配を `chunkGradKeys` の順に並べたもの
     private func chunkBackward(_ arrays: [MLXArray], chunkFrames: Int) -> [MLXArray] {
         let numLayers = network.numLayers
-        // 補助ヘッドがあるときは入力が [特徴量, ロジット勾配, 補助ロジット勾配] + 状態
-        let useVoice = network.voiceHead.isEmpty != true
+        // 補助の出力 (補助ヘッドのロジットか、表現をそろえる損失用の発火率) があるときは
+        // 入力が [特徴量, ロジット勾配, 補助の出力の勾配] + 状態
+        let useVoice = collectsLayerRates
         var base = 2
         if useVoice {
             base = 3
@@ -792,7 +863,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             let chunkLogits = matmul(stacked(readouts, axis: 1), model.wOut) + model.bOut
             var inner = sum(chunkLogits * arrays[1])
             if useVoice {
-                inner = inner + sum(self.voiceLogits(network: model, rates: rates) * arrays[2])
+                inner = inner + sum(self.auxiliaryOutput(network: model, rates: rates) * arrays[2])
             }
             return [inner]
         }
@@ -897,7 +968,8 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         targetsBatch: [[Int]],
         blankId: Int = 0,
         compiled: Bool = true,
-        voiceTargetsBatch: [[Int]]? = nil
+        voiceTargetsBatch: [[Int]]? = nil,
+        cleanFeaturesBatch: [[[Float]]]? = nil
     ) -> Float {
         let bSize = featuresBatch.count
         if bSize == 0 {
@@ -908,6 +980,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         var validFeatures: [[[Float]]] = []
         var validTargets: [[Int]] = []
         var validVoice: [[Int]] = []
+        var validClean: [[[Float]]] = []
         var frameCounts: [Int] = []
         var maxT = 0
         var b = 0
@@ -917,6 +990,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 validFeatures.append(featuresBatch[b])
                 validTargets.append(targetsBatch[b])
                 validVoice.append(voiceTargetsBatch?[b] ?? [])
+                validClean.append(cleanFeaturesBatch?[b] ?? [])
                 frameCounts.append(frames)
                 if maxT < frames {
                     maxT = frames
@@ -955,6 +1029,37 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         }
 
         let featArray = MLXArray(flatFeat, [validCount, maxT, inDim])
+
+        // 表現をそろえる損失: きれいな入力の層の発火率 (勾配なし) を教師データにする。
+        // きれいな特徴量が無い・長さが合わない発話はマスク 0 (損失に入れない)。compile 済みの関数の入力の並びを一定にするため常に渡す
+        let useConsistency = 0.0 < consistencyWeight && network.voiceHead.isEmpty
+        var consistencyArrays: [MLXArray] = []
+        if useConsistency {
+            var flatClean = [Float](repeating: 0.0, count: validCount * maxT * inDim)
+            var flatMask = [Float](repeating: 0.0, count: validCount * maxT)
+            b = 0
+            while b < validCount {
+                let cSeq = validClean[b]
+                if cSeq.count == frameCounts[b] {
+                    var t = 0
+                    while t < cSeq.count {
+                        let offset = ((b * maxT) + t) * inDim
+                        var d = 0
+                        while d < inDim {
+                            flatClean[offset + d] = cSeq[t][d]
+                            d += 1
+                        }
+                        flatMask[b * maxT + t] = 1.0
+                        t += 1
+                    }
+                }
+                b += 1
+            }
+            let cleanArray = MLXArray(flatClean, [validCount, maxT, inDim])
+            let targets = layerRatesInChunks(network: network, features: cleanArray)
+            consistencyArrays = [targets, MLXArray(flatMask, [validCount, maxT])]
+        }
+        lastConsistencyLoss = 0.0
         let extTargets = MLXCTCLoss.ExtendedTargets(
             targetsBatch: validTargets,
             frameCounts: frameCounts,
@@ -982,18 +1087,32 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         lastVoiceLoss = 0.0
 
         if compiledMaxFrames < maxT && chunkLongSequences {
-            let (loss, grads) = chunkedLossAndGradients(features: featArray, extTargets: extTargets, voiceTargets: voiceArray, compiled: compiled)
+            var consistencyTargets: MLXArray? = nil
+            var frameMask: MLXArray? = nil
+            if useConsistency {
+                consistencyTargets = consistencyArrays[0]
+                frameMask = consistencyArrays[1]
+            }
+            let (loss, grads) = chunkedLossAndGradients(
+                features: featArray, extTargets: extTargets, voiceTargets: voiceArray,
+                consistencyTargets: consistencyTargets, frameMask: frameMask, compiled: compiled
+            )
             let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
             optimizer.update(model: network, gradients: clippedGrads)
             eval(network, optimizer, loss)
             return loss.item(Float.self)
         }
 
+        let consistencyW = consistencyWeight
         if compiled != true || compiledMaxFrames < maxT {
             let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
-                let (logits, voice) = self.logitsAndVoiceBatch(network: model, features: arrays[0])
+                let (logits, aux) = self.logitsAndVoiceBatch(network: model, features: arrays[0])
                 let ctc = MLXCTCLoss.loss(logits: logits, targets: extTargets)
-                if let voice = voice, 1 < arrays.count {
+                if let rates = aux, useConsistency {
+                    let cLoss = Self.consistencyLoss(rates: rates, targets: arrays[1], mask: arrays[2])
+                    return [ctc + cLoss * consistencyW, cLoss]
+                }
+                if let voice = aux, 1 < arrays.count {
                     let vLoss = Self.voiceLoss(logits: voice, targets: arrays[1])
                     return [ctc + vLoss * voiceWeight, vLoss]
                 }
@@ -1004,11 +1123,16 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             if let va = voiceArray {
                 inputs.append(va)
             }
+            inputs.append(contentsOf: consistencyArrays)
             let (lossValues, grads) = lg(network, inputs)
             let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
             optimizer.update(model: network, gradients: clippedGrads)
             eval(network, optimizer, lossValues)
-            lastVoiceLoss = lossValues[1].item(Float.self)
+            if useConsistency {
+                lastConsistencyLoss = lossValues[1].item(Float.self)
+            } else {
+                lastVoiceLoss = lossValues[1].item(Float.self)
+            }
 
             return lossValues[0].item(Float.self)
         }
@@ -1031,6 +1155,10 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                     inputLengths: arrays[7]
                 )
                 let ctc = MLXCTCLoss.loss(logits: logits, targets: targets)
+                if let rates = voice, useConsistency {
+                    let cLoss = Self.consistencyLoss(rates: rates, targets: arrays[8], mask: arrays[9])
+                    return [ctc + cLoss * consistencyW, cLoss]
+                }
                 if let voice = voice, 8 < arrays.count {
                     let vLoss = Self.voiceLoss(logits: voice, targets: arrays[8])
                     return [ctc + vLoss * voiceWeight, vLoss]
@@ -1044,6 +1172,9 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             var lossInputCount = 8
             if useVoice {
                 lossInputCount = 9
+            }
+            if useConsistency {
+                lossInputCount = 10
             }
             func step(arrays: [MLXArray]) -> [MLXArray] {
                 let (lossValues, grads) = lg(self.network, Array(arrays[0..<lossInputCount]))
@@ -1068,6 +1199,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         if let va = voiceArray {
             inputs.append(va)
         }
+        inputs.append(contentsOf: consistencyArrays)
         inputs.append(optimizer.learningRate)
 
         let lossValues = stepFn(inputs)
@@ -1075,7 +1207,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         // Adam の m/v が遅延グラフとして積み上がり、生存バッファ数が
         // Metal のリソース上限 (約 50 万) に達して落ちる
         eval(network, optimizer, lossValues)
-        lastVoiceLoss = lossValues[1].item(Float.self)
+        if useConsistency {
+            lastConsistencyLoss = lossValues[1].item(Float.self)
+        } else {
+            lastVoiceLoss = lossValues[1].item(Float.self)
+        }
 
         return lossValues[0].item(Float.self)
     }
