@@ -505,11 +505,12 @@ final class MultiLayerSNNTests: XCTestCase {
     /// 短い系列 (compile 済みのステップ) と長い系列 (チャンク分割の逆伝播) の両方で学習が進む
     func testConsistencyLossZeroForCleanAndPositiveForNoisy() {
         let inputDim = 16
-        for frames in [24, 300] {
+        for (frames, cleanCTC) in [(24, false), (300, false), (24, true), (300, true)] {
             let mlxNet = MLXSpikingNetwork(numLayers: 3, inputDim: inputDim, maxHiddenDim: 64, outputDim: 8, gatedMemory: true)
             mlxNet.wIn = mlxNet.wIn * 4.0
             let trainer = MLXBPTTTrainer(network: mlxNet, config: TrainingConfig(learningRate: 0.01), bpttWindow: 4)
             trainer.consistencyWeight = 1.0
+            trainer.consistencyOnCleanCTC = cleanCTC
             let clean: [[[Float]]] = [makeFeatures(frames: frames, dim: inputDim), makeFeatures(frames: frames - 4, dim: inputDim)]
             let noisy: [[[Float]]] = clean.map { seq in
                 seq.enumerated().map { (t, frame) in
@@ -518,11 +519,11 @@ final class MultiLayerSNNTests: XCTestCase {
             }
             let targets: [[Int]] = [[1, 2, 3, 2], [4, 5, 6]]
             let same = trainer.trainBatchCTC(featuresBatch: clean, targetsBatch: targets, cleanFeaturesBatch: clean)
-            XCTAssertFalse(same.isNaN, "frames \(frames)")
-            XCTAssertEqual(trainer.lastConsistencyLoss, 0.0, accuracy: 1e-7, "frames \(frames)")
+            XCTAssertFalse(same.isNaN, "frames \(frames) cleanCTC \(cleanCTC)")
+            XCTAssertEqual(trainer.lastConsistencyLoss, 0.0, accuracy: 1e-7, "frames \(frames) cleanCTC \(cleanCTC)")
             let mixed = trainer.trainBatchCTC(featuresBatch: noisy, targetsBatch: targets, cleanFeaturesBatch: clean)
-            XCTAssertFalse(mixed.isNaN, "frames \(frames)")
-            XCTAssertLessThan(0.0, trainer.lastConsistencyLoss, "frames \(frames)")
+            XCTAssertFalse(mixed.isNaN, "frames \(frames) cleanCTC \(cleanCTC)")
+            XCTAssertLessThan(0.0, trainer.lastConsistencyLoss, "frames \(frames) cleanCTC \(cleanCTC)")
         }
     }
 

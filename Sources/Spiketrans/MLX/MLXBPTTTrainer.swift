@@ -37,6 +37,10 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     public var consistencyWeight: Float = 0.0
     /// 直近のバッチの表現をそろえる損失 (重みを掛ける前)
     public private(set) var lastConsistencyLoss: Float = 0.0
+    /// 表現をそろえる損失を使うとき、CTC をきれいな入力で学習するか。
+    /// 真なら雑音を重ねた入力には表現をそろえる損失だけを掛け、教師データはきれいな入力の発火率 (同じ前向き計算、勾配なし)。
+    /// 偽なら CTC は雑音を重ねた入力で学習する
+    public var consistencyOnCleanCTC: Bool = false
 
     /// 前向き計算で層 voiceLayer の発火率を集めるか (補助ヘッドか、表現をそろえる損失があるとき)
     var collectsLayerRates: Bool {
@@ -687,14 +691,16 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
     ///   2. CTC 損失のロジットについての勾配を vjp で求める
     ///   3. チャンクごとに前向きをやり直し、ロジットとその勾配の内積を逆伝播してパラメータ勾配を足す
     /// チャンク境界は窓境界に揃えるので、一括で微分した結果と一致する
+    /// extTargets が nil なら CTC 損失を使わない (表現をそろえる損失だけの逆伝播)。
+    /// 戻り値の aux は集めた層の出力 (補助ヘッドのロジットか発火率)。集めない構成では nil
     func chunkedLossAndGradients(
         features: MLXArray,
-        extTargets: MLXCTCLoss.ExtendedTargets,
+        extTargets: MLXCTCLoss.ExtendedTargets?,
         voiceTargets: MLXArray? = nil,
         consistencyTargets: MLXArray? = nil,
         frameMask: MLXArray? = nil,
         compiled: Bool = true
-    ) -> (loss: MLXArray, gradients: ModuleParameters) {
+    ) -> (loss: MLXArray, gradients: ModuleParameters, aux: MLXArray?) {
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
         let hMax = network.maxHiddenDim
@@ -766,18 +772,24 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         let logits = concatenated(logitsChunks, axis: 1)
 
         // 2. CTC 損失のロジット勾配 (+ 補助損失のロジット勾配は解析的に求める)
-        let (lossOut, cotangents) = vjp(
-            { (arrays: [MLXArray]) -> [MLXArray] in
-                return [MLXCTCLoss.loss(logits: arrays[0], targets: extTargets)]
-            },
-            primals: [logits],
-            cotangents: [MLXArray(Float(1.0))]
-        )
-        let gradLogits = cotangents[0]
-        var totalLoss = lossOut[0]
+        var gradLogits = MLXArray.zeros(like: logits)
+        var totalLoss = MLXArray(Float(0.0))
+        if let ext = extTargets {
+            let (lossOut, cotangents) = vjp(
+                { (arrays: [MLXArray]) -> [MLXArray] in
+                    return [MLXCTCLoss.loss(logits: arrays[0], targets: ext)]
+                },
+                primals: [logits],
+                cotangents: [MLXArray(Float(1.0))]
+            )
+            gradLogits = cotangents[0]
+            totalLoss = lossOut[0]
+        }
         var gradVoice: MLXArray? = nil
+        var collected: MLXArray? = nil
         if useVoice {
             let aux = concatenated(voiceChunks, axis: 1)
+            collected = aux
             gradVoice = MLXArray.zeros(like: aux)
             if network.voiceHead.isEmpty != true, let vt = voiceTargets {
                 let vLoss = Self.voiceLoss(logits: aux, targets: vt)
@@ -822,7 +834,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             c += 1
             t0 = t1
         }
-        return (totalLoss, total!)
+        return (totalLoss, total!, collected)
     }
 
     /// チャンク 1 つの勾配なし前向き。入力は [特徴量 [B, C, inDim]] + 状態 (v, s, a を層ごとに)、
@@ -1034,8 +1046,13 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
         // きれいな特徴量が無い・長さが合わない発話はマスク 0 (損失に入れない)。compile 済みの関数の入力の並びを一定にするため常に渡す
         let useConsistency = 0.0 < consistencyWeight && network.voiceHead.isEmpty
         var consistencyArrays: [MLXArray] = []
+        // CTC をきれいな入力で学習する構成では、CTC の入力をきれいな特徴量に替え、
+        // consistencyArrays は [雑音を重ねた特徴量, マスク] (教師データは損失の中でその場で作る)
+        let cleanCTC = useConsistency && consistencyOnCleanCTC
+        var ctcInput = featArray
         if useConsistency {
-            var flatClean = [Float](repeating: 0.0, count: validCount * maxT * inDim)
+            // きれいな特徴量が無い発話は雑音を重ねた特徴量で埋め、マスク 0 にする
+            var flatClean = flatFeat
             var flatMask = [Float](repeating: 0.0, count: validCount * maxT)
             b = 0
             while b < validCount {
@@ -1056,8 +1073,14 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 b += 1
             }
             let cleanArray = MLXArray(flatClean, [validCount, maxT, inDim])
-            let targets = layerRatesInChunks(network: network, features: cleanArray)
-            consistencyArrays = [targets, MLXArray(flatMask, [validCount, maxT])]
+            let maskArray = MLXArray(flatMask, [validCount, maxT])
+            if cleanCTC {
+                ctcInput = cleanArray
+                consistencyArrays = [featArray, maskArray]
+            } else {
+                let targets = layerRatesInChunks(network: network, features: cleanArray)
+                consistencyArrays = [targets, maskArray]
+            }
         }
         lastConsistencyLoss = 0.0
         let extTargets = MLXCTCLoss.ExtendedTargets(
@@ -1093,10 +1116,28 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 consistencyTargets = consistencyArrays[0]
                 frameMask = consistencyArrays[1]
             }
-            let (loss, grads) = chunkedLossAndGradients(
-                features: featArray, extTargets: extTargets, voiceTargets: voiceArray,
-                consistencyTargets: consistencyTargets, frameMask: frameMask, compiled: compiled
-            )
+            var loss: MLXArray
+            var grads: ModuleParameters
+            if cleanCTC {
+                // きれいな入力で CTC、雑音を重ねた入力で表現をそろえる損失、の 2 回の逆伝播の勾配を足す
+                let clean = chunkedLossAndGradients(features: ctcInput, extTargets: extTargets, compiled: compiled)
+                lastConsistencyLoss = 0.0
+                let noisy = chunkedLossAndGradients(
+                    features: consistencyArrays[0], extTargets: nil,
+                    consistencyTargets: stopGradient(clean.aux!), frameMask: consistencyArrays[1], compiled: compiled
+                )
+                loss = clean.loss + noisy.loss
+                grads = clean.gradients.mapValues(noisy.gradients) { (x: MLXArray, y: MLXArray?) -> MLXArray in
+                    return x + (y ?? MLXArray.zeros(like: x))
+                }
+            } else {
+                let result = chunkedLossAndGradients(
+                    features: featArray, extTargets: extTargets, voiceTargets: voiceArray,
+                    consistencyTargets: consistencyTargets, frameMask: frameMask, compiled: compiled
+                )
+                loss = result.loss
+                grads = result.gradients
+            }
             let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
             optimizer.update(model: network, gradients: clippedGrads)
             eval(network, optimizer, loss)
@@ -1108,6 +1149,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
                 let (logits, aux) = self.logitsAndVoiceBatch(network: model, features: arrays[0])
                 let ctc = MLXCTCLoss.loss(logits: logits, targets: extTargets)
+                if let rates = aux, cleanCTC {
+                    let (_, noisyRates) = self.logitsAndVoiceBatch(network: model, features: arrays[1])
+                    let cLoss = Self.consistencyLoss(rates: noisyRates!, targets: stopGradient(rates), mask: arrays[2])
+                    return [ctc + cLoss * consistencyW, cLoss]
+                }
                 if let rates = aux, useConsistency {
                     let cLoss = Self.consistencyLoss(rates: rates, targets: arrays[1], mask: arrays[2])
                     return [ctc + cLoss * consistencyW, cLoss]
@@ -1119,7 +1165,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                 return [ctc, MLXArray(Float(0.0))]
             }
 
-            var inputs = [featArray]
+            var inputs = [ctcInput]
             if let va = voiceArray {
                 inputs.append(va)
             }
@@ -1155,6 +1201,11 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
                     inputLengths: arrays[7]
                 )
                 let ctc = MLXCTCLoss.loss(logits: logits, targets: targets)
+                if let rates = voice, cleanCTC {
+                    let (_, noisyRates) = self.logitsAndVoiceBatch(network: model, features: arrays[8])
+                    let cLoss = Self.consistencyLoss(rates: noisyRates!, targets: stopGradient(rates), mask: arrays[9])
+                    return [ctc + cLoss * consistencyW, cLoss]
+                }
                 if let rates = voice, useConsistency {
                     let cLoss = Self.consistencyLoss(rates: rates, targets: arrays[8], mask: arrays[9])
                     return [ctc + cLoss * consistencyW, cLoss]
@@ -1194,7 +1245,7 @@ public final class MLXBPTTTrainer: @unchecked Sendable {
             stepFn = newStep
         }
 
-        var inputs: [MLXArray] = [featArray]
+        var inputs: [MLXArray] = [ctcInput]
         inputs.append(contentsOf: extTargets.toArrays())
         if let va = voiceArray {
             inputs.append(va)

@@ -51,12 +51,25 @@ enum Defaults {
     /// 層 voiceLayer の発火率を、同じ発話のきれいな入力の発火率 (勾配なし) に近づける。CTC は雑音を重ねた入力で学習する。
     /// 話速の変化・SpecAugment・声の種類の補助ヘッドとは併用しない
     static let noiseConsistencyWeight: Float = 0.0
+    /// 表現をそろえる損失を使うとき、CTC はきれいな入力で学習し、雑音を重ねた入力には表現をそろえる損失だけを掛けるか。
+    /// 雑音入りで CTC を学習すると、声が埋もれた区間でも文字を出させることになり CTC が崩れる (雑音を重ねた 5 本で実況が悪化)
+    static let noiseConsistencyCleanCTC = false
     /// 発火 (0/1) の代わりに、閾値の前後だけ連続値になる出力を次の層へ渡す対照実験 (0/1 への量子化が学習を妨げているかの切り分け)。
     /// CPU 推論は発火前提なので、評価の音響モデル推論も MLX で行う
     static let continuousSpikes = false
     /// 各層にゲート付き記憶 (RG-LRU 型: 発火でリセットされず、残す割合を入力で決める連続値の記憶) を持たせるか。
     /// 1.7 万件・8 epoch で実況 73.7 → 71.2%、告知 39.6 → 36.4%。学習は約 1.4 倍、CPU 推論の記憶の計算は約 5%
     static let gatedMemory = true
+
+    /// 音響モデルを SNN の代わりに Hawk 型 (Griffin の再帰だけの構成。発火なしの連続値) にする比較実験。
+    /// RG-LRU は線形の再帰なので、系列全体を切り詰めずに逆伝播する。重みは別形式 (HawkWeights)、評価の推論は CPU の Hawk
+    static let hawk = false
+    /// Hawk 型の大きさ (層数は numLayers)。8 層で約 9M パラメータと SNN 8 層にそろえる
+    static let hawkModelDim = 288
+    static let hawkRNNDim = 384
+    static let hawkMLPDim = 864
+    static let hawkHeads = 8
+    static let hawkConvWidth = 4
 
     /// 学習に使う発話の最大フレーム数 (40 ms 単位、60 秒)。CTC 損失は計算グラフの深さが発話長に比例し、
     /// 逆伝播でグラフを再帰でたどるため、極端に長い発話 (TTS の生成の暴走など) でスタックがあふれて落ちる。
@@ -118,6 +131,88 @@ enum Defaults {
 
 /// 並列評価の既定ワーカー数は P コア数。静的分割で E コアを混ぜると
 /// 遅いワーカーが末尾まで残り、全体が P コアのみより遅くなる
+/// 学習中の重みの写し (最良の epoch の保持・巻き戻し・保存に使う)
+enum AcousticSnapshot {
+    case snn(SpikingNetworkWeights)
+    case hawk(HawkWeights)
+
+    func save(to path: String) throws {
+        switch self {
+        case .snn(let weights):
+            try weights.save(to: URL(fileURLWithPath: path))
+        case .hawk(let weights):
+            try weights.save(to: URL(fileURLWithPath: path))
+        }
+    }
+}
+
+/// GPU 学習器の共通の口 (SNN と Hawk 型)
+protocol AcousticGPUTrainer: AnyObject {
+    func updateLearningRate(_ lr: Float)
+    func trainCTC(features: [[[Float]]], targets: [[Int]], voiceLabels: [[Int]], clean: [[[Float]]]) -> Float
+    /// 直近のバッチの補助損失 (声の種類の損失か、表現をそろえる損失。無ければ 0)
+    var auxiliaryLoss: Float { get }
+    func snapshot(vocabulary: TextVocabulary) -> AcousticSnapshot
+    /// 写しの重みに戻す。resetOptimizer なら Adam のモーメントも捨てる (巻き戻し)
+    func restore(_ snapshot: AcousticSnapshot, resetOptimizer: Bool)
+}
+
+extension MLXBPTTTrainer: AcousticGPUTrainer {
+    func trainCTC(features: [[[Float]]], targets: [[Int]], voiceLabels: [[Int]], clean: [[[Float]]]) -> Float {
+        return trainBatchCTC(
+            featuresBatch: features,
+            targetsBatch: targets,
+            blankId: TextVocabulary.padId,
+            voiceTargetsBatch: voiceLabels,
+            cleanFeaturesBatch: clean
+        )
+    }
+
+    var auxiliaryLoss: Float {
+        return lastVoiceLoss + lastConsistencyLoss
+    }
+
+    func snapshot(vocabulary: TextVocabulary) -> AcousticSnapshot {
+        return .snn(network.exportWeights(vocabulary: vocabulary))
+    }
+
+    func restore(_ snapshot: AcousticSnapshot, resetOptimizer: Bool) {
+        guard case .snn(let weights) = snapshot else {
+            return
+        }
+        if resetOptimizer {
+            rollback(to: weights)
+            return
+        }
+        network.importWeights(from: weights)
+    }
+}
+
+extension MLXHawkTrainer: AcousticGPUTrainer {
+    func trainCTC(features: [[[Float]]], targets: [[Int]], voiceLabels: [[Int]], clean: [[[Float]]]) -> Float {
+        return trainBatchCTC(featuresBatch: features, targetsBatch: targets, blankId: TextVocabulary.padId)
+    }
+
+    var auxiliaryLoss: Float {
+        return 0.0
+    }
+
+    func snapshot(vocabulary: TextVocabulary) -> AcousticSnapshot {
+        return .hawk(network.exportWeights(vocabulary: vocabulary))
+    }
+
+    func restore(_ snapshot: AcousticSnapshot, resetOptimizer: Bool) {
+        guard case .hawk(let weights) = snapshot else {
+            return
+        }
+        if resetOptimizer {
+            rollback(to: weights)
+            return
+        }
+        network.importWeights(from: weights)
+    }
+}
+
 func performanceCoreCount() -> Int {
     var count: Int32 = 0
     var size = MemoryLayout<Int32>.size
@@ -360,16 +455,25 @@ let trainHiraganaLines = trainTextLines.map { kanjiConverter.convertToHiragana($
 // 重みを持ち込む場合は同梱の語彙を使う。学習時と別のマニフェストでも
 // 出力層の ID 割当が変わらず、評価や追加学習ができる
 var importedWeights: SpikingNetworkWeights? = nil
+var importedHawk: HawkWeights? = nil
 if let impPath = importWeightsPath {
     print("\n[重み読込] 外部ファイルからモデル重みをインポート中: \(impPath)")
-    guard let wData = try? SpikingNetworkWeights.load(from: URL(fileURLWithPath: impPath)) else {
-        print("  ✕ 重みファイルの読み込みに失敗しました。")
-        exit(1)
+    if Defaults.hawk {
+        guard let hData = try? HawkWeights.load(from: URL(fileURLWithPath: impPath)) else {
+            print("  ✕ Hawk 型の重みファイルの読み込みに失敗しました。")
+            exit(1)
+        }
+        importedHawk = hData
+    } else {
+        guard let wData = try? SpikingNetworkWeights.load(from: URL(fileURLWithPath: impPath)) else {
+            print("  ✕ 重みファイルの読み込みに失敗しました。")
+            exit(1)
+        }
+        importedWeights = wData
     }
-    importedWeights = wData
 }
 let phoneticVocabulary: TextVocabulary
-switch importedWeights?.vocabulary {
+switch importedWeights?.vocabulary ?? importedHawk?.vocabulary {
 case .some(let embedded):
     phoneticVocabulary = embedded
     print("  同梱語彙を使用: \(embedded.size) 文字")
@@ -504,6 +608,29 @@ if let wData = importedWeights {
     }
 }
 
+// Hawk 型の音響モデルの CPU 推論 (Defaults.hawk のときだけ)
+var hawkCPU: HawkNetwork? = nil
+if Defaults.hawk {
+    print("第1段 Hawk 型: 層数 = \(Defaults.numLayers), 幅 = \(Defaults.hawkModelDim), 再帰の幅 = \(Defaults.hawkRNNDim), MLP の幅 = \(Defaults.hawkMLPDim), ゲートのブロック = \(Defaults.hawkHeads), 畳み込み = \(Defaults.hawkConvWidth) フレーム")
+}
+if let hData = importedHawk {
+    guard hData.outputDim == phoneticVocabulary.size,
+          hData.inputDim == acousticInputDim,
+          hData.numLayers == Defaults.numLayers,
+          hData.modelDim == Defaults.hawkModelDim,
+          hData.rnnDim == Defaults.hawkRNNDim,
+          hData.mlpDim == Defaults.hawkMLPDim else {
+        print("  ✕ Hawk 型の重みの次元が現在の構成と一致しません (入力 \(hData.inputDim)/\(acousticInputDim), 出力 \(hData.outputDim)/\(phoneticVocabulary.size), 層数 \(hData.numLayers)/\(Defaults.numLayers), 幅 \(hData.modelDim)/\(Defaults.hawkModelDim))。")
+        exit(1)
+    }
+    hawkCPU = HawkNetwork(weights: hData)
+    if epochs == 0 {
+        print("  ✓ Hawk 型の重みのインポート完了。評価のみ実行します (-e 0)。")
+    } else {
+        print("  ✓ Hawk 型の重みのインポート完了。この重みから \(epochs) エポックの追加学習を行います。")
+    }
+}
+
 if epochs == 0 {
     // 追加学習なし。インポート済み重みで評価へ進む
 } else {
@@ -517,44 +644,74 @@ if epochs == 0 {
         return phoneticVocabulary.textToIds(dataset.hiraganaText(at: idx))
     }
 
-    let mlxNet = MLXSpikingNetwork(
-        numLayers: Defaults.numLayers,
-        inputDim: acousticInputDim,
-        maxHiddenDim: Defaults.maxHiddenDim,
-        outputDim: phoneticVocabulary.size,
-        timeSteps: 4,
-        lifConfig: trainer.acousticNetwork.lifConfig,
-        upperRecurrent: Defaults.upperRecurrent,
-        learnedBeta: Defaults.learnedBeta,
-        inputNorm: Defaults.inputNorm,
-        inputNormGainInit: Defaults.inputNormGainInit,
-        voiceHead: Defaults.voiceHead,
-        gatedMemory: Defaults.gatedMemory
-    )
-    mlxNet.continuousSpikes = Defaults.continuousSpikes
-    if let wData = importedWeights {
-        mlxNet.importWeights(from: wData)
-        print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
-    }
-    let mlxTrainer = MLXBPTTTrainer(
-        network: mlxNet,
-        config: trainConfig,
-        bpttWindow: Defaults.bpttWindow
-    )
-    mlxTrainer.voiceLossWeight = Defaults.voiceLossWeight
-    mlxTrainer.consistencyWeight = Defaults.noiseConsistencyWeight
-    if 0.0 < Defaults.noiseConsistencyWeight {
-        guard noiseBank != nil, augmentOptions.isEmpty, Defaults.voiceHead != true else {
-            print("  ✕ 表現をそろえる損失には雑音バンク (--noise-bank) が要り、話速の変化・SpecAugment・声の種類の補助ヘッドとは併用できません")
+    let gpuTrainer: AcousticGPUTrainer
+    if Defaults.hawk {
+        let hawkNet = MLXHawkNetwork(
+            inputDim: acousticInputDim,
+            modelDim: Defaults.hawkModelDim,
+            rnnDim: Defaults.hawkRNNDim,
+            mlpDim: Defaults.hawkMLPDim,
+            heads: Defaults.hawkHeads,
+            convWidth: Defaults.hawkConvWidth,
+            numLayers: Defaults.numLayers,
+            outputDim: phoneticVocabulary.size
+        )
+        if let hData = importedHawk {
+            hawkNet.importWeights(from: hData)
+            print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
+        }
+        guard Defaults.noiseConsistencyWeight == 0.0, Defaults.voiceHead != true else {
+            print("  ✕ Hawk 型は表現をそろえる損失・声の種類の補助ヘッドに対応していません")
             exit(1)
         }
-        print("  雑音の有無で表現をそろえる損失: 重み \(Defaults.noiseConsistencyWeight)、層 \(mlxNet.voiceLayer) の発火率")
+        print("  Hawk 型: パラメータ \(hawkNet.exportWeights().parameterCount) 個、系列全体で逆伝播 (切り詰めなし)")
+        gpuTrainer = MLXHawkTrainer(network: hawkNet, learningRate: trainConfig.learningRate)
+    } else {
+        let mlxNet = MLXSpikingNetwork(
+            numLayers: Defaults.numLayers,
+            inputDim: acousticInputDim,
+            maxHiddenDim: Defaults.maxHiddenDim,
+            outputDim: phoneticVocabulary.size,
+            timeSteps: 4,
+            lifConfig: trainer.acousticNetwork.lifConfig,
+            upperRecurrent: Defaults.upperRecurrent,
+            learnedBeta: Defaults.learnedBeta,
+            inputNorm: Defaults.inputNorm,
+            inputNormGainInit: Defaults.inputNormGainInit,
+            voiceHead: Defaults.voiceHead,
+            gatedMemory: Defaults.gatedMemory
+        )
+        mlxNet.continuousSpikes = Defaults.continuousSpikes
+        if let wData = importedWeights {
+            mlxNet.importWeights(from: wData)
+            print("  [追加学習] インポート済み重みを GPU 学習の初期値に設定")
+        }
+        let mlxTrainer = MLXBPTTTrainer(
+            network: mlxNet,
+            config: trainConfig,
+            bpttWindow: Defaults.bpttWindow
+        )
+        mlxTrainer.voiceLossWeight = Defaults.voiceLossWeight
+        mlxTrainer.consistencyWeight = Defaults.noiseConsistencyWeight
+        mlxTrainer.consistencyOnCleanCTC = Defaults.noiseConsistencyCleanCTC
+        if 0.0 < Defaults.noiseConsistencyWeight {
+            guard noiseBank != nil, augmentOptions.isEmpty, Defaults.voiceHead != true else {
+                print("  ✕ 表現をそろえる損失には雑音バンク (--noise-bank) が要り、話速の変化・SpecAugment・声の種類の補助ヘッドとは併用できません")
+                exit(1)
+            }
+            var ctcInput = "雑音を重ねた入力"
+            if Defaults.noiseConsistencyCleanCTC {
+                ctcInput = "きれいな入力"
+            }
+            print("  雑音の有無で表現をそろえる損失: 重み \(Defaults.noiseConsistencyWeight)、層 \(mlxNet.voiceLayer) の発火率、CTC は\(ctcInput)で学習")
+        }
+        if Defaults.voiceHead {
+            let labeled = dataset.metaSamples.filter { $0.voiceSpans.isEmpty != true }.count
+            print("  声の種類の補助ヘッド: 層 \(mlxNet.voiceLayer) から \(SpikingNetworkWeights.voiceClasses) クラス、損失の重み \(Defaults.voiceLossWeight)、ラベル付き \(labeled) / \(dataset.count) 件")
+        }
+        print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
+        gpuTrainer = mlxTrainer
     }
-    if Defaults.voiceHead {
-        let labeled = dataset.metaSamples.filter { $0.voiceSpans.isEmpty != true }.count
-        print("  声の種類の補助ヘッド: 層 \(mlxNet.voiceLayer) から \(SpikingNetworkWeights.voiceClasses) クラス、損失の重み \(Defaults.voiceLossWeight)、ラベル付き \(labeled) / \(dataset.count) 件")
-    }
-    print("  切り詰め BPTT 窓幅: \(Defaults.bpttWindow) フレーム")
     let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin, totalEpochs: epochs, warmupEpochs: 1)
     print("  学習率: \(Defaults.lrMax) → \(Defaults.lrMin)")
     let trainStartTime = CFAbsoluteTimeGetCurrent()
@@ -733,7 +890,7 @@ if epochs == 0 {
     // 最後まで ep4 に戻らなかった)。最良の重みへ巻き戻して学習率を半分にする
     var bestLoss = Float.greatestFiniteMagnitude
     var bestEpoch = 0
-    var bestWeights: SpikingNetworkWeights? = nil
+    var bestWeights: AcousticSnapshot? = nil
     var prevLoss = Float.greatestFiniteMagnitude
     var riseStreak = 0
     var lrScale: Float = 1.0
@@ -742,17 +899,17 @@ if epochs == 0 {
     var globalStep = 0
     // 学習済みの重みから続けるときは暖機と減衰をやり直さず、最初から lrMin 一定で進める。
     // 収束した重みを lrMax でなぞると壊れる。減衰上限に達した長い学習の続きと同じ形になる
-    if importedWeights != nil && startsFromPretraining != true {
+    if (importedWeights != nil || importedHawk != nil) && startsFromPretraining != true {
     globalStep = scheduleSteps
     print("  学習済みの重みから再開: 学習率は最初から lrMin \(Defaults.lrMin) 一定")
     }
     var ep = 1
     while ep <= epochs {
     let epStartTime = CFAbsoluteTimeGetCurrent()
-    if Defaults.bpttWindowGrowth.isEmpty != true {
+    if Defaults.bpttWindowGrowth.isEmpty != true, let snn = gpuTrainer as? MLXBPTTTrainer {
         let window = Defaults.bpttWindowGrowth[min(ep - 1, Defaults.bpttWindowGrowth.count - 1)]
-        if window != mlxTrainer.bpttWindow {
-            mlxTrainer.setBPTTWindow(window)
+        if window != snn.bpttWindow {
+            snn.setBPTTWindow(window)
             print("  BPTT 窓幅: \(window) フレーム (epoch \(ep) から)")
         }
     }
@@ -802,7 +959,7 @@ if epochs == 0 {
         globalStep += 1
         curLR = scheduler.learningRate(
             step: globalStep, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
-        mlxTrainer.updateLearningRate(curLR)
+        gpuTrainer.updateLearningRate(curLR)
 
         var maxFrames = 0
         for seq in currentBatch.features {
@@ -812,14 +969,16 @@ if epochs == 0 {
         }
         let paddedFrames = ((maxFrames + 31) / 32) * 32
         let gpuStart = CFAbsoluteTimeGetCurrent()
-        let res = mlxTrainer.trainBatchCTC(
-            featuresBatch: currentBatch.features,
-            targetsBatch: tBatch,
-            blankId: TextVocabulary.padId,
-            voiceTargetsBatch: currentBatch.voiceLabels,
-            cleanFeaturesBatch: currentBatch.clean
+        let res = gpuTrainer.trainCTC(
+            features: currentBatch.features,
+            targets: tBatch,
+            voiceLabels: currentBatch.voiceLabels,
+            clean: currentBatch.clean
         )
-        epVoiceLossSum += mlxTrainer.lastVoiceLoss + mlxTrainer.lastConsistencyLoss
+        epVoiceLossSum += gpuTrainer.auxiliaryLoss
+        if let hawkTrainer = gpuTrainer as? MLXHawkTrainer, hawkTrainer.lastGradientNorm.isFinite != true || res.isFinite != true {
+            print("    ⚠ 損失 \(res) / 勾配ノルム \(hawkTrainer.lastGradientNorm) (ステップ \(globalStep)、\(paddedFrames) フレーム)")
+        }
         let gpuElapsed = CFAbsoluteTimeGetCurrent() - gpuStart
         gpuSeconds += gpuElapsed
         if compiledMaxFrames < paddedFrames {
@@ -864,7 +1023,7 @@ if epochs == 0 {
     if avgLoss < bestLoss {
         bestLoss = avgLoss
         bestEpoch = ep
-        bestWeights = mlxNet.exportWeights(vocabulary: phoneticVocabulary)
+        bestWeights = gpuTrainer.snapshot(vocabulary: phoneticVocabulary)
     }
     if prevLoss < avgLoss {
         riseStreak += 1
@@ -879,7 +1038,7 @@ if epochs == 0 {
             lrScale *= Defaults.lrRollbackFactor
             riseStreak = 0
             prevLoss = bestLoss
-            mlxTrainer.rollback(to: best)
+            gpuTrainer.restore(best, resetOptimizer: true)
             print("    ↩ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇。epoch \(bestEpoch) の重み (損失 \(String(format: "%.4f", bestLoss))) へ巻き戻し、学習率を \(String(format: "%.2f", lrScale)) 倍にする (\(rollbacks)/\(Defaults.maxLRRollbacks) 回目)")
         } else {
             print("    ■ 損失が \(Defaults.lossRiseEpochs) epoch 続けて上昇し、巻き戻しの回数も使い切ったので学習を打ち切る (最良は epoch \(bestEpoch))")
@@ -895,7 +1054,7 @@ if epochs == 0 {
         case .some(let basePath):
             let ckptPath = "\(basePath).ep\(ep).json"
             do {
-                try mlxNet.exportWeights(vocabulary: phoneticVocabulary).save(to: URL(fileURLWithPath: ckptPath))
+                try gpuTrainer.snapshot(vocabulary: phoneticVocabulary).save(to: ckptPath)
                 print("    ✓ チェックポイント保存: \(ckptPath)")
             } catch {
                 print("    ✕ チェックポイント保存に失敗: \(error)")
@@ -909,7 +1068,7 @@ if epochs == 0 {
 
     // 最後の epoch が最良でなければ、最良の重みで終える
     if let best = bestWeights, bestLoss < prevLoss {
-    mlxNet.importWeights(from: best)
+    gpuTrainer.restore(best, resetOptimizer: false)
     print("  最終 epoch より epoch \(bestEpoch) (損失 \(String(format: "%.4f", bestLoss))) の方が良いので、その重みを採用する")
     }
 
@@ -917,8 +1076,12 @@ if epochs == 0 {
     print("\nGPU 学習完了 (総所要時間: \(String(format: "%.3f", trainElapsed)) 秒)")
     
     // 学習した重みを Pure Swift 推論エンジンに転送
-    let exported = mlxNet.exportWeights(vocabulary: phoneticVocabulary)
-    trainer.acousticNetwork.importWeights(from: exported)
+    switch gpuTrainer.snapshot(vocabulary: phoneticVocabulary) {
+    case .snn(let exported):
+        trainer.acousticNetwork.importWeights(from: exported)
+    case .hawk(let exported):
+        hawkCPU = HawkNetwork(weights: exported)
+    }
     print("  ✓ GPU 学習パラメータを Pure Swift 推論エンジンに転送完了")
 
     // MLX Metal GPU メモリ・キャッシュを解放
@@ -931,9 +1094,13 @@ if epochs == 0 {
 if let expPath = exportWeightsPath {
     print("\n[重み保存] モデル重みをファイルにエクスポート中: \(expPath)")
     let expURL = URL(fileURLWithPath: expPath)
-    let wData = trainer.acousticNetwork.exportWeights(vocabulary: phoneticVocabulary)
     do {
-        try wData.save(to: expURL)
+        switch hawkCPU {
+        case .some(let hawkNet):
+            try hawkNet.weights.save(to: expURL)
+        case .none:
+            try trainer.acousticNetwork.exportWeights(vocabulary: phoneticVocabulary).save(to: expURL)
+        }
         print("  ✓ 重みパラメータのエクスポートが完了しました: \(expPath)")
     } catch {
         print("  ✕ 重みパラメータの保存に失敗しました: \(error)")
@@ -943,8 +1110,8 @@ if let expPath = exportWeightsPath {
 // 5. 学習済みモデルによるスライス別 (Base / Middle / High) 推論テスト
 print("\n--- 3. 音声文字起こしテスト ---")
 
-// === 一次診断ログ (データセット先頭の発話) ===
-if 0 < dataset.count {
+// === 一次診断ログ (データセット先頭の発話)。SNN の発火を見るので Hawk 型では省く ===
+if 0 < dataset.count && Defaults.hawk != true {
     let s0 = dataset.sample(at: 0, loadPCM: true)
     let feat0 = s0.acousticFeatures
     let totalF = feat0.count
@@ -1140,7 +1307,7 @@ if 0 < dataset.count {
     print("==================================================\n")
 }
 
-if 0 < dataset.count {
+if 0 < dataset.count && Defaults.hawk != true {
     for idx in 0..<min(3, dataset.count) {
         let testSample = dataset.sample(at: idx, loadPCM: true)
         print("\n  ==================================================")
@@ -1492,6 +1659,7 @@ if Defaults.continuousSpikes {
         chunkStart = chunkEnd
     }
 }
+let evalHawk = hawkCPU
 DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
     // 第2段デコーダはワーカー内で使い回し、発話ごとの再確保を避ける
     let goldDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict, languageBonus: 0.0)
@@ -1516,6 +1684,11 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
         // 正解のかな読み (第1段の評価基準)
         let targetKana = evalKanjiConverter.convertToHiragana(pair.text)
 
+        var acousticLogProbs = evalMLX.logProbs[idx]
+        if let hawkNet = evalHawk {
+            acousticLogProbs = hawkNet.logProbs(features: features)
+        }
+
         func evaluateUtterance() -> EvalResult {
             let res = trainer.transcribeTwoStage(
                 featuresSeq: features,
@@ -1526,7 +1699,7 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
                 useCTC: true,
                 languageBonus: evalLanguageBonus,
                 blankPenalty: Defaults.blankPenalty,
-                acousticLogProbs: evalMLX.logProbs[idx]
+                acousticLogProbs: acousticLogProbs
             )
             let dist = levenshteinDistance(pair.text, res.kanji)
             let cer = Float(dist) / Float(max(1, pair.text.count))
@@ -1789,8 +1962,33 @@ if 0 < rawPairs.count {
     print("=== [推論レイテンシ] 単一スレッド, \(benchFeatures.count) 発話 (音声 \(String(format: "%.1f", benchAudioSeconds)) 秒) ===")
     print("==================================================")
 
+    if let hawkNet = hawkCPU {
+        // 行列積は Accelerate (内部で複数スレッドを使うことがある)、ゲートと再帰は 1 スレッドの SIMD
+        let decoder = CTCBeamDecoder(vocabulary: phoneticVocabulary, blankId: TextVocabulary.padId, beamWidth: 16)
+        let acousticStart = CFAbsoluteTimeGetCurrent()
+        var totalFrames = 0
+        var benchLogProbs: [[[Float]]] = []
+        for feats in benchFeatures {
+            let logProbs = hawkNet.logProbs(features: feats)
+            totalFrames += logProbs.count
+            benchLogProbs.append(logProbs)
+        }
+        let acousticElapsed = CFAbsoluteTimeGetCurrent() - acousticStart
+        let decodeStart = CFAbsoluteTimeGetCurrent()
+        var decodedChars = 0
+        for logProbs in benchLogProbs {
+            decodedChars += decoder.decode(logProbs: logProbs).text.count
+        }
+        let fullElapsed = acousticElapsed + (CFAbsoluteTimeGetCurrent() - decodeStart)
+        let n = Double(max(1, benchFeatures.count))
+        let rtf = fullElapsed / max(1e-9, benchAudioSeconds)
+        print("[Hawk 型 \(hawkNet.weights.numLayers) 層・幅 \(hawkNet.weights.modelDim)]")
+        print("  音響モデルのみ: \(String(format: "%.2f", (acousticElapsed / n) * 1000.0)) ms/発話 (\(totalFrames) フレーム処理)")
+        print("  かな文字起こし全体 (音響モデル + CTC ビーム): \(String(format: "%.2f", (fullElapsed / n) * 1000.0)) ms/発話 (\(decodedChars) 文字)")
+        print("  RTF: \(String(format: "%.4f", rtf)) (実時間の \(String(format: "%.0f", max(1e-9, benchAudioSeconds) / fullElapsed)) 倍速)")
+    }
     let benchNetwork = trainer.acousticNetwork
-    do {
+    if Defaults.hawk != true {
         let decoder = AcousticDecoder(
             network: benchNetwork
         )
